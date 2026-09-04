@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * The `council-review` binary: argument parsing, subcommand dispatch, and exit-code mapping.
  * See `openspec/changes/add-council-review/specs/council-review/cli/spec.md` for the requirements
@@ -13,9 +12,8 @@
 import { parseArgs } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
-import { assertNodeVersion } from './node-guard.js';
 import { isThinkingLevel, type ThinkingLevel } from './levels.js';
 import {
   ConfigError,
@@ -922,20 +920,4 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
   } catch (err) {
     return handleTopLevelError(err);
   }
-}
-
-async function main(): Promise<void> {
-  assertNodeVersion();
-  process.exitCode = await runCli(process.argv.slice(2));
-}
-
-// Only auto-run when this module is the actual process entry point (`node dist/cli.js ...`, or
-// the installed `council-review` binary) — never when `runCli` is imported as a library function,
-// which is how `test/unit/cli.test.ts` drives the CLI in-process. Without this guard, importing
-// this module for its `runCli` export would also execute `main()` against the *test runner's*
-// own `process.argv`, corrupting the test process's own exit code.
-const isMainModule =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (isMainModule) {
-  void main();
 }

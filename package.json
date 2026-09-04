@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "bin": {
-    "council-review": "dist/cli.js"
+    "council-review": "dist/bin.js"
   },
   "files": [
     "dist/",
