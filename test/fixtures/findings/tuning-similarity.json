@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/api.ts",
+        "line": 50,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "Error responses do not include a request identifier for tracing.",
+        "impact": "Support cannot correlate a user report with server logs."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-c",
+    "findings": [
+      {
+        "file": "src/api.ts",
+        "line": 50,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "Error responses omit any identifier useful for tracing requests.",
+        "impact": "Correlating a report with server logs becomes difficult."
+      }
+    ]
+  }
+]

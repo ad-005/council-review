@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 15,
+        "severity": "high",
+        "category": "security",
+        "claim": "User input is concatenated directly into a SQL query.",
+        "impact": "This allows SQL injection."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-c",
+    "findings": [
+      {
+        "file": "src/db.ts",
+        "line": 15,
+        "severity": "high",
+        "category": "security",
+        "claim": "User input is concatenated directly into a SQL query.",
+        "impact": "This allows SQL injection."
+      }
+    ]
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/secrets.ts",
+        "line": 5,
+        "severity": "high",
+        "category": "security",
+        "claim": "Secret key is hardcoded in source.",
+        "impact": "Anyone with source access can extract the secret."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-b",
+    "findings": [
+      {
+        "file": "src/secrets.ts",
+        "line": 6,
+        "severity": "high",
+        "category": "security",
+        "claim": "The secret key is hardcoded directly in the source file.",
+        "impact": "Anyone reading the source can obtain the secret key."
+      }
+    ]
+  },
+  {
+    "reviewerId": "openai-codex/model-c",
+    "findings": null
+  }
+]

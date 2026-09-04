@@ -1,0 +1,45 @@
+{
+  "name": "council-review",
+  "version": "0.1.0",
+  "description": "A read-only, multi-vendor code review panel over local git state.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "council-review": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "test": "vitest run --project unit --project security",
+    "test:unit": "vitest run --project unit",
+    "test:security": "vitest run --project security",
+    "test:live": "COUNCIL_LIVE=1 vitest run --project live"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.2.1",
+    "@sinclair/typebox": "^0.34.14",
+    "picomatch": "^4.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/node": "^22.10.5",
+    "@types/picomatch": "^3.0.2",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.19.1",
+    "vitest": "^3.0.2"
+  }
+}

@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 10,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The retry loop never increments its counter.",
+        "impact": "The loop can run forever under failure."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-c",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 200,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The retry loop never increments its counter variable.",
+        "impact": "The loop can run forever under repeated failure."
+      }
+    ]
+  }
+]

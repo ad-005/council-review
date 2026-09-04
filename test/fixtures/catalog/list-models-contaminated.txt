@@ -1,0 +1,12 @@
+[Playwright Extension] Browser automation tools registered
+[Some Other Extension] Registered 3 tools without issue today
+provider      model                                               context  max-out  thinking  images
+minimax       MiniMax-M2.7                                        204.8K   131.1K   yes       no
+minimax       MiniMax-M2.7-highspeed                               204.8K   131.1K   yes       no
+minimax       MiniMax-M3                                            1.0M     512K     yes       yes
+openai-codex  gpt-5.4                                               272K     128K     yes       yes
+opencode-go   deepseek-v4-flash                                     1M       384K     yes       no
+opencode-go   glm-5.2                                               1M       131.1K   yes       no
+openrouter    ~anthropic/claude-fable-latest                        1M       128K     yes       yes
+openrouter    aion-labs/aion-2.0                                    131.1K   32.8K    yes       no
+openrouter    auto                                                  2.0M     30K      yes       yes

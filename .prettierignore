@@ -1,0 +1,9 @@
+dist/
+node_modules/
+coverage/
+
+# Not part of the npm package; owned by other tooling.
+.claude/
+.codegraph/
+openspec/
+docs/

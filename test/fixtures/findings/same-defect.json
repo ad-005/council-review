@@ -1,0 +1,43 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 42,
+        "severity": "high",
+        "category": "security",
+        "claim": "User input is concatenated directly into the SQL query without sanitization.",
+        "impact": "An attacker can inject arbitrary SQL through the affected parameter.",
+        "evidence": "buildUserQuery() interpolates `req.query.name` into the SQL string."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-b",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 44,
+        "severity": "critical",
+        "category": "security",
+        "claim": "User input is concatenated directly into the SQL query without any sanitization.",
+        "impact": "This allows full SQL injection against the users table.",
+        "suggestion": "Use a parameterised query instead of string concatenation."
+      }
+    ]
+  },
+  {
+    "reviewerId": "openai-codex/model-c",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 43,
+        "severity": "medium",
+        "category": "security",
+        "claim": "User input gets concatenated directly into the SQL query without sanitization.",
+        "impact": "The query is vulnerable to injection via crafted input."
+      }
+    ]
+  }
+]

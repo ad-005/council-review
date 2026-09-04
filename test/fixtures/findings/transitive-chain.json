@@ -1,0 +1,41 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/list.ts",
+        "line": 10,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The bounds check is off by one when validating the array index.",
+        "impact": "The last valid index is rejected as out of range."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-b",
+    "findings": [
+      {
+        "file": "src/list.ts",
+        "line": 18,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The array index bounds check has an off by one error.",
+        "impact": "The last valid index is incorrectly treated as out of range."
+      }
+    ]
+  },
+  {
+    "reviewerId": "openai-codex/model-c",
+    "findings": [
+      {
+        "file": "src/list.ts",
+        "line": 26,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "There is an off by one error in the array index bounds check.",
+        "impact": "A valid final index is rejected by the bounds check."
+      }
+    ]
+  }
+]

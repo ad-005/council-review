@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 80,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The loop off by one skips the last user record.",
+        "impact": "The final record is silently dropped from the result set."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-c",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 80,
+        "severity": "low",
+        "category": "correctness",
+        "claim": "The error message leaks the internal file path.",
+        "impact": "Sensitive path information is exposed to the client."
+      }
+    ]
+  }
+]

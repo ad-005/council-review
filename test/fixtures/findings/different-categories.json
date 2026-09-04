@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 120,
+        "severity": "high",
+        "category": "security",
+        "claim": "The token expiry check compares strings instead of numbers.",
+        "impact": "An expired token could be accepted as valid due to a lexical comparison bug."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-c",
+    "findings": [
+      {
+        "file": "src/auth.ts",
+        "line": 120,
+        "severity": "low",
+        "category": "style",
+        "claim": "The token expiry check compares strings instead of numbers.",
+        "impact": "The comparison is harder to read than a plain numeric check."
+      }
+    ]
+  }
+]

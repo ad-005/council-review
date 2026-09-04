@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/cache.ts",
+        "line": 12,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "Cache entries are never invalidated after a write.",
+        "impact": "Stale data can be served to callers after an update."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-b",
+    "findings": [
+      {
+        "file": "src/cache.ts",
+        "line": 14,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The cache is never invalidated after a write occurs.",
+        "impact": "Callers can observe stale data following an update."
+      }
+    ]
+  }
+]

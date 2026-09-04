@@ -1,0 +1,23 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/util.ts",
+        "line": 30,
+        "severity": "low",
+        "category": "style",
+        "claim": "The variable name is a single letter and unclear.",
+        "impact": "Reduces readability for future maintainers."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-b",
+    "findings": []
+  },
+  {
+    "reviewerId": "openai-codex/model-c",
+    "findings": []
+  }
+]

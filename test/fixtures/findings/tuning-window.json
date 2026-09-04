@@ -1,0 +1,28 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/queue.ts",
+        "line": 10,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The worker never acknowledges a processed message.",
+        "impact": "Messages are redelivered and processed more than once."
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-c",
+    "findings": [
+      {
+        "file": "src/queue.ts",
+        "line": 25,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The worker never acknowledges a processed message.",
+        "impact": "Messages are redelivered and processed more than once."
+      }
+    ]
+  }
+]

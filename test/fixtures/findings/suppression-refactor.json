@@ -1,0 +1,32 @@
+{
+  "before": [
+    {
+      "reviewerId": "openrouter/model-a",
+      "findings": [
+        {
+          "file": "src/handler.ts",
+          "line": 20,
+          "severity": "low",
+          "category": "correctness",
+          "claim": "The response body is logged even when it contains sensitive fields.",
+          "impact": "Sensitive response data ends up in application logs."
+        }
+      ]
+    }
+  ],
+  "after": [
+    {
+      "reviewerId": "openrouter/model-a",
+      "findings": [
+        {
+          "file": "src/handler.ts",
+          "line": 65,
+          "severity": "low",
+          "category": "correctness",
+          "claim": "The response body is logged even when it contains sensitive fields.",
+          "impact": "Sensitive response data ends up in application logs."
+        }
+      ]
+    }
+  ]
+}
