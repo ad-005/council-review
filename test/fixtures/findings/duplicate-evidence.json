@@ -1,0 +1,47 @@
+[
+  {
+    "reviewerId": "openrouter/model-a",
+    "findings": [
+      {
+        "file": "src/format.ts",
+        "line": 10,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The trailing slice drops the last character it should keep.",
+        "impact": "Output is truncated by one character.",
+        "evidence": "slice(0, len - 1) should be slice(0, len)",
+        "suggestion": "drop the \"- 1\""
+      }
+    ]
+  },
+  {
+    "reviewerId": "minimax/model-b",
+    "findings": [
+      {
+        "file": "src/format.ts",
+        "line": 10,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The trailing slice drops the last character it should keep.",
+        "impact": "Output is truncated by one character.",
+        "evidence": "slice(0, len - 1) should be slice(0, len)",
+        "suggestion": "drop the \"- 1\""
+      }
+    ]
+  },
+  {
+    "reviewerId": "openai-codex/model-c",
+    "findings": [
+      {
+        "file": "src/format.ts",
+        "line": 10,
+        "severity": "medium",
+        "category": "correctness",
+        "claim": "The trailing slice drops the last character it should keep.",
+        "impact": "Output is truncated by one character.",
+        "evidence": "Slice(0, len - 1) should be slice(0, len).",
+        "suggestion": "Drop the \"- 1\"."
+      }
+    ]
+  }
+]

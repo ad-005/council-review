@@ -85,6 +85,22 @@ describe('fingerprint', () => {
     const fp2 = fingerprint('src/b.ts', 'User input reaches a SQL query unsanitised.');
     expect(fp1).not.toBe(fp2);
   });
+
+  it('pins the hash of a known input to its literal expected value', () => {
+    // `fingerprint` output is persisted in `.council/ignore.json` (suppression entries) and used
+    // to diff findings across runs (`--since` baselines). If the hash key composition ever
+    // changed — including, notably, the NUL byte joining file and claim being swapped for some
+    // other separator — every previously suppressed finding would silently un-suppress, and
+    // every baseline comparison would report every finding as simultaneously resolved and new.
+    // These two literal hashes are the regression guard: any change to `fingerprint`'s inputs or
+    // separator must fail this test loudly rather than corrupt stored suppressions silently.
+    expect(fingerprint('src/handler.ts', 'The response body is logged even when sensitive.')).toBe(
+      'ec544bdd632a1194262bbbf9c15802b2228f65f3b3fc3d03fe76f09e2a1404c8',
+    );
+    expect(fingerprint('src/a.ts', 'User input reaches a SQL query unsanitised.')).toBe(
+      '8c010a2a963029705f97ca0ac2eb36102f61d21b5738c59ce8701fda82b9a21c',
+    );
+  });
 });
 
 describe('mergeFindings: clustering', () => {
@@ -157,11 +173,17 @@ describe('mergeFindings: clustering', () => {
 
 describe('mergeFindings: tuning constants change clustering', () => {
   it('the claim-similarity threshold change flips clustering', () => {
+    // This fixture's pair (a terse claim and a more detailed paraphrase of the same defect)
+    // scores 0.667 under the overlap coefficient `claimOverlap` now uses (it scored 0.444 under
+    // the old Jaccard measure, which is why these two threshold values changed from 0.6/0.4 to
+    // 0.7/0.6 when the metric switched — the fixture and its intent, demonstrating that the
+    // threshold is genuinely load-bearing, are unchanged; only the two literal values needed to
+    // straddle the new metric's score for this pair).
     const results = loadFixture('tuning-similarity.json');
-    const strict = mergeFindings(results, { ...DEFAULT_OPTIONS, claimSimilarity: 0.6 });
+    const strict = mergeFindings(results, { ...DEFAULT_OPTIONS, claimSimilarity: 0.7 });
     expect(strict.findings).toHaveLength(2);
 
-    const loose = mergeFindings(results, { ...DEFAULT_OPTIONS, claimSimilarity: 0.4 });
+    const loose = mergeFindings(results, { ...DEFAULT_OPTIONS, claimSimilarity: 0.6 });
     expect(loose.findings).toHaveLength(1);
   });
 
@@ -343,6 +365,267 @@ describe('mergeFindings: traceability', () => {
     expect(claimsByReviewer.get('openai-codex/model-c')).toBe(
       'User input gets concatenated directly into the SQL query without sanitization.',
     );
+  });
+});
+
+describe('mergeFindings: cross-model claim paraphrase (live calibration)', () => {
+  // `live-token-validation.json` is genuine multi-model output (not a synthetic fixture): three
+  // reviewers examined a real two-defect diff and, under the old Jaccard-based similarity, none
+  // of the five findings they raised clustered — every one landed as its own 1/3-agreement
+  // finding, even though two independent reviewers agreed, in different words, on each of the
+  // diff's two actual defects. See the `claimOverlap` and `categoriesCompatible` doc comments in
+  // src/merge.ts for the measured scores and the reasoning behind the fix.
+  it('clusters the falsy-token-bypass defect (line 2) raised independently by two reviewers', () => {
+    const outcome = mergeFindings(loadFixture('live-token-validation.json'), DEFAULT_OPTIONS);
+    const cluster = outcome.findings.find((f) => f.line === 2)!;
+    expect(cluster).toBeDefined();
+    expect(cluster.agreement).toEqual({ raisers: 2, reporting: 3 });
+    expect(new Set(cluster.raisedBy)).toEqual(
+      new Set(['opencode-go/glm-5.3-flash', 'opencode-go/qwen3.8-flash']),
+    );
+  });
+
+  it('clusters the strict-vs-loose-equality defect (line 3) despite the two reviewers disagreeing on category', () => {
+    const outcome = mergeFindings(loadFixture('live-token-validation.json'), DEFAULT_OPTIONS);
+    const lineThreeFindings = outcome.findings.filter((f) => f.line === 3);
+    const cluster = lineThreeFindings.find((f) => f.agreement.raisers === 2)!;
+    expect(cluster).toBeDefined();
+    expect(new Set(cluster.raisedBy)).toEqual(
+      new Set(['opencode-go/glm-5.3-flash', 'opencode-go/qwen3.8-flash']),
+    );
+    // One reviewer called this "security" (glm, severity high), the other "correctness" (qwen,
+    // also severity high) — exactly the routine taxonomic disagreement `categoriesCompatible`
+    // exists to bridge, rather than block. Both members tie on severity, so category resolution
+    // falls to the content-based (not reviewer-id-based) tiebreak: glm's claim's own fingerprint
+    // sorts before qwen's, so "security" wins deterministically — not because glm's reviewerId
+    // happens to sort first alphabetically (it does, but that is coincidental here; see the
+    // "category resolution" tests below for a case where the alphabetically-first reviewer does
+    // NOT win, proving the outcome tracks content and not naming).
+    expect(cluster.category).toBe('security');
+  });
+
+  it("does not force nova's differently-worded line-3 claim into either cluster", () => {
+    // nova's claim ('returns true for null, undefined, or an empty token') genuinely describes
+    // the same underlying defect as the line-2 falsy-token cluster to a human reader — but its
+    // claim-overlap score against that cluster's representative claim is 0.25, and against the
+    // line-3 loose-equality cluster's representative claim is 0.125, both well below the 0.6
+    // threshold that the other two clusters clear at 0.625 and 0.6 respectively. Forcing this
+    // in would mean lowering the threshold far enough to risk merging genuinely distinct
+    // findings elsewhere (that is exactly what the negative-case tests above exist to catch), or
+    // adding a semantic judgement this deterministic module deliberately does not make. Left
+    // alone, nova's finding surfaces as its own honest 1/3-agreement finding, which is what it
+    // is: a real defect, independently described in words too different from either cluster's
+    // representative for this module to safely say "same claim".
+    const outcome = mergeFindings(loadFixture('live-token-validation.json'), DEFAULT_OPTIONS);
+    const lone = outcome.findings.find(
+      (f) => f.raisedBy.length === 1 && f.raisedBy[0] === 'openrouter/amazon/nova-micro-v1',
+    )!;
+    expect(lone).toBeDefined();
+    expect(lone.agreement).toEqual({ raisers: 1, reporting: 3 });
+    expect(outcome.findings).toHaveLength(3);
+  });
+});
+
+describe('mergeFindings: category compatibility', () => {
+  it('merges security and correctness findings on an identical claim (routine taxonomy disagreement)', () => {
+    const results: ReviewerFindings[] = [
+      {
+        reviewerId: 'a',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 5,
+            category: 'security',
+            claim: 'Loose equality in the token comparison allows a type-coercion bypass.',
+          }),
+        ],
+      },
+      {
+        reviewerId: 'b',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 5,
+            category: 'correctness',
+            claim: 'Loose equality in the token comparison allows a type-coercion bypass.',
+          }),
+        ],
+      },
+    ];
+    const outcome = mergeFindings(results, DEFAULT_OPTIONS);
+    expect(outcome.findings).toHaveLength(1);
+    expect(outcome.findings[0]!.agreement.raisers).toBe(2);
+  });
+
+  it('does not extend compatibility beyond the security/correctness pair', () => {
+    const results: ReviewerFindings[] = [
+      {
+        reviewerId: 'a',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 5,
+            category: 'security',
+            claim: 'Loose equality in the token comparison allows a type-coercion bypass.',
+          }),
+        ],
+      },
+      {
+        reviewerId: 'b',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 5,
+            category: 'performance',
+            claim: 'Loose equality in the token comparison allows a type-coercion bypass.',
+          }),
+        ],
+      },
+    ];
+    const outcome = mergeFindings(results, DEFAULT_OPTIONS);
+    expect(outcome.findings).toHaveLength(2);
+  });
+});
+
+describe('mergeFindings: category resolution for mixed-category clusters', () => {
+  it('resolves a tied severity by content, not by reviewer-id sort order: renaming reviewers does not change the merged category', () => {
+    // Real paraphrase pair from `live-token-validation.json` (F003/F004): its claim-overlap
+    // score is exactly 0.6, clearing the default threshold, while the two claims are worded
+    // differently enough to have distinct fingerprints — needed so this test actually exercises
+    // the tiebreak rather than two identical strings (which would trivially tie the tiebreak
+    // too, masking the bug this test guards against).
+    const securityClaim =
+      'Strict equality was replaced with loose `==`, introducing type-coercion weaknesses in token comparison.';
+    const correctnessClaim =
+      'The token comparison was changed from strict equality (`===`) to loose equality (`==`), allowing type-coerced matches in a credential check.';
+
+    function build(securityReviewerId: string, correctnessReviewerId: string): ReviewerFindings[] {
+      return [
+        {
+          reviewerId: securityReviewerId,
+          findings: [
+            finding({
+              file: 'src/x.ts',
+              line: 5,
+              category: 'security',
+              severity: 'high',
+              claim: securityClaim,
+            }),
+          ],
+        },
+        {
+          reviewerId: correctnessReviewerId,
+          findings: [
+            finding({
+              file: 'src/x.ts',
+              line: 5,
+              category: 'correctness',
+              severity: 'high',
+              claim: correctnessClaim,
+            }),
+          ],
+        },
+      ];
+    }
+
+    // Case A: the security-labelled finding's reviewerId sorts first alphabetically.
+    const caseA = mergeFindings(build('aaa-security-model', 'zzz-correctness-model'), DEFAULT_OPTIONS);
+    // Case B: the identical pair of findings — only the reviewer NAMES are renamed, so the
+    // CORRECTNESS-labelled finding's reviewerId now sorts first instead.
+    const caseB = mergeFindings(build('zzz-security-model', 'aaa-correctness-model'), DEFAULT_OPTIONS);
+
+    expect(caseA.findings).toHaveLength(1);
+    expect(caseB.findings).toHaveLength(1);
+    expect(caseA.findings[0]!.severity).toBe('high');
+    expect(caseB.findings[0]!.severity).toBe('high');
+    // If category resolution depended on reviewerId order (the bug this fixes), case A and case
+    // B would disagree here purely because of the rename. A tiebreak on each member's own
+    // fingerprint (file + claim, never reviewerId) instead guarantees they cannot.
+    expect(caseA.findings[0]!.category).toBe(caseB.findings[0]!.category);
+  });
+
+  it('takes the category of the highest-severity member when severities differ, even when that member is not the alphabetically-first reviewer', () => {
+    const results: ReviewerFindings[] = [
+      {
+        reviewerId: 'aaa-model', // sorts first — would have supplied the category under the old rule
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 5,
+            category: 'correctness',
+            severity: 'low',
+            claim:
+              'The token comparison was changed from strict equality (`===`) to loose equality (`==`), allowing type-coerced matches in a credential check.',
+          }),
+        ],
+      },
+      {
+        reviewerId: 'zzz-model',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 5,
+            category: 'security',
+            severity: 'critical',
+            claim:
+              'Strict equality was replaced with loose `==`, introducing type-coercion weaknesses in token comparison.',
+          }),
+        ],
+      },
+    ];
+    const outcome = mergeFindings(results, DEFAULT_OPTIONS);
+    expect(outcome.findings).toHaveLength(1);
+    const [f] = outcome.findings;
+    // Severity correctly escalates to the critical member's value; category must tell the same
+    // story rather than dilute to the low-severity, alphabetically-first reviewer's label.
+    expect(f!.severity).toBe('critical');
+    expect(f!.category).toBe('security');
+  });
+});
+
+describe('mergeFindings: evidence and suggestion deduplication', () => {
+  it('collapses an exact-duplicate and a case/trailing-punctuation near-duplicate to one entry, keeping the first-seen wording', () => {
+    const outcome = mergeFindings(loadFixture('duplicate-evidence.json'), DEFAULT_OPTIONS);
+    expect(outcome.findings).toHaveLength(1);
+    const [f] = outcome.findings;
+
+    // Three reviewers contributed evidence/suggestion text: model-a and model-b are byte-identical,
+    // model-c differs only in leading capitalisation and a trailing period. All three should
+    // collapse to the single first-seen string in cluster-member order (sorted by reviewerId,
+    // so 'minimax/model-b' is seen first) — which happens to be byte-identical to model-a's text
+    // anyway, so the surviving string is unambiguous either way.
+    expect(f!.evidence).toEqual(['slice(0, len - 1) should be slice(0, len)']);
+    expect(f!.suggestions).toEqual(['drop the "- 1"']);
+  });
+
+  it('does not merge two genuinely different evidence strings that happen to share a cluster', () => {
+    const results: ReviewerFindings[] = [
+      {
+        reviewerId: 'a',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 1,
+            claim: 'The loop off-by-one skips the last element.',
+            evidence: 'The loop condition uses < instead of <=.',
+          }),
+        ],
+      },
+      {
+        reviewerId: 'b',
+        findings: [
+          finding({
+            file: 'src/x.ts',
+            line: 1,
+            claim: 'The loop off-by-one skips the last element.',
+            evidence: 'The upper bound is computed as length - 1, dropping the final index.',
+          }),
+        ],
+      },
+    ];
+    const outcome = mergeFindings(results, DEFAULT_OPTIONS);
+    expect(outcome.findings).toHaveLength(1);
+    expect(outcome.findings[0]!.evidence).toHaveLength(2);
   });
 });
 
