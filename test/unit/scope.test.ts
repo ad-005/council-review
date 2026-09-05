@@ -7,6 +7,7 @@ import {
   ScopeError,
   type ScopeSelectors,
 } from '../../src/scope.js';
+import { reviewsDirPath } from '../../src/report.js';
 import { createTestRepo, type TestRepo } from '../helpers/git-repo.js';
 
 describe('scope', () => {
@@ -345,6 +346,99 @@ describe('scope', () => {
         { baseBranch: 'main' },
       );
       expect(scope.files).toEqual(['src/a.ts']);
+    });
+  });
+
+  describe('own run-artifact exclusion', () => {
+    // reviewsDirPath is report.ts's single source of truth for where a run's own manifest,
+    // findings, report, handoff and per-reviewer traces land. These tests derive the relative
+    // path from it rather than hardcoding '.council/reviews' a second time, so they keep
+    // matching scope.ts's exclusion even if that directory ever moved.
+    function reviewsRelFile(repo: TestRepo, ...segments: string[]): string {
+      const abs = reviewsDirPath(repo.root);
+      const rel = abs.slice(repo.root.length + 1); // strip "<root>/"
+      return [rel, ...segments].join('/');
+    }
+
+    it('excludes untracked-not-ignored run artifacts from the default worktree scope', async () => {
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+
+      // Simulates a prior run's leftovers sitting in the tree, exactly as council-review itself
+      // would leave them -- untracked, and with no .gitignore involved at all (the whole point
+      // being that this must be excluded whether or not `init` ever ran).
+      repo.writeFile(reviewsRelFile(repo, '20260101T000000000Z', 'manifest.json'), '{"scope":{}}\n');
+      repo.writeFile(
+        reviewsRelFile(repo, '20260101T000000000Z', 'reviewers', 'nova.trace.jsonl'),
+        '{"line":1}\n',
+      );
+      repo.writeFile('kept.txt', 'kept content\n');
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+
+      expect(scope.files).toEqual(['kept.txt']);
+      expect(scope.patch).not.toContain('manifest');
+      expect(scope.patch).not.toContain('nova.trace');
+    });
+
+    it('excludes committed run artifacts from every scope mode', async () => {
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+      repo.git(['branch', 'main-base', 'HEAD']);
+      const artifactPath = reviewsRelFile(repo, '20260101T000000000Z', 'manifest.json');
+      const rev = repo.writeAndCommit(artifactPath, '{"scope":{}}\n', 'accidentally committed a run');
+      repo.writeAndCommit('feature.txt', 'feature\n', 'real change');
+
+      const worktree = await resolveScope(repo.root, {}, { baseBranch: 'main-base' });
+      expect(worktree.files).toEqual(['feature.txt']);
+
+      const revision = await resolveScope(repo.root, { revision: rev }, { baseBranch: 'main-base' });
+      expect(revision.files).toEqual([]);
+      expect(revision.empty).toBe(true);
+
+      const range = await resolveScope(
+        repo.root,
+        { range: `main-base..${rev}` },
+        { baseBranch: 'main-base' },
+      );
+      expect(range.files).toEqual([]);
+      expect(range.empty).toBe(true);
+    });
+
+    it('excludes staged run artifacts from the staged scope', async () => {
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+      const artifactPath = reviewsRelFile(repo, '20260101T000000000Z', 'findings.json');
+      repo.writeFile(artifactPath, '[]\n');
+      repo.writeFile('staged.txt', 'staged content\n');
+      repo.add([artifactPath, 'staged.txt']);
+
+      const scope = await resolveScope(repo.root, { staged: true }, { baseBranch: 'main' });
+
+      expect(scope.files).toEqual(['staged.txt']);
+    });
+
+    it('cannot be smuggled back in by an explicit --paths glob targeting it', async () => {
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+      repo.writeFile(reviewsRelFile(repo, '20260101T000000000Z', 'manifest.json'), '{}\n');
+      repo.writeFile('kept.txt', 'kept\n');
+
+      const scope = await resolveScope(
+        repo.root,
+        { paths: ['.council/reviews/**', 'kept.txt'] },
+        { baseBranch: 'main' },
+      );
+
+      expect(scope.files).toEqual(['kept.txt']);
+    });
+
+    it('still reviews changes to .council/config.json and .council/ignore.json', async () => {
+      // Only the run-artifact directory is excluded -- config.json and ignore.json are meant to
+      // be committed, and a reviewer should still see a change to them like any other file.
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+      repo.writeFile('.council/config.json', '{"models":[]}\n');
+      repo.writeFile('.council/ignore.json', '{"suppressions":[]}\n');
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+
+      expect(scope.files.sort()).toEqual(['.council/config.json', '.council/ignore.json'].sort());
     });
   });
 });

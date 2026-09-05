@@ -12,9 +12,10 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { mkdtemp, copyFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import picomatch from 'picomatch';
+import { reviewsDirPath } from './report.js';
 
 export type ScopeMode = 'worktree' | 'staged' | 'range' | 'revision';
 
@@ -173,13 +174,17 @@ async function resolveWorktreeScope(
 ): Promise<{ patch: string; files: string[] }> {
   return withThrowawayIndex(repoRoot, async (env) => {
     const untracked = await listUntrackedNotIgnored(repoRoot);
-    const narrowedUntracked = narrowByGlobs(untracked, paths);
+    // Dropped here too, not just below: this is what stops a run's own artifacts from ever being
+    // intent-to-add'ed into the throwaway index in the first place -- an accumulated
+    // .council/reviews/ can be thousands of files deep, and there's no reason to stage any of
+    // them only to filter them back out of `files` a few lines down.
+    const narrowedUntracked = excludeOwnRunArtifacts(narrowByGlobs(untracked, paths), repoRoot);
     if (narrowedUntracked.length > 0) {
       await runGit(['add', '--intent-to-add', '--', ...narrowedUntracked], { cwd: repoRoot, env });
     }
 
     const nameOnly = await runGit(['diff', '--name-only', mergeBase], { cwd: repoRoot, env });
-    const files = narrowByGlobs(splitLines(nameOnly), paths);
+    const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
     if (files.length === 0) {
       return { patch: '', files: [] };
     }
@@ -194,7 +199,7 @@ async function resolveStagedScope(
   paths: string[] | undefined,
 ): Promise<{ patch: string; files: string[] }> {
   const nameOnly = await runGit(['diff', '--cached', '--name-only'], { cwd: repoRoot });
-  const files = narrowByGlobs(splitLines(nameOnly), paths);
+  const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
   if (files.length === 0) {
     return { patch: '', files: [] };
   }
@@ -213,7 +218,7 @@ async function resolveRangeScope(
   const to = await resolveRevision(repoRoot, toRef);
 
   const nameOnly = await runGit(['diff', '--name-only', from, to], { cwd: repoRoot });
-  const files = narrowByGlobs(splitLines(nameOnly), paths);
+  const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
   const patch =
     files.length === 0 ? '' : await runGit(['diff', from, to, '--', ...files], { cwd: repoRoot });
   return { patch, files, endRevision: to };
@@ -229,7 +234,7 @@ async function resolveRevisionScope(
   const parent = await resolveParent(repoRoot, rev);
 
   const nameOnly = await runGit(['diff', '--name-only', parent, rev], { cwd: repoRoot });
-  const files = narrowByGlobs(splitLines(nameOnly), paths);
+  const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
   const patch =
     files.length === 0
       ? ''
@@ -342,6 +347,54 @@ async function withThrowawayIndex<T>(
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+/**
+ * Repo-relative, forward-slash path of the directory every run writes its own artifacts into
+ * (manifest.json, findings.json, REPORT.md, HANDOFF.md, per-reviewer traces...). Derived from
+ * `reviewsDirPath` -- report.ts's one definition of that directory -- rather than hardcoding
+ * ".council/reviews" a second time here, so the two modules cannot drift apart if that layout
+ * ever changes. `relative` can return backslash-separated segments on Windows; git's own path
+ * output (and this module's `files` arrays) are always forward-slash, so the result is
+ * normalised to match.
+ */
+function reviewsDirRelPath(repoRoot: string): string {
+  return relative(repoRoot, reviewsDirPath(repoRoot)).split(sep).join('/');
+}
+
+/**
+ * Removes the tool's own run-artifact directory from a resolved file list, unconditionally.
+ *
+ * A review's whole premise (see runner.ts) is that each reviewer sees only the task, the prompt
+ * and the patch -- "nothing produced by any other reviewer." `.council/reviews/` is where every
+ * past run's manifest, findings, report, handoff and raw per-reviewer traces live, so if the
+ * default worktree scope's fold of untracked-not-ignored files (or any other scope mode) ever
+ * picked those up, a run would review its own prior output: reviewer independence breaks, input
+ * cost grows without bound across repeated runs, and past a few runs the accumulated patch can
+ * exceed the OS argv limit outright.
+ *
+ * `council-review init` writes a `.gitignore` entry for this, but relying on that is exactly the
+ * bug this closes: `--models`/`--pick` are documented as first-class one-off invocations that
+ * never require `init` to have run, a `.gitignore` entry can be hand-edited or deleted, and
+ * "untracked but not ignored" is a property of the working tree, not of what this directory is
+ * for. So the exclusion here is structural -- it holds with no `.gitignore` entry at all, in
+ * every scope mode below, and it is applied *after* `narrowByGlobs` in every caller specifically
+ * so an explicit `--paths .council/reviews/**` cannot select these files back in. There is no
+ * supported way to point this tool at a review of its own run artifacts.
+ *
+ * This deliberately excludes only `.council/reviews/`, not the whole `.council/` directory:
+ * `.council/config.json` (the saved panel) and `.council/ignore.json` (suppressions) are
+ * ordinary version-controlled files that a reviewer might legitimately need to see change -- a
+ * PR that edits the panel's model list is exactly the kind of change this tool exists to review.
+ * Excluding all of `.council/` would hide that from every scope mode with no way to opt back in,
+ * which is a worse failure mode than the narrower rule risks: this directory's name and purpose
+ * are fixed by this tool, not by user configuration, so there is no ambiguity about which half of
+ * `.council/` is generated output and which half is checked-in config.
+ */
+function excludeOwnRunArtifacts(files: readonly string[], repoRoot: string): string[] {
+  const dir = reviewsDirRelPath(repoRoot);
+  const prefix = `${dir}/`;
+  return files.filter((f) => f !== dir && !f.startsWith(prefix));
 }
 
 function narrowByGlobs(files: readonly string[], globs: readonly string[] | undefined): string[] {
