@@ -76,6 +76,11 @@ describe('loadConfig: valid document round-trip', () => {
     expect(loaded.baseBranch).toBe('main');
     expect(loaded.panel).toEqual(validPanel);
   });
+
+  it('loads an explicit "maxOutputTokens": null as null rather than a type error', () => {
+    writeRawConfig({ version: 1, panel: validPanel, maxOutputTokens: null });
+    expect(loadConfig(root).maxOutputTokens).toBeNull();
+  });
 });
 
 describe('loadConfig: default fill-in for every optional key', () => {
@@ -88,6 +93,10 @@ describe('loadConfig: default fill-in for every optional key', () => {
     expect(loaded.includeContextFiles).toBe(CONFIG_DEFAULTS.includeContextFiles);
     expect(loaded.timeoutSeconds).toBe(CONFIG_DEFAULTS.timeoutSeconds);
     expect(loaded.maxOutputTokens).toBe(CONFIG_DEFAULTS.maxOutputTokens);
+    // An omitted maxOutputTokens means "no ceiling at all", represented as null -- not merely
+    // equal to whatever CONFIG_DEFAULTS happens to hold, stated outright so a future change to
+    // CONFIG_DEFAULTS can't silently drift this behaviour.
+    expect(loaded.maxOutputTokens).toBeNull();
     expect(loaded.mergeWindow).toBe(CONFIG_DEFAULTS.mergeWindow);
     expect(loaded.claimSimilarity).toBe(CONFIG_DEFAULTS.claimSimilarity);
     expect(loaded.failOn).toBe(CONFIG_DEFAULTS.failOn);
@@ -149,6 +158,32 @@ describe('loadConfig: rejection paths', () => {
       expect(e.exitCode).toBe(2);
       expect(e.keyPath).toBe('/claimSimilarity');
       expect(e.message).toContain('/claimSimilarity');
+    }
+  });
+
+  it('rejects a zero maxOutputTokens', () => {
+    writeRawConfig({ version: 1, panel: validPanel, maxOutputTokens: 0 });
+
+    try {
+      loadConfig(root);
+      expect.unreachable();
+    } catch (err) {
+      const e = err as ConfigError;
+      expect(e.exitCode).toBe(2);
+      expect(e.keyPath).toBe('/maxOutputTokens');
+    }
+  });
+
+  it('rejects a negative maxOutputTokens', () => {
+    writeRawConfig({ version: 1, panel: validPanel, maxOutputTokens: -1 });
+
+    try {
+      loadConfig(root);
+      expect.unreachable();
+    } catch (err) {
+      const e = err as ConfigError;
+      expect(e.exitCode).toBe(2);
+      expect(e.keyPath).toBe('/maxOutputTokens');
     }
   });
 

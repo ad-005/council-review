@@ -403,6 +403,24 @@ describe('per-reviewer budgets', () => {
     expect(outcome.degraded).toBe(true);
   }, 15_000);
 
+  it('runs to completion with no output-token ceiling at all (maxOutputTokens: null)', async () => {
+    // `clean-with-tools` accrues 196 cumulative output tokens across its three turns (see the
+    // "captures the terminal assistant text" test above) -- comfortably over the ceiling of 10
+    // that breaches in the sibling test just above, so a null ceiling completing here is a real
+    // contrast, not a vacuous pass. Only the wall-clock timeout would stop an unbounded run, so
+    // this deliberately does not use the `never-ends` fixture.
+    setFixture('clean-with-tools');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+
+    const outcome = await runPanel(
+      baseOptions({ reviewers: [reviewer], timeoutSeconds: 30, maxOutputTokens: null }),
+    );
+    const result = outcome.results[0]!;
+
+    expect(result.state).toBe('ok');
+    expect(outcome.degraded).toBe(false);
+  }, 15_000);
+
   it('applies command-line-supplied overrides for timeout and ceiling (i.e. whatever the caller passes)', async () => {
     // RunPanelOptions carries only the effective (already-resolved) values -- there is no
     // separate "config default" field on it. Section 16 is responsible for the `cliValue ??
