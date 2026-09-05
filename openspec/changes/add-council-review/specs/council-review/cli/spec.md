@@ -109,7 +109,7 @@ The document supports at least: `version`, `baseBranch`, `panel` (an ordered lis
 
 ### Requirement: Command and flag surface
 
-The binary SHALL dispatch the subcommands `init`, `models`, `show`, `ignore` and `gc`, and SHALL treat an invocation with no subcommand as a review run. A review run MUST accept scope flags (`--staged`, `--range`, `--paths`, `--base`), panel flags (`--models`, `--pick`, `--thinking`, `--allow-correlated`), run flags (`--timeout`, `--max-tokens`, `--since`, `--fail-on`, `--no-suppress`, `--json`) and environment flags (`--pane`, `--no-pane`, `--handoff`, `--no-notify`).
+The binary SHALL dispatch the subcommands `init`, `models`, `show`, `ignore`, `gc` and `status`, and SHALL treat an invocation with no subcommand as a review run. A review run MUST accept scope flags (`--staged`, `--range`, `--paths`, `--base`), panel flags (`--models`, `--pick`, `--thinking`, `--allow-correlated`), run flags (`--timeout`, `--max-tokens`, `--since`, `--fail-on`, `--no-suppress`, `--json`) and environment flags (`--pane`, `--no-pane`, `--handoff`, `--no-notify`).
 
 #### Scenario: Bare invocation runs a review
 
@@ -164,3 +164,37 @@ The tool SHALL distinguish outcomes by exit code so that a CI job or a calling a
 
 - **WHEN** the assembled panel does not satisfy the vendor-independence guard and the override flag was not given
 - **THEN** no reviewer is spawned and the tool exits with code 4
+
+### Requirement: Status reporting
+
+`council-review status [--json] [--verify]` SHALL report, in milliseconds and without spawning a reviewer, whether the current project is configured for council-review, alongside the resolved panel, the vendor-independence guard's verdict, the effective settings, the suppression count, the stored runs, and gitignore/herdr state — so that a coding agent can decide what to do next without reading half a dozen files itself. The default form MUST make no model call and no host process call beyond the single `git rev-parse` used to find the repository root; `--verify` MAY additionally discover the model catalog to report each panel entry's real readiness and effective thinking level. `--json` MUST emit the full report as JSON on stdout in place of the human-readable form.
+
+#### Scenario: Configured repository
+
+- **WHEN** `council-review status` is run in a repository with a valid `.council/config.json`
+- **THEN** the tool exits with code 0 and reports the resolved panel, the independence-guard verdict, and the effective settings
+
+#### Scenario: Unconfigured repository
+
+- **WHEN** `council-review status` is run in a git repository with no `.council/config.json`
+- **THEN** the tool exits with code 2 and directs the user to run `council-review init`, without crashing
+
+#### Scenario: Invalid configuration
+
+- **WHEN** `council-review status` is run in a repository whose `.council/config.json` fails validation
+- **THEN** the tool exits with code 2 and names the offending key path and the reason, exactly as a review run's own configuration error would
+
+#### Scenario: Outside a git repository
+
+- **WHEN** `council-review status` is run in a directory that is not inside a git repository
+- **THEN** the tool exits with code 2 and reports plainly that no repository was found, without crashing
+
+#### Scenario: JSON output
+
+- **WHEN** `council-review status --json` is run
+- **THEN** the full status report is written to stdout as JSON and nothing else is written there
+
+#### Scenario: Verifying a panel entry missing from the catalog
+
+- **WHEN** `council-review status --verify` is run against a saved panel entry naming a model no longer present in the discovered catalog
+- **THEN** that entry is reported as not ready, with a reason, and the command still exits according to the project's configured status rather than failing

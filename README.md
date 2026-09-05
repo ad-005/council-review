@@ -116,6 +116,79 @@ changes the review's own outcome.
   recent (default: the configured `retain`, or 20). Never removes the run the `last` pointer
   resolves to. Also sweeps snapshot directories orphaned by a run that couldn't clean up after
   itself.
+- **`status [--json] [--verify]`** — report whether this project is configured, plus the resolved
+  panel, independence-guard verdict, settings, suppression count, stored runs and
+  gitignore/herdr state. This is the intended entry point for a coding agent to check in
+  milliseconds whether it can run a review here at all, before doing anything else. Exits `0`
+  when configured, `2` when not — including outside a git repository, or with an invalid
+  `.council/config.json` (the offending key is named in the report) — and never anything else.
+  The default form makes no host call and no model call: it reads only files already on disk
+  (plus the single `git rev-parse` used to find the repository root). `--verify` additionally
+  discovers the model catalog and reports each panel entry's real readiness and effective
+  thinking level — a stale panel entry (a model no longer in the catalog) is reported as not
+  ready rather than causing the command to fail. `--json` emits the full report as JSON on
+  stdout instead of the human-readable form, e.g.:
+  ```json
+  {
+    "version": "0.1.0",
+    "configured": true,
+    "repoRoot": "/path/to/project",
+    "config": {
+      "path": "/path/to/project/.council/config.json",
+      "present": true,
+      "valid": true,
+      "version": 1,
+      "error": null,
+      "errorKeyPath": null
+    },
+    "panel": [
+      {
+        "provider": "anthropic",
+        "model": "claude-opus-4",
+        "vendor": "anthropic",
+        "thinking": "high",
+        "effectiveThinking": null,
+        "clamped": null,
+        "ready": null,
+        "readyReason": null
+      }
+    ],
+    "independence": {
+      "ok": true,
+      "modelCount": 3,
+      "vendorCount": 3,
+      "vendors": { "anthropic": ["anthropic/claude-opus-4"] },
+      "reason": null
+    },
+    "settings": {
+      "baseBranch": "main",
+      "failOn": "high",
+      "timeoutSeconds": 600,
+      "maxOutputTokens": null,
+      "mergeWindow": 10,
+      "claimSimilarity": 0.6,
+      "includeContextFiles": false,
+      "retain": 20
+    },
+    "suppressions": {
+      "path": "/path/to/project/.council/ignore.json",
+      "present": true,
+      "count": 4
+    },
+    "runs": {
+      "count": 12,
+      "last": {
+        "id": "20260904T153012123Z",
+        "path": "...",
+        "reportPath": "...",
+        "findingsPath": "..."
+      }
+    },
+    "gitignore": { "excludesReviews": true },
+    "herdr": { "detected": false },
+    "verified": false
+  }
+  ```
 
 Run `council-review <subcommand> --help` for a subcommand's own usage, or `council-review --help`
 for the full flag surface.

@@ -57,6 +57,7 @@ import {
   type ManifestInput,
 } from './report.js';
 import { splitPaneAndRun, setPaneTitle, notifyComplete, handoffToAgent } from './herdr.js';
+import { collectStatus, formatStatusText, gitignoreExcludesReviews } from './status.js';
 
 // -------------------------------------------------------------------------------------------
 // CLI-level errors
@@ -115,6 +116,7 @@ Subcommands:
   show [run-id]               Render a stored run's report
   ignore <finding-id>         Suppress a finding
   gc [--keep <n>]             Prune stored runs
+  status [--json] [--verify]  Report whether this project is configured
 Run "council-review <subcommand> --help" for a subcommand's own flags.
 
 Scope flags:
@@ -181,6 +183,22 @@ and leaves the ignore file unchanged.
 Prunes stored runs under .council/reviews/, retaining the <n> most recent (default: the
 configured "retain" value, or 20). Never removes the run the most-recent pointer resolves to.
 Also sweeps snapshot directories orphaned by a run that could not clean up after itself.
+`,
+  status: `council-review status [--json] [--verify]
+
+Reports whether this project is configured for council-review, plus the resolved panel,
+independence-guard verdict, settings, suppression count, stored runs and gitignore/herdr state.
+Intended as the entry point for a coding agent to check in milliseconds whether it can run a
+review here at all.
+
+The default form makes no host call and no model call: it reads only files already on disk (plus
+the single "git rev-parse" used to find the repository root). --verify additionally discovers the
+model catalog and reports each panel entry's actual readiness and effective thinking level.
+
+--json emits the full report as JSON on stdout instead of the human-readable form.
+
+Exit codes: 0 when configured, 2 when not (including outside a git repository or with an invalid
+config) -- never anything else.
 `,
 };
 
@@ -270,7 +288,11 @@ function ensureIgnoreFile(repoRoot: string): void {
 
 const GITIGNORE_ENTRY = '.council/reviews/';
 
+/** The write half of the gitignore check; `gitignoreExcludesReviews` (status.ts) is the read
+ * half -- both match the same two accepted forms, so a project `status` reports as already
+ * excluded is never one `init` would append a duplicate entry to, or vice versa. */
 function ensureGitignoreEntry(repoRoot: string): void {
+  if (gitignoreExcludesReviews(repoRoot)) return;
   const file = path.join(repoRoot, '.gitignore');
   let content = '';
   try {
@@ -278,8 +300,6 @@ function ensureGitignoreEntry(repoRoot: string): void {
   } catch {
     // No .gitignore yet; created fresh below.
   }
-  const lines = content.split('\n').map((l) => l.trim());
-  if (lines.includes(GITIGNORE_ENTRY) || lines.includes('.council/reviews')) return;
   const needsNewline = content.length > 0 && !content.endsWith('\n');
   fs.writeFileSync(file, `${content}${needsNewline ? '\n' : ''}${GITIGNORE_ENTRY}\n`, 'utf8');
 }
@@ -587,6 +607,31 @@ async function cmdGc(args: readonly string[]): Promise<number> {
 }
 
 // -------------------------------------------------------------------------------------------
+// status
+// -------------------------------------------------------------------------------------------
+
+async function cmdStatus(args: readonly string[]): Promise<number> {
+  const { values } = callParseArgs('status', () =>
+    parseArgs({
+      args: args as string[],
+      options: { json: { type: 'boolean' }, verify: { type: 'boolean' } },
+      allowPositionals: false,
+      strict: true,
+    }),
+  );
+
+  const report = await collectStatus(process.cwd(), { verify: Boolean(values.verify) });
+
+  if (values.json) {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    process.stdout.write(formatStatusText(report));
+  }
+
+  return report.configured ? 0 : 2;
+}
+
+// -------------------------------------------------------------------------------------------
 // review (bare invocation)
 // -------------------------------------------------------------------------------------------
 
@@ -863,7 +908,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
 // Dispatch
 // -------------------------------------------------------------------------------------------
 
-const KNOWN_SUBCOMMANDS = ['init', 'models', 'show', 'ignore', 'gc'] as const;
+const KNOWN_SUBCOMMANDS = ['init', 'models', 'show', 'ignore', 'gc', 'status'] as const;
 type Subcommand = (typeof KNOWN_SUBCOMMANDS)[number];
 
 function isKnownSubcommand(s: string): s is Subcommand {
@@ -900,6 +945,8 @@ async function dispatch(argv: readonly string[], pickerIO: PickerIO | undefined)
       return cmdIgnore(rest);
     case 'gc':
       return cmdGc(rest);
+    case 'status':
+      return cmdStatus(rest);
   }
 }
 
