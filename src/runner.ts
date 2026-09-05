@@ -80,7 +80,9 @@ export interface RunPanelOptions {
   extensionPath: string;
   includeContextFiles: boolean;
   timeoutSeconds: number;
-  maxOutputTokens: number;
+  /** Per-reviewer output-token ceiling. `null` means no ceiling at all -- reviewers are then
+   *  bounded only by `timeoutSeconds`. */
+  maxOutputTokens: number | null;
   onProgress?: (r: ReviewerResult[]) => void;
   signal?: AbortSignal;
   /** Where the live/plain progress lines (task 11.7) are written. Defaults to `process.stdout`.
@@ -338,7 +340,7 @@ type KillReason = 'timeout' | 'over-budget' | 'interrupted';
 /** Mutable per-attempt parse state, threaded through as stream lines arrive. */
 interface AttemptState {
   readonly startedAt: number;
-  readonly maxOutputTokens: number;
+  readonly maxOutputTokens: number | null;
   toolCalls: ToolCall[];
   rawTrace: string[];
   usageTotal: Usage;
@@ -366,6 +368,7 @@ function computeCurrentUsage(state: AttemptState): Usage {
 
 function checkBudget(state: AttemptState): void {
   if (state.killReason) return;
+  if (state.maxOutputTokens === null) return; // no ceiling: nothing to check
   const currentOutput = computeCurrentUsage(state).output;
   if (currentOutput > state.maxOutputTokens) {
     state.killReason = 'over-budget';
@@ -484,7 +487,7 @@ interface AttemptOptions {
   snapshotRoot: string;
   repoRoot: string;
   timeoutSeconds: number;
-  maxOutputTokens: number;
+  maxOutputTokens: number | null;
   hostBin: string;
   signal: AbortSignal | undefined;
   onUsage: ((usage: Usage) => void) | undefined;
@@ -736,7 +739,7 @@ interface ReviewerRunOptions {
   snapshot: Snapshot;
   repoRoot: string;
   timeoutSeconds: number;
-  maxOutputTokens: number;
+  maxOutputTokens: number | null;
   hostBin: string;
   signal: AbortSignal | undefined;
   onUsage: ((usage: Usage) => void) | undefined;
@@ -751,7 +754,11 @@ function attemptErrorMessage(
     case 'timeout':
       return `reviewer exceeded its ${o.timeoutSeconds}s timeout`;
     case 'over-budget':
-      return `reviewer exceeded its ${o.maxOutputTokens}-token output ceiling`;
+      // Unreachable when maxOutputTokens is null (checkBudget never breaches with no ceiling),
+      // but must still typecheck without printing "null" if it somehow were.
+      return o.maxOutputTokens === null
+        ? 'reviewer exceeded its output ceiling'
+        : `reviewer exceeded its ${o.maxOutputTokens}-token output ceiling`;
     case 'interrupted':
       return 'run was interrupted';
     case 'truncated':

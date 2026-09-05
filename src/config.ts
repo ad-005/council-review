@@ -27,7 +27,9 @@ export interface CouncilConfig {
   modelThinkingLevels?: Record<string, ThinkingLevel>;
   includeContextFiles: boolean;
   timeoutSeconds: number;
-  maxOutputTokens: number;
+  /** Per-reviewer output-token ceiling. `null` means no ceiling at all -- reviewers are then
+   *  bounded only by `timeoutSeconds`. */
+  maxOutputTokens: number | null;
   mergeWindow: number;
   claimSimilarity: number;
   failOn: 'critical' | 'high' | 'medium' | 'low' | 'none';
@@ -63,13 +65,15 @@ export class ConfigError extends Error {
 export const SUPPORTED_CONFIG_VERSIONS: readonly number[] = [1];
 
 /** The current version stamped onto a newly written config, alongside the documented defaults
- * for every optional key. `panel` has no default: it is meaningless without a real selection. */
+ * for every optional key. `panel` has no default: it is meaningless without a real selection.
+ * `maxOutputTokens` defaults to no ceiling (`null`): an omitted key is deliberately unbounded,
+ * not a forgotten number. */
 export const CONFIG_DEFAULTS: Readonly<Partial<CouncilConfig>> = Object.freeze({
   version: 1,
   baseBranch: 'main',
   includeContextFiles: false,
   timeoutSeconds: 600,
-  maxOutputTokens: 32000,
+  maxOutputTokens: null,
   mergeWindow: 10,
   claimSimilarity: 0.6,
   failOn: 'high',
@@ -107,7 +111,7 @@ const ConfigSchema = Type.Object({
   modelThinkingLevels: Type.Optional(Type.Record(Type.String(), Type.String())),
   includeContextFiles: Type.Optional(Type.Boolean()),
   timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
-  maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  maxOutputTokens: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])),
   mergeWindow: Type.Optional(Type.Integer({ minimum: 0 })),
   claimSimilarity: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   failOn: Type.Optional(

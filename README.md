@@ -75,14 +75,14 @@ hand-edited config is checked too. On refusal, nothing is spawned and the tool e
 
 ## Run flags
 
-| Flag                      | Meaning                                                                                                  |
-| ------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `--timeout <seconds>`     | Per-reviewer wall-clock timeout (overrides configured `timeoutSeconds`)                                  |
-| `--max-tokens <n>`        | Per-reviewer output-token ceiling (overrides configured `maxOutputTokens`)                               |
-| `--since <last\|run-id>`  | Diff this run's findings against a previous one: `resolved` / `still-present` / `new`                    |
-| `--fail-on <level\|none>` | Severity threshold for exit code `1` (`critical`, `high`, `medium`, `low`, or `none` to disable)         |
-| `--no-suppress`           | Ignore `.council/ignore.json` for this run only; the file itself is untouched                            |
-| `--json`                  | Emit only the merged findings document on stdout; everything else (progress, diagnostics) goes to stderr |
+| Flag                      | Meaning                                                                                                                                       |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--timeout <seconds>`     | Per-reviewer wall-clock timeout (overrides configured `timeoutSeconds`)                                                                       |
+| `--max-tokens <n>`        | Per-reviewer output-token ceiling (overrides configured `maxOutputTokens`); with neither the flag nor the config key set, there is no ceiling |
+| `--since <last\|run-id>`  | Diff this run's findings against a previous one: `resolved` / `still-present` / `new`                                                         |
+| `--fail-on <level\|none>` | Severity threshold for exit code `1` (`critical`, `high`, `medium`, `low`, or `none` to disable)                                              |
+| `--no-suppress`           | Ignore `.council/ignore.json` for this run only; the file itself is untouched                                                                 |
+| `--json`                  | Emit only the merged findings document on stdout; everything else (progress, diagnostics) goes to stderr                                      |
 
 ## Environment (herdr) flags
 
@@ -240,22 +240,22 @@ procedure after a host upgrade.
 Written by `init`, hand-editable afterward. An unrecognised `version` is a hard error, so a future
 schema change has a defined migration point.
 
-| Key                    | Meaning                                                                                    |
-| ---------------------- | ------------------------------------------------------------------------------------------ |
-| `version`              | Config schema version                                                                      |
-| `baseBranch`           | Default base branch for scope resolution                                                   |
-| `panel`                | Ordered list of `{ provider, model, thinking? }`                                           |
-| `defaultThinkingLevel` | Fallback thinking level when nothing more specific applies                                 |
-| `modelThinkingLevels`  | Per-model thinking level, keyed `"provider/modelId"` — what the picker actually writes     |
-| `includeContextFiles`  | Opt into loading agent context files into reviewers (default: excluded)                    |
-| `timeoutSeconds`       | Per-reviewer wall-clock timeout                                                            |
-| `maxOutputTokens`      | Per-reviewer output-token ceiling                                                          |
-| `mergeWindow`          | Line-proximity window for clustering findings                                              |
-| `claimSimilarity`      | Claim-token-similarity threshold for clustering                                            |
-| `failOn`               | Default severity threshold for exit code `1` (`critical`\|`high`\|`medium`\|`low`\|`none`) |
-| `snapshot.include`     | Path globs narrowing what's copied into the snapshot (large repos)                         |
-| `vendorOverrides`      | Exact `"provider/modelId"` → vendor overrides for vendor derivation                        |
-| `retain`               | Default number of runs `gc` keeps                                                          |
+| Key                    | Meaning                                                                                            |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `version`              | Config schema version                                                                              |
+| `baseBranch`           | Default base branch for scope resolution                                                           |
+| `panel`                | Ordered list of `{ provider, model, thinking? }`                                                   |
+| `defaultThinkingLevel` | Fallback thinking level when nothing more specific applies                                         |
+| `modelThinkingLevels`  | Per-model thinking level, keyed `"provider/modelId"` — what the picker actually writes             |
+| `includeContextFiles`  | Opt into loading agent context files into reviewers (default: excluded)                            |
+| `timeoutSeconds`       | Per-reviewer wall-clock timeout                                                                    |
+| `maxOutputTokens`      | Per-reviewer output-token ceiling (default: none — reviewers are bounded by `timeoutSeconds` only) |
+| `mergeWindow`          | Line-proximity window for clustering findings                                                      |
+| `claimSimilarity`      | Claim-token-similarity threshold for clustering                                                    |
+| `failOn`               | Default severity threshold for exit code `1` (`critical`\|`high`\|`medium`\|`low`\|`none`)         |
+| `snapshot.include`     | Path globs narrowing what's copied into the snapshot (large repos)                                 |
+| `vendorOverrides`      | Exact `"provider/modelId"` → vendor overrides for vendor derivation                                |
+| `retain`               | Default number of runs `gc` keeps                                                                  |
 
 `.council/ignore.json` holds suppressed findings by fingerprint (stable across line movement —
 see the design doc's fingerprinting rationale), each optionally carrying a human-supplied `reason`.
