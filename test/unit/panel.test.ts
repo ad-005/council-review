@@ -383,6 +383,111 @@ describe('resolveSpecPanel', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Duplicate collapsing — a resolved panel must never spawn the same `provider/model` twice: one
+// literal entry repeated, and (much more likely in practice) a glob that also matches a model
+// already named literally elsewhere in the same spec. Left uncollapsed, this pays twice for one
+// model's worth of independence, overwrites the first spawn's on-disk artifacts with the
+// duplicate's (both are named from a hash of `provider/model`), and corrupts the agreement count
+// reported alongside every finding (`raisers` counting distinct reviewers while `reporting`
+// counts spawns). Collapsing at panel-resolution time — before any of that happens — is the only
+// place that fixes all three at once.
+// ---------------------------------------------------------------------------------------------
+
+describe('resolveSpecPanel duplicate collapsing', () => {
+  it('collapses a literal duplicate entry to one reviewer, in first-seen order', () => {
+    const reviewers = resolveSpecPanel(
+      'minimax/MiniMax-M2.7,minimax/MiniMax-M2.7,opencode-go/glm-5.2,opencode-go/kimi-k2.6',
+      CATALOG,
+      BASE_CONFIG,
+    );
+    expect(reviewers.map((r) => `${r.provider}/${r.model}`)).toEqual([
+      'minimax/MiniMax-M2.7',
+      'opencode-go/glm-5.2',
+      'opencode-go/kimi-k2.6',
+    ]);
+  });
+
+  it('collapses a glob match that overlaps a model already named literally elsewhere in the spec', () => {
+    // opencode-go/kimi-* matches only kimi-k2.6 in this fixture catalog, so this spec resolves
+    // the same model twice before collapsing: once from the glob, once from the literal entry
+    // that follows it.
+    const reviewers = resolveSpecPanel(
+      'opencode-go/kimi-*,opencode-go/kimi-k2.6,minimax/MiniMax-M2.7,opencode-go/glm-5.2',
+      CATALOG,
+      BASE_CONFIG,
+    );
+    expect(reviewers).toHaveLength(3);
+    // First-seen position is the glob's own slot (position 0), not the later literal entry's.
+    expect(reviewers.map((r) => `${r.provider}/${r.model}`)).toEqual([
+      'opencode-go/kimi-k2.6',
+      'minimax/MiniMax-M2.7',
+      'opencode-go/glm-5.2',
+    ]);
+  });
+
+  it('resolves a conflicting per-entry pin on a duplicate by letting the later occurrence win', () => {
+    // Design decision: a duplicate entry's own pin is treated the same way resolveThinking treats
+    // every other precedence conflict — the later, more specific statement wins, on the theory
+    // that repeating a model with a different pin is a correction ("no wait, high") rather than a
+    // note to silently ignore. The entry keeps its FIRST-seen position in the panel; only its
+    // pinned value is superseded.
+    const reviewers = resolveSpecPanel(
+      'minimax/MiniMax-M2.7:low,opencode-go/glm-5.2,minimax/MiniMax-M2.7:high,opencode-go/kimi-k2.6',
+      CATALOG,
+      BASE_CONFIG,
+    );
+    expect(reviewers.map((r) => `${r.provider}/${r.model}`)).toEqual([
+      'minimax/MiniMax-M2.7',
+      'opencode-go/glm-5.2',
+      'opencode-go/kimi-k2.6',
+    ]);
+    expect(reviewers.find((r) => r.model === 'MiniMax-M2.7')?.thinking.requested).toBe('high');
+  });
+
+  it('a spec naming the same model three times collapses to a single-model panel, refused by the guard', () => {
+    // This is the "de-duplication must happen BEFORE the guard" requirement: --models 'a,a,a'
+    // must be refused as ONE model (too few models), not silently pass as three.
+    const reviewers = resolveSpecPanel('minimax/MiniMax-M2.7,minimax/MiniMax-M2.7,minimax/MiniMax-M2.7', CATALOG, BASE_CONFIG);
+    expect(reviewers).toHaveLength(1);
+    expect(() => enforceIndependence(reviewers, false)).toThrow(GuardRefusal);
+    try {
+      enforceIndependence(reviewers, false);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as Error).message).toContain('1 model');
+    }
+  });
+});
+
+describe('resolveConfiguredPanel duplicate collapsing', () => {
+  it('collapses a literal duplicate saved-panel entry to one reviewer, in first-seen order', () => {
+    const panel: PanelEntry[] = [
+      { provider: 'minimax', model: 'MiniMax-M2.7' },
+      { provider: 'opencode-go', model: 'glm-5.2' },
+      { provider: 'minimax', model: 'MiniMax-M2.7' },
+      { provider: 'opencode-go', model: 'kimi-k2.6' },
+    ];
+    const reviewers = resolveConfiguredPanel(panel, CATALOG, BASE_CONFIG);
+    expect(reviewers.map((r) => `${r.provider}/${r.model}`)).toEqual([
+      'minimax/MiniMax-M2.7',
+      'opencode-go/glm-5.2',
+      'opencode-go/kimi-k2.6',
+    ]);
+  });
+
+  it('a conflicting saved thinking level on a duplicate entry lets the later occurrence win', () => {
+    const panel: PanelEntry[] = [
+      { provider: 'minimax', model: 'MiniMax-M2.7', thinking: 'low' },
+      { provider: 'opencode-go', model: 'glm-5.2' },
+      { provider: 'minimax', model: 'MiniMax-M2.7', thinking: 'high' },
+    ];
+    const reviewers = resolveConfiguredPanel(panel, CATALOG, BASE_CONFIG);
+    expect(reviewers).toHaveLength(2);
+    expect(reviewers.find((r) => r.model === 'MiniMax-M2.7')?.thinking.requested).toBe('high');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // Independence guard
 // ---------------------------------------------------------------------------------------------
 

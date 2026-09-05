@@ -146,6 +146,41 @@ export function expandPanelSpec(spec: string, catalog: Catalog): ParsedEntry[] {
 }
 
 // -------------------------------------------------------------------------------------------
+// Duplicate collapsing
+// -------------------------------------------------------------------------------------------
+
+/**
+ * Collapses `entries` that name the same `provider/model` down to one, at the position of their
+ * FIRST occurrence but carrying the value of their LAST occurrence. A duplicated panel entry is
+ * always a mistake, never a deliberate choice — reviewing the same model twice adds no
+ * independence, but it does spawn the host twice (paying twice for one model's worth of signal),
+ * and because a reviewer's on-disk artifacts are named from a hash of `provider/model`, the
+ * second spawn silently overwrites the first's `.text.md`/`.findings.json`/`.trace.jsonl` while
+ * the manifest still claims both ran. The most common way to hit this isn't a literal repeated
+ * entry — it's a glob (`opencode-go/qwen3.8-*`) that happens to also match a model named
+ * explicitly elsewhere in the same spec, so this must run on the fully-expanded entry list, not
+ * just reject literal repeats.
+ *
+ * "Last occurrence wins" for the entry's own value mirrors `resolveThinking`'s own precedence
+ * rule elsewhere in this file: when a model is named more than once with conflicting per-entry
+ * pins (`foo/bar:low,foo/bar:high`), the later one is treated as a correction of the earlier one
+ * — the user's final word — not as a note to silently discard. `Map#set` gives us exactly this
+ * for free: re-setting an already-present key overwrites its value but leaves its original
+ * iteration position untouched, so the loop below is the entire implementation.
+ *
+ * This must run BEFORE the independence guard (`enforceIndependence`) sees the result — both
+ * `resolveSpecPanel` and `resolveConfiguredPanel` call this ahead of `buildReviewer` for exactly
+ * that reason, so `--models 'a,a,a'` is correctly refused as one model, not admitted as three.
+ */
+function collapseDuplicates<T>(entries: readonly T[], keyOf: (entry: T) => string): T[] {
+  const byKey = new Map<string, T>();
+  for (const entry of entries) {
+    byKey.set(keyOf(entry), entry);
+  }
+  return Array.from(byKey.values());
+}
+
+// -------------------------------------------------------------------------------------------
 // Reviewer assembly
 // -------------------------------------------------------------------------------------------
 
@@ -173,7 +208,8 @@ export function resolveConfiguredPanel(
   cfg: CouncilConfig,
   cliPanelWide?: ThinkingLevel,
 ): Reviewer[] {
-  return panel.map((entry) => {
+  const deduped = collapseDuplicates(panel, (entry) => `${entry.provider}/${entry.model}`);
+  return deduped.map((entry) => {
     const model = findModel(catalog, entry.provider, entry.model);
     if (!model) {
       throw new PanelError(
@@ -209,7 +245,8 @@ export function resolveSpecPanel(
   cliPanelWide?: ThinkingLevel,
 ): Reviewer[] {
   const expanded = expandPanelSpec(spec, catalog);
-  return expanded.map((entry) => {
+  const deduped = collapseDuplicates(expanded, (entry) => `${entry.provider}/${entry.model}`);
+  return deduped.map((entry) => {
     const model = findModel(catalog, entry.provider, entry.model);
     if (!model) {
       // expandPanelSpec already validated existence for every entry it returns; this only
