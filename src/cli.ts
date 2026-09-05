@@ -132,7 +132,7 @@ Panel flags:
 
 Run flags:
   --timeout <seconds>          Per-reviewer wall-clock timeout
-  --max-tokens <n>              Per-reviewer output-token ceiling
+  --max-tokens <n>              Per-reviewer output-token ceiling (default: none)
   --since <last|run-id>         Diff findings against a previous run
   --fail-on <level|none>        Severity threshold for exit code 1
   --no-suppress                 Ignore .council/ignore.json for this run

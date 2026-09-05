@@ -87,7 +87,7 @@ The tool SHALL derive a review-depth signal per reviewer from its recorded tool 
 
 ### Requirement: Per-reviewer budgets
 
-Each reviewer SHALL be bounded by a wall-clock timeout and by an output-token ceiling, both defaulting from configuration and overridable per run. Breaching either MUST terminate only that reviewer, mark it `timeout` or `over-budget`, and leave the run to continue with the report marked degraded.
+Each reviewer SHALL be bounded by a wall-clock timeout, which always applies, defaults from configuration, and is overridable per run. An output-token ceiling is OPTIONAL: it applies only when one is configured or supplied on the command line, and no ceiling is the default. Breaching either bound MUST terminate only that reviewer, mark it `timeout` or `over-budget`, and leave the run to continue with the report marked degraded.
 
 #### Scenario: Timeout breach
 
@@ -96,8 +96,13 @@ Each reviewer SHALL be bounded by a wall-clock timeout and by an output-token ce
 
 #### Scenario: Output ceiling breach
 
-- **WHEN** a reviewer exceeds its output-token ceiling
+- **WHEN** a reviewer exceeds an output-token ceiling that is in force
 - **THEN** that reviewer is marked `over-budget`, the other reviewers continue, and the report is marked degraded
+
+#### Scenario: No output ceiling configured
+
+- **WHEN** no `maxOutputTokens` is configured and no `--max-tokens` is supplied
+- **THEN** the reviewer is never terminated for output volume, and only the wall-clock timeout bounds it
 
 #### Scenario: Partial output from a breached reviewer is preserved
 
