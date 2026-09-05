@@ -61,7 +61,7 @@ The document supports at least: `version`, `baseBranch`, `panel` (an ordered lis
 #### Scenario: Absent optional keys fall back to documented defaults
 
 - **WHEN** a configuration document omits `mergeWindow`, `claimSimilarity`, `timeoutSeconds`, `maxOutputTokens` or `failOn`
-- **THEN** the run proceeds using the documented default for each omitted key
+- **THEN** the run proceeds using the documented default for each omitted key (for `maxOutputTokens`, the documented default is no ceiling)
 
 #### Scenario: Malformed configuration is rejected
 
