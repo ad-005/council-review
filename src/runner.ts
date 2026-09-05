@@ -12,7 +12,9 @@
  * Section 9, security-critical); it only orchestrates process lifecycle and stream parsing.
  */
 import * as childProcessModule from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 import {
   buildReviewerArgv,
@@ -129,6 +131,120 @@ function buildInitialPrompt(taskPrompt: string, patchContent: string): string {
  */
 function buildRepairPrompt(errors: readonly string[], priorText: string): string {
   return [repairInstruction(errors), '', 'Your previous response:', '', priorText].join('\n');
+}
+
+/**
+ * Prepended to every prompt written by `writePromptFileArg`, so the reviewer is told what the
+ * envelope pi puts around it means before it ever gets confused by it.
+ *
+ * A live run (real pi 0.84.4, three real models) found that pi's own `processFileArguments`
+ * wraps whatever this function writes in `<file name="<absolute path to the prompt file>">...
+ * </file>` -- and one reviewer (`openrouter/amazon/nova-micro-v1`) took that name at face value:
+ * it called `council_read` and `council_grep` on that exact path, got "path escapes the allowed
+ * root" from both (containment held; this is a quality problem, not a security one), concluded it
+ * could not access needed context, and explicitly degraded its own review as a result -- burning
+ * two tool calls and part of its output budget along the way. The other two reviewers in that same
+ * run used relative paths and were unaffected, so the failure is model-dependent, not universal,
+ * but real. This notice heads that off structurally: it tells every reviewer, unconditionally,
+ * that the `<file>` tag is a delivery artifact rather than part of the reviewed tree, before that
+ * reviewer's first token of actual task content.
+ */
+const FILE_ENVELOPE_NOTICE =
+  'Note: this entire message is delivered as file content, and the host may show you the path ' +
+  'of that file wrapped in a `<file name="...">` tag around everything below. That path is a ' +
+  'delivery artifact only -- it is not part of the repository under review and does not exist ' +
+  'in your snapshot. Do not attempt to read, grep, or list it. Your only readable surface is the ' +
+  'frozen snapshot, via your council_read, council_grep, council_list and council_git tools.';
+
+/**
+ * Writes prompt text to a file under the run directory and returns the argv token that delivers
+ * it to the reviewer: `@<absolute path>`. This is what keeps a large patch off the command line
+ * entirely -- pi's own CLI grammar (`pi [options] [--] [@files...] [messages...]`, per `pi
+ * --help`) treats any positional argument starting with `@` as a file reference: it strips the
+ * `@`, resolves the rest as a path, reads it as UTF-8 text, and uses that as message input
+ * (verified statically against the installed host bundle's `parseArgs`/`processFileArguments` --
+ * see the fix's report for the exact source quoted). Previously the entire composed prompt
+ * (task instructions + the whole patch, verbatim) was pushed as one `argv` element by
+ * `buildReviewerArgv`; once that string's byte length, combined with the process environment,
+ * exceeded the OS's `ARG_MAX` (`getconf ARG_MAX`), `spawn()` failed outright with `E2BIG` and no
+ * reviewer in the panel ran at all. With this indirection, argv carries only a short, constant-size
+ * file path no matter how large the patch or a reviewer's own prior output is -- the one thing
+ * that scales with review-panel input is the file on disk, and the OS has no meaningful ceiling on
+ * that.
+ *
+ * This is used unconditionally -- every prompt, of every size, travels this way -- rather than
+ * only above some computed "safe argv budget" threshold. A size-conditional hybrid was considered
+ * and rejected: the safe threshold is `ARG_MAX` minus the *current* serialized environment, which
+ * varies host to host and even run to run (any `PATH`/`HOME`/`PI_*` difference shifts it), so it
+ * would have to be recomputed live rather than pinned as a constant; it would need `runner.ts` to
+ * reach into `buildReviewerEnv`'s output just to size it, coupling this module to the exact
+ * environment `reviewer-spawn.ts` decides to allow through; and it would leave two delivery code
+ * paths to maintain and, worse, a discontinuity right at the threshold where one review in a
+ * batch could take one path and a nearly-identical one the next byte over could take the other,
+ * for no reason a reader of a bug report could see. A single, always-on path has none of that: one
+ * mechanism, one thing to test on both sides of "large", and — per the live run above — the actual
+ * quality cost of the envelope for an ordinary small prompt is exactly one clear sentence's worth
+ * of explanation, not a change in review outcome.
+ *
+ * Written into `runDir` (the run directory that already holds `patch.diff`, per
+ * `RunPanelOptions.patchPath`'s own contract) -- never into the snapshot, and never into some
+ * separate scratch location that would need its own cleanup: the run directory is the run's
+ * permanent record of what happened, so the exact prompt text sent is as much a part of that
+ * record as `patch.diff` itself.
+ *
+ * `resolve()` guards against `runDir` ever being relative: pi's own cwd for the reviewer process
+ * is the frozen snapshot root (`reviewerCwd`), never this process's cwd, so the `@` path must be
+ * absolute for the host to find it regardless of where the child was launched from.
+ */
+function writePromptFileArg(runDir: string, filename: string, content: string): string {
+  const promptDir = resolve(runDir, 'prompts');
+  mkdirSync(promptDir, { recursive: true });
+  const path = join(promptDir, filename);
+  writeFileSync(path, `${FILE_ENVELOPE_NOTICE}\n\n${content}`, 'utf8');
+  return `@${path}`;
+}
+
+/**
+ * Turns a raw child-process spawn failure into a message that names what happened and, where
+ * there's something actionable to say, what to do about it. `err.message` alone (e.g. the bare
+ * string `"spawn E2BIG"`) is meaningless to whoever reads the manifest afterward -- this is the
+ * one place every spawn failure (both the synchronous `spawn()` throw and the async `'error'`
+ * event, see the two call sites in `runAttempt`) passes through, so no spawn errno can surface
+ * unexplained again.
+ *
+ * `E2BIG` gets its own case even though the prompt itself no longer travels through argv (see
+ * `writePromptFileArg`): argv and the environment together still have to fit under `ARG_MAX`, so
+ * an E2BIG here points at something else unbounded -- an unusually large inherited environment, or
+ * a very long extension/snapshot path -- not patch size.
+ */
+function describeSpawnError(err: unknown): string {
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as NodeJS.ErrnoException).code)
+      : undefined;
+  const message = err instanceof Error ? err.message : String(err);
+  switch (code) {
+    case 'E2BIG':
+      return (
+        'failed to spawn the reviewer process: its command line and environment were too large ' +
+        'for this system (E2BIG). The review prompt is delivered via a file reference, not argv, ' +
+        'so this points at something else growing unbounded -- e.g. an unusually large inherited ' +
+        `environment. Original error: ${message}`
+      );
+    case 'ENOENT':
+      return (
+        'failed to spawn the reviewer process: the host binary was not found (ENOENT). Check ' +
+        'that "pi" is installed and on PATH, or that $COUNCIL_PI_BIN points at a real ' +
+        `executable. Original error: ${message}`
+      );
+    case 'EACCES':
+      return (
+        'failed to spawn the reviewer process: permission denied launching the host binary ' +
+        `(EACCES). Original error: ${message}`
+      );
+    default:
+      return `failed to spawn the reviewer process${code ? ` (${code})` : ''}: ${message}`;
+  }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -359,7 +475,10 @@ interface AttemptResult {
 
 interface AttemptOptions {
   reviewer: Reviewer;
-  promptText: string;
+  /** The trailing argv token handed to the host: always an `@<absolute path>` file reference
+   *  (see `writePromptFileArg`), never the prompt text itself -- that's what keeps this off the
+   *  command line regardless of patch size or a reviewer's own prior output length. */
+  promptArg: string;
   extensionPath: string;
   includeContextFiles: boolean;
   snapshotRoot: string;
@@ -408,7 +527,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
     model: o.reviewer.model,
     thinking: o.reviewer.thinking.effective,
     includeContextFiles: o.includeContextFiles,
-    prompt: o.promptText,
+    prompt: o.promptArg,
   });
   const env = buildAttemptEnv(o.snapshotRoot, o.repoRoot);
   const cwd = reviewerCwd(o.snapshotRoot);
@@ -424,7 +543,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
       toolCalls: [],
       rawTrace: [],
       outcome: 'spawn-error',
-      errorMessage: err instanceof Error ? err.message : String(err),
+      errorMessage: describeSpawnError(err),
       startedAt,
       endedAt,
     });
@@ -482,7 +601,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
 
     child.on('error', (err) => {
       spawnErrored = true;
-      spawnErrorMessage = err.message;
+      spawnErrorMessage = describeSpawnError(err);
       childClosed = true;
       finalize();
     });
@@ -605,7 +724,13 @@ function createLineReader(stream: NodeJS.ReadableStream): {
 
 interface ReviewerRunOptions {
   reviewer: Reviewer;
-  initialPrompt: string;
+  /** `@<absolute path>` reference to the shared initial-prompt file `runPanel` wrote once for
+   *  the whole panel -- identical for every reviewer's first attempt, per the "no
+   *  cross-contamination" structural guarantee `buildInitialPrompt`'s own doc comment describes. */
+  initialPromptArg: string;
+  /** The run directory (holding `patch.diff`), used only to write this reviewer's own repair
+   *  prompt (attempt 2) to a file if a repair attempt turns out to be needed. */
+  runDir: string;
   extensionPath: string;
   includeContextFiles: boolean;
   snapshot: Snapshot;
@@ -641,7 +766,7 @@ function attemptErrorMessage(
 async function runReviewer(o: ReviewerRunOptions): Promise<ReviewerResult> {
   const attempt1 = await runAttempt({
     reviewer: o.reviewer,
-    promptText: o.initialPrompt,
+    promptArg: o.initialPromptArg,
     extensionPath: o.extensionPath,
     includeContextFiles: o.includeContextFiles,
     snapshotRoot: o.snapshot.root,
@@ -707,10 +832,19 @@ async function runReviewer(o: ReviewerRunOptions): Promise<ReviewerResult> {
   }
 
   // Exactly one repair attempt: a second, independent process spawn, given only the validation
-  // errors and this reviewer's own prior output.
+  // errors and this reviewer's own prior output. That prior output can itself be large (a
+  // reviewer's own full first-attempt output, up to its token ceiling), so it goes through the
+  // same file-reference delivery as the initial prompt rather than back onto argv -- a unique
+  // filename per attempt since, unlike the initial prompt, repair prompts differ reviewer to
+  // reviewer and must never collide with one another on disk.
+  const repairPromptArg = writePromptFileArg(
+    o.runDir,
+    `repair-${randomUUID()}.txt`,
+    buildRepairPrompt(extracted1.errors, attempt1.text),
+  );
   const attempt2 = await runAttempt({
     reviewer: o.reviewer,
-    promptText: buildRepairPrompt(extracted1.errors, attempt1.text),
+    promptArg: repairPromptArg,
     extensionPath: o.extensionPath,
     includeContextFiles: o.includeContextFiles,
     snapshotRoot: o.snapshot.root,
@@ -904,13 +1038,26 @@ export async function runPanel(o: RunPanelOptions): Promise<RunPanelOutcome> {
   const patchContent = readFileSync(o.patchPath, 'utf8');
   const initialPrompt = buildInitialPrompt(o.prompt, patchContent);
 
+  // `patchPath`'s own directory is the run directory (Section 15's `createRunDir` creates it,
+  // `writePatch` writes `patch.diff` directly into it) -- reused here rather than threading a
+  // separate "run directory" option through `RunPanelOptions`, since the two paths must already
+  // agree for this run and `patchPath` is the one piece of that this module already receives.
+  const runDir = dirname(o.patchPath);
+
+  // Written once and shared by every reviewer's first attempt, never per-reviewer: this is what
+  // the "no cross-contamination" structural guarantee (see `buildInitialPrompt`'s own comment)
+  // rests on -- byte-identical argv input for every reviewer, now a byte-identical `@file`
+  // reference instead of a byte-identical inline string.
+  const initialPromptArg = writePromptFileArg(runDir, 'initial-prompt.txt', initialPrompt);
+
   const progress = new ProgressReporter(o.reviewers, o.progressStream);
   const results: Array<ReviewerResult | undefined> = new Array(o.reviewers.length);
 
   const runOne = async (reviewer: Reviewer, idx: number): Promise<void> => {
     const result = await runReviewer({
       reviewer,
-      initialPrompt,
+      initialPromptArg,
+      runDir,
       extensionPath: o.extensionPath,
       includeContextFiles: o.includeContextFiles,
       snapshot: o.snapshot,

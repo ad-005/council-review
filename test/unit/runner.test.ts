@@ -10,9 +10,9 @@
  * `writeModelSwitchedHostWrapper` below for why that's needed instead of `sequenceEnv` there).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 // `node:child_process`'s ESM namespace is not configurable, so `vi.spyOn` cannot wrap it
@@ -494,10 +494,15 @@ describe('no cross-contamination', () => {
       { cwd: string; env: NodeJS.ProcessEnv },
     ][];
 
-    const prompts = calls.map(([, argv]) => argv[argv.length - 1]);
+    const prompts = calls.map(([, argv]) => argv[argv.length - 1]!);
     expect(new Set(prompts).size).toBe(1); // byte-identical trailing prompt argument for all three
-    expect(prompts[0]).toContain('Review this patch');
-    expect(prompts[0]).toContain('diff --git');
+    // The prompt itself never rides on argv (see the E2BIG regression tests below) -- the
+    // trailing argument is always a short `@<path>` file reference, and it's the referenced
+    // file's content that must carry the task prompt and the patch.
+    expect(prompts[0]).toMatch(/^@\//);
+    const promptFileContent = readFileSync(prompts[0]!.slice(1), 'utf8');
+    expect(promptFileContent).toContain('Review this patch');
+    expect(promptFileContent).toContain('diff --git');
 
     const cwds = calls.map(([, , opts]) => opts.cwd);
     expect(new Set(cwds).size).toBe(1); // shared snapshot root, nothing reviewer-specific
@@ -510,6 +515,184 @@ describe('no cross-contamination', () => {
     // structurally incapable of carrying another reviewer's output because nothing else varies.
     const models = calls.map(([, argv]) => argv[argv.indexOf('--model') + 1]);
     expect(models).toEqual(['model-a', 'model-b', 'model-c']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// E2BIG regression: a large patch must never be inlined into argv
+// ---------------------------------------------------------------------------------------------
+//
+// A single ordinary large diff used to make the entire panel fail with a raw `spawn E2BIG`: the
+// whole composed prompt (task instructions + the patch, verbatim) was pushed as one `argv`
+// element, and once that string's byte length (combined with the process environment) exceeded
+// the OS's `ARG_MAX`, `spawn()` failed outright and no reviewer in the panel ran at all. The fix
+// writes the prompt to a file in the run directory and hands the reviewer an `@<path>` reference
+// instead -- these tests hold both ends of that: the mechanism actually avoids the OS failure
+// (against a real `spawn()`, not a mock), and a spawn failure that still occurs is never reported
+// as a bare, unexplained string.
+
+describe('E2BIG regression: large-patch delivery', () => {
+  it('spawning a single huge argv element really does fail with E2BIG on this system (documents the bug this fix targets)', async () => {
+    // Not exercising runPanel here -- this is the shape of the OLD, buggy call (the entire
+    // payload inlined as one argv element), reproduced directly against the real `spawn()` to
+    // establish, with a live assertion rather than a comment, that the underlying OS failure is
+    // real on this machine and not merely hypothetical.
+    // `spawn()` can fail either synchronously (this platform throws the E2BIG failure directly
+    // out of the call) or asynchronously via the child's `'error'` event -- exactly the two
+    // sites `runAttempt` guards, and exactly why this test tolerates both.
+    const hugeArg = 'x'.repeat(4_000_000);
+    let code: string | undefined;
+    try {
+      const child = cp.spawn(process.execPath, ['-e', '0', hugeArg]);
+      code = await new Promise<string | undefined>((resolvePromise) => {
+        child.on('error', (e) => resolvePromise((e as NodeJS.ErrnoException).code));
+        child.on('spawn', () => {
+          child.kill();
+          resolvePromise(undefined); // spawn unexpectedly succeeded on this system
+        });
+      });
+    } catch (err) {
+      code = (err as NodeJS.ErrnoException).code;
+    }
+    expect(code).toBe('E2BIG');
+  });
+
+  it('reviews a patch far larger than would fit on the command line without any reviewer failing', async () => {
+    setFixture('clean-with-tools');
+    // Larger than any real system's ARG_MAX (and larger than Linux's 128KiB per-argument cap) --
+    // under the old inline-argv delivery this alone would have failed every reviewer.
+    const hugePatchContent = `diff --git a/src/foo.ts b/src/foo.ts\n${'+// padding line\n'.repeat(150_000)}`;
+    const patchPath = makePatch(hugePatchContent);
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer], patchPath }));
+    const result = outcome.results[0]!;
+
+    expect(result.error).toBeUndefined();
+    expect(result.state).toBe('ok');
+    expect(result.findings).not.toBeNull();
+
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
+    const argv = spawnSpy.mock.calls[0]![1] as string[];
+    const trailingArg = argv[argv.length - 1]!;
+    // The one thing that must NOT scale with patch size is the argv token itself.
+    expect(trailingArg.length).toBeLessThan(500);
+    expect(trailingArg).toMatch(/^@\//);
+
+    const promptFilePath = trailingArg.slice(1);
+    const promptFileContent = readFileSync(promptFilePath, 'utf8');
+    expect(promptFileContent).toContain(hugePatchContent);
+
+    // Written into the run directory (next to `patch.diff`), never into the snapshot.
+    expect(dirname(dirname(promptFilePath))).toBe(dirname(patchPath));
+  });
+
+  it('writes each reviewer a distinct repair-prompt file, never colliding, when a repair attempt is needed', async () => {
+    Object.assign(process.env, sequenceEnv(['invalid-findings', 'valid-findings']));
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const patchPath = makePatch();
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer], patchPath }));
+    expect(outcome.results[0]!.state).toBe('ok');
+
+    expect(spawnSpy).toHaveBeenCalledTimes(2); // first attempt, then the repair
+    const repairArgv = spawnSpy.mock.calls[1]![1] as string[];
+    const repairTrailingArg = repairArgv[repairArgv.length - 1]!;
+    expect(repairTrailingArg).toMatch(/^@\//);
+    const repairPromptContent = readFileSync(repairTrailingArg.slice(1), 'utf8');
+    expect(repairPromptContent).toContain('Re-emit your complete findings'); // the repair instruction text
+    expect(repairPromptContent).toContain('severe'); // the reviewer's own first-attempt output
+  });
+
+  it('never surfaces a bare spawn errno: a real spawn failure is mapped to an explanatory message', async () => {
+    setFixture('clean-with-tools');
+    // ENOENT is the easiest real spawn failure to force deterministically and cross-platform.
+    process.env.COUNCIL_PI_BIN = join(baseDir, 'this-binary-does-not-exist');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
+    const result = outcome.results[0]!;
+
+    expect(result.state).toBe('failed');
+    expect(result.error).toBeDefined();
+    expect(result.error).not.toBe('spawn ENOENT'); // never a bare, unexplained errno string
+    expect(result.error).toContain('ENOENT');
+    expect(result.error).toContain('was not found');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// File-envelope notice: a live run found a reviewer chasing the wrapper path
+// ---------------------------------------------------------------------------------------------
+//
+// pi's own `processFileArguments` wraps whatever `@file` delivery hands it in a
+// `<file name="<absolute path>">...</file>` tag. A live run against real pi 0.84.4 found one
+// reviewer (`openrouter/amazon/nova-micro-v1`) take that name at face value: it called
+// `council_read` and `council_grep` on the prompt file's own path, was correctly refused ("path
+// escapes the allowed root" -- containment held, this was a quality problem, not a security one),
+// and explicitly degraded its own review as a result. `writePromptFileArg` now prepends a fixed
+// notice to every prompt it writes, unconditionally (both the initial prompt and a repair
+// prompt), so no reviewer -- regardless of patch size -- is left to guess what the wrapper means.
+
+describe('file-envelope notice', () => {
+  it('tells the reviewer the wrapper path is a delivery artifact, on an ordinary small patch, before the actual task content', async () => {
+    setFixture('clean-with-tools');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const patchPath = makePatch(); // the small, ordinary-size default patch
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer], patchPath }));
+    expect(outcome.results[0]!.state).toBe('ok');
+
+    const argv = spawnSpy.mock.calls[0]![1] as string[];
+    const trailingArg = argv[argv.length - 1]!;
+    expect(trailingArg).toMatch(/^@\//); // @file delivery unconditionally, not just for large patches
+    const promptFileContent = readFileSync(trailingArg.slice(1), 'utf8');
+
+    expect(promptFileContent).toContain('delivered as file content');
+    expect(promptFileContent).toContain('not part of the repository under review');
+    expect(promptFileContent).toContain('Do not attempt to read, grep, or list it');
+    expect(promptFileContent).toContain('council_read, council_grep, council_list and council_git');
+
+    // The notice comes BEFORE the actual task content, since the model reads top to bottom.
+    const noticeIndex = promptFileContent.indexOf('delivered as file content');
+    const taskIndex = promptFileContent.indexOf('Review this patch');
+    expect(noticeIndex).toBeGreaterThanOrEqual(0);
+    expect(taskIndex).toBeGreaterThan(noticeIndex);
+  });
+
+  it('carries the same notice on a repair prompt', async () => {
+    Object.assign(process.env, sequenceEnv(['invalid-findings', 'valid-findings']));
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
+    expect(outcome.results[0]!.state).toBe('ok');
+
+    const repairArgv = spawnSpy.mock.calls[1]![1] as string[];
+    const repairPromptContent = readFileSync(repairArgv[repairArgv.length - 1]!.slice(1), 'utf8');
+    expect(repairPromptContent).toContain('delivered as file content');
+    expect(repairPromptContent.indexOf('delivered as file content')).toBeLessThan(
+      repairPromptContent.indexOf('Re-emit your complete findings'),
+    );
+  });
+
+  it('still delivers the notice on the large patch from the E2BIG regression above -- one mechanism, not a size-conditional one', async () => {
+    setFixture('clean-with-tools');
+    const hugePatchContent = `diff --git a/src/foo.ts b/src/foo.ts\n${'+// padding line\n'.repeat(150_000)}`;
+    const patchPath = makePatch(hugePatchContent);
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer], patchPath }));
+    expect(outcome.results[0]!.state).toBe('ok');
+
+    const argv = spawnSpy.mock.calls[0]![1] as string[];
+    const promptFileContent = readFileSync(argv[argv.length - 1]!.slice(1), 'utf8');
+    expect(promptFileContent).toContain('delivered as file content');
+    expect(promptFileContent).toContain(hugePatchContent);
   });
 });
 
