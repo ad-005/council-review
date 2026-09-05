@@ -26,10 +26,16 @@ class ScriptedTerminal {
   readonly output = new PassThrough();
   buffer = '';
 
-  constructor() {
+  constructor(options: { columns?: number } = {}) {
     this.output.on('data', (chunk: Buffer) => {
       this.buffer += chunk.toString('utf8');
     });
+    if (options.columns !== undefined) {
+      Object.defineProperty(this.output, 'columns', {
+        value: options.columns,
+        configurable: true,
+      });
+    }
   }
 
   send(keys: string): void {
@@ -87,6 +93,11 @@ const KIMI = model({
   reasoning: false,
 });
 const GLM = model({ id: 'glm-5.2', provider: 'opencode-go', vendor: 'zhipu', reasoning: true });
+
+// `provider/id` alone is ~99 characters here — over the inquirer fallback width of 80 columns,
+// but under the 120-column terminal the test below drives the picker at.
+const WIDE_ID = 'a'.repeat(90);
+const WIDE = model({ id: WIDE_ID, provider: 'opencode', vendor: 'opencode', reasoning: false });
 
 function catalogOf(models: CatalogModel[]): Catalog {
   const providerIds = Array.from(new Set(models.map((m) => m.provider)));
@@ -216,6 +227,31 @@ describe('pickPanel — full staged selection', () => {
     const reviewers = await resultPromise;
     expect(reviewers).toHaveLength(1);
     expect(reviewers[0]?.provider).toBe('minimax');
+  }, 10_000);
+});
+
+describe('pickPanel — terminal width', () => {
+  it('does not hard-wrap a long model id when the relay reports the real terminal width', async () => {
+    const catalog = catalogOf([WIDE]);
+    const term = new ScriptedTerminal({ columns: 120 });
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER); // select the only provider
+
+    await term.waitFor('Select models');
+    // At the buggy 80-column fallback, inquirer hard-wraps mid-token and this id is split across
+    // two rendered lines; at the real 120-column width it stays on one line, contiguous.
+    expect(term.buffer).toContain(WIDE_ID);
+
+    term.send(SPACE + ENTER); // select the only model; non-reasoning, so no thinking stage follows
+
+    await resultPromise;
   }, 10_000);
 });
 

@@ -20,7 +20,7 @@ import { resolveThinking, supportedLevels } from './thinking.js';
 
 export interface PickerIO {
   input: NodeJS.ReadableStream;
-  output: NodeJS.WritableStream;
+  output: NodeJS.WritableStream & Partial<Pick<NodeJS.WriteStream, 'columns' | 'rows' | 'isTTY'>>;
   isTTY: boolean;
 }
 
@@ -108,12 +108,27 @@ function splitModelKey(key: string): { provider: string; id: string } {
  * caller-supplied stream for good after the very first of this picker's three stages. Relaying
  * through a disposable `PassThrough` with `{ end: false }` on the downstream pipe means only the
  * disposable relay ever gets closed; `io.output` stays open for every later stage.
+ *
+ * The relay also needs to mirror `io.output`'s `columns`/`rows`/`isTTY`, because that is how
+ * inquirer measures the terminal: `@inquirer/core`'s `readlineWidth()` goes through `cli-width`,
+ * and node's own `readline.Interface#columns`, both of which end up reading `.columns` off
+ * whatever stream inquirer was handed — here, the relay, not the real terminal. A relay that
+ * reports no width silently falls back to 80 columns, which hard-wraps long model labels mid-word
+ * and makes `ScreenManager` erase the wrong number of lines on every re-render (arrow keys leave
+ * stale copies of the list on screen). Defined as getters rather than copied once, so a mid-prompt
+ * terminal resize is still reflected on the next render, exactly as it would be against real
+ * stdout.
  */
 function promptContext(io: PickerIO): {
   input: NodeJS.ReadableStream;
   output: NodeJS.WritableStream;
 } {
   const relay = new PassThrough();
+  Object.defineProperties(relay, {
+    columns: { get: () => io.output.columns, configurable: true },
+    rows: { get: () => io.output.rows, configurable: true },
+    isTTY: { get: () => io.output.isTTY === true, configurable: true },
+  });
   relay.pipe(io.output, { end: false });
   return { input: io.input, output: relay };
 }
