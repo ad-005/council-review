@@ -287,8 +287,16 @@ export interface GuardResult {
  * point there is that `unknown` is admitted rather than rejected, not that it is exempt from
  * collapsing). The model-count check runs first so its message doesn't get crowded out by a
  * vendor-count message that would be equally true of a too-small panel.
+ *
+ * Typed against a structural minimum (only the three fields this function actually reads)
+ * rather than the full `Reviewer` shape, so `status.ts` can hand it plain `{provider, model,
+ * vendor}` objects derived from config alone -- reusing this exact guard verdict -- without
+ * needing to build a `CatalogModel` or resolve thinking levels for anything. `Reviewer` remains
+ * assignable, so every existing caller is unaffected.
  */
-export function checkIndependence(reviewers: readonly Reviewer[]): GuardResult {
+export function checkIndependence(
+  reviewers: readonly { provider: string; model: string; vendor: string }[],
+): GuardResult {
   const vendors = new Map<string, string[]>();
   for (const r of reviewers) {
     const key = `${r.provider}/${r.model}`;

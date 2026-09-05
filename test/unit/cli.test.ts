@@ -643,6 +643,83 @@ describe('models', () => {
   });
 });
 
+describe('status', () => {
+  it('exits 0 in a configured repository', async () => {
+    writeConfigFile();
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli(['status']);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain('configured:   yes');
+  });
+
+  it('exits 2 in an unconfigured repository', async () => {
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli(['status']);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(2);
+    expect(stdout.text()).toContain('configured:   no');
+  });
+
+  it('--json writes parseable JSON to stdout', async () => {
+    writeConfigFile();
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli(['status', '--json']);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdout.text()) as { configured: boolean; panel: unknown[] };
+    expect(parsed.configured).toBe(true);
+    expect(parsed.panel).toHaveLength(3);
+  });
+
+  it('an unknown flag exits 2 and prints the status help', async () => {
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['status', '--nope']);
+    } finally {
+      stderr.restore();
+    }
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('council-review status');
+  });
+
+  it("outside a git repository, exits 2, reports repoRoot: null under --json, and never leaks git's own stderr", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'council-cli-test-outside-'));
+    process.chdir(outside);
+    const stderr = captureStream(process.stderr);
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli(['status', '--json']);
+    } finally {
+      stderr.restore();
+      stdout.restore();
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+    expect(code).toBe(2);
+    // findRepoRoot's underlying `git rev-parse --show-toplevel` fails here and is expected to;
+    // what must never happen is git's own "fatal: ..." line leaking onto our stderr on top of
+    // the clean, structured report status itself produces.
+    expect(stderr.text()).not.toMatch(/fatal:|not a git repository \(or any of the parent/);
+    const parsed = JSON.parse(stdout.text()) as { repoRoot: string | null; configured: boolean };
+    expect(parsed.repoRoot).toBeNull();
+    expect(parsed.configured).toBe(false);
+  });
+});
+
 // -------------------------------------------------------------------------------------------
 // Guard refusal (exit 4)
 // -------------------------------------------------------------------------------------------
@@ -1128,20 +1205,23 @@ describe('--direction validation', () => {
     expect(stderr.text()).toContain('down');
   });
 
-  it.each(['vertical', 'horizontal'])('--direction %s is accepted outside herdr', async (direction) => {
-    useFixtures({ defaultFixture: 'unparseable-lines' });
-    writeConfigFile();
-    makeWorkingChange();
+  it.each(['vertical', 'horizontal'])(
+    '--direction %s is accepted outside herdr',
+    async (direction) => {
+      useFixtures({ defaultFixture: 'unparseable-lines' });
+      writeConfigFile();
+      makeWorkingChange();
 
-    const stderr = captureStream(process.stderr);
-    let code: number;
-    try {
-      code = await runCli(['--pane', '--direction', direction]);
-    } finally {
-      stderr.restore();
-    }
-    expect(code).toBe(0);
-  });
+      const stderr = captureStream(process.stderr);
+      let code: number;
+      try {
+        code = await runCli(['--pane', '--direction', direction]);
+      } finally {
+        stderr.restore();
+      }
+      expect(code).toBe(0);
+    },
+  );
 
   it('omitting --direction still defaults to horizontal and runs cleanly', async () => {
     useFixtures({ defaultFixture: 'unparseable-lines' });

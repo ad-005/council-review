@@ -66,7 +66,16 @@ const EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
  */
 export function findRepoRoot(cwd: string): string {
   try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8' }).trim();
+    // `stdio` is given explicitly so git's own stderr (e.g. "fatal: not a git repository...") is
+    // discarded rather than forwarded to our stderr, which `execFileSync` does by default. The
+    // `catch` below already raises a better-worded `ScopeError`, and callers like `status` treat
+    // "not a git repository" as ordinary, reportable state rather than a crash -- git's own noise
+    // on top of that would make a clean status report look like a failure.
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
   } catch {
     throw new ScopeError(`not a git repository (or any parent up to the mount point): "${cwd}"`);
   }
