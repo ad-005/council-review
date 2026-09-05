@@ -303,6 +303,28 @@ function validateFailOn(raw: string): CouncilConfig['failOn'] {
   return raw as CouncilConfig['failOn'];
 }
 
+const DIRECTIONS = ['horizontal', 'vertical'] as const;
+
+/**
+ * Validates `--direction` the same way every other enum-valued flag is validated (`--thinking`,
+ * `--fail-on`): anything other than exactly one of the two accepted literals exits 2 naming what
+ * was given, rather than silently coercing an unrecognised value to the default. Before this
+ * check existed, the call site did `values.direction === 'vertical' ? 'vertical' : 'horizontal'`,
+ * so any typo — or, worse, `--direction down` — was silently accepted as `horizontal`. `down` is
+ * a particularly likely mistake: herdr's own `pane split --direction` vocabulary is `right`/`down`
+ * (see `splitPaneAndRun` in herdr.ts, which maps `horizontal`->`right` and `vertical`->`down`), so
+ * a user who reaches for the herdr word for "stacked" gets, silently, the opposite layout.
+ */
+function validateDirection(raw: string | undefined): 'horizontal' | 'vertical' {
+  if (raw === undefined) return 'horizontal';
+  if (!(DIRECTIONS as readonly string[]).includes(raw)) {
+    throw new UsageError(
+      `invalid --direction value: "${raw}" (expected one of ${DIRECTIONS.join(', ')})`,
+    );
+  }
+  return raw as 'horizontal' | 'vertical';
+}
+
 const SEVERITY_RANK: Record<Severity, number> = { low: 0, medium: 1, high: 2, critical: 3 };
 
 function breachesThreshold(
@@ -625,6 +647,11 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
     thinkingFlag = values.thinking;
   }
 
+  // Validated eagerly (alongside --thinking above), not deferred to inside the `--pane` branch
+  // below: an unrecognised value is a usage error regardless of whether --pane is even present,
+  // consistent with every other enum-valued flag never waiting on how it happens to be used.
+  const direction = validateDirection(values.direction);
+
   const allowCorrelated = Boolean(values['allow-correlated']);
   const jsonMode = Boolean(values.json);
   const noSuppress = Boolean(values['no-suppress']);
@@ -689,7 +716,6 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
   }
 
   if (values.pane && !values['no-pane']) {
-    const direction = values.direction === 'vertical' ? 'vertical' : 'horizontal';
     const delegateArgv = [process.argv[0]!, process.argv[1]!, ...args];
     const { attempted } = splitPaneAndRun(delegateArgv, direction);
     if (attempted) {

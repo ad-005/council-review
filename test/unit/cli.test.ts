@@ -1079,6 +1079,87 @@ describe('herdr flags outside a herdr environment', () => {
 });
 
 // -------------------------------------------------------------------------------------------
+// --direction validation: every other enum-valued flag (--thinking, --fail-on) exits 2 on an
+// unrecognised value rather than silently coercing it to a default. Before this fix, `--direction`
+// was the one exception -- anything that wasn't exactly "vertical" fell through to "horizontal",
+// which is a particularly sharp trap for `--direction down`: herdr's own `pane split --direction`
+// vocabulary is `right`/`down` (see herdr.ts's splitPaneAndRun), so a user reaching for the herdr
+// word silently got the opposite layout with no indication anything was wrong.
+// -------------------------------------------------------------------------------------------
+
+describe('--direction validation', () => {
+  it('an unrecognised --direction value exits 2 and names the value, even without --pane', async () => {
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--direction', 'sideways']);
+    } finally {
+      stderr.restore();
+    }
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('sideways');
+  });
+
+  it('--pane --direction sideways exits 2 rather than silently falling back to horizontal', async () => {
+    useFixtures({ defaultFixture: 'unparseable-lines' });
+    writeConfigFile();
+    makeWorkingChange();
+
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--pane', '--direction', 'sideways']);
+    } finally {
+      stderr.restore();
+    }
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('sideways');
+  });
+
+  it('--direction down (a plausible herdr-vocabulary mistake) is rejected rather than silently accepted', async () => {
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--pane', '--direction', 'down']);
+    } finally {
+      stderr.restore();
+    }
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('down');
+  });
+
+  it.each(['vertical', 'horizontal'])('--direction %s is accepted outside herdr', async (direction) => {
+    useFixtures({ defaultFixture: 'unparseable-lines' });
+    writeConfigFile();
+    makeWorkingChange();
+
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--pane', '--direction', direction]);
+    } finally {
+      stderr.restore();
+    }
+    expect(code).toBe(0);
+  });
+
+  it('omitting --direction still defaults to horizontal and runs cleanly', async () => {
+    useFixtures({ defaultFixture: 'unparseable-lines' });
+    writeConfigFile();
+    makeWorkingChange();
+
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--pane']);
+    } finally {
+      stderr.restore();
+    }
+    expect(code).toBe(0);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
 // Interruption: cmdReview manages SIGINT/SIGTERM itself (buildSnapshot is called with
 // `handleSignals: false` precisely so it can), so the interruption must actually be reported and
 // the snapshot must actually be removed -- not silently pre-empted by snapshot.ts's own signal
