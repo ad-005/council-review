@@ -84,20 +84,29 @@ export interface ReviewerExtensionAPI {
  * symlink that escapes, and a symlink on an *intermediate* directory component that escapes —
  * all four collapse to the same check: resolve fully, then compare against the resolved root.
  *
+ * An empty string and `'.'` are both accepted as spellings of "the root itself" — a reviewer
+ * inspecting the tree it was given naturally reaches for an empty path when asking a snapshot
+ * tool to look at the root, and rejecting that before the request even reaches the containment
+ * check just burns a turn for no security benefit. This is a pure input normalisation done
+ * *before* any resolution: `''` becomes `'.'`, and from there it flows through the exact same
+ * `join`/`realpathSync`/prefix-check pipeline as every other path below, so it carries no
+ * special-case bypass and gains no privilege a literal `'.'` didn't already have.
+ *
  * The design's TOCTOU note applies here: callers must perform every filesystem operation against
  * the *returned* resolved path, never re-resolve or re-derive it from the original input.
  */
 export function resolveContained(root: string, requestedPath: unknown): string {
-  if (typeof requestedPath !== 'string' || requestedPath.length === 0) {
-    throw new Error('path must be a non-empty string');
+  if (typeof requestedPath !== 'string') {
+    throw new Error('path must be a string');
   }
   if (requestedPath.includes('\0')) {
     throw new Error('path must not contain a NUL byte');
   }
+  const normalizedPath = requestedPath.length === 0 ? '.' : requestedPath;
 
   const resolvedRoot = resolveRoot(root);
-  const candidate = isAbsolute(requestedPath) ? requestedPath : join(root, requestedPath);
-  const resolvedCandidate = safeRealpath(candidate, requestedPath);
+  const candidate = isAbsolute(normalizedPath) ? normalizedPath : join(root, normalizedPath);
+  const resolvedCandidate = safeRealpath(candidate, requestedPath || '.');
 
   if (resolvedCandidate !== resolvedRoot && !resolvedCandidate.startsWith(resolvedRoot + sep)) {
     throw new Error(`path escapes the allowed root: ${requestedPath}`);
@@ -225,7 +234,7 @@ const readParameters = {
     path: {
       type: 'string',
       description:
-        'File path relative to the snapshot root (or an absolute path inside it) to read.',
+        'File path relative to the snapshot root (or an absolute path inside it) to read. An empty string or "." means the root itself, which is a directory and will fail -- use council_list for that.',
     },
     startLine: {
       type: 'number',
@@ -370,7 +379,7 @@ const grepParameters = {
     path: {
       type: 'string',
       description:
-        'Directory or file to search, relative to the snapshot root. Defaults to the snapshot root.',
+        'Directory or file to search, relative to the snapshot root. Empty string, ".", or omitting it all mean the whole snapshot root.',
     },
     ignoreCase: { type: 'boolean', description: 'Match case-insensitively.' },
     maxResults: {
@@ -490,7 +499,7 @@ const listParameters = {
     path: {
       type: 'string',
       description:
-        'Directory to list, relative to the snapshot root. Defaults to the snapshot root.',
+        'Directory to list, relative to the snapshot root. Empty string, ".", or omitting it all mean the snapshot root itself.',
     },
     recursive: {
       type: 'boolean',

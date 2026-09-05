@@ -103,6 +103,15 @@ describe('resolveContained', () => {
   it('accepts the root itself', () => {
     expect(() => resolveContained(fx.snapshotRoot, '.')).not.toThrow();
   });
+
+  it('accepts an empty string as another spelling of the root', () => {
+    expect(() => resolveContained(fx.snapshotRoot, '')).not.toThrow();
+    expect(resolveContained(fx.snapshotRoot, '')).toBe(resolveContained(fx.snapshotRoot, '.'));
+  });
+
+  it('rejects a NUL byte in the path even though empty-string normalisation exists', () => {
+    expect(() => resolveContained(fx.snapshotRoot, 'inside.txt\0')).toThrow();
+  });
 });
 
 describe('council_read containment', () => {
@@ -158,6 +167,14 @@ describe('council_read containment', () => {
     expect(text).toContain('secret-marker');
     expect(text).not.toContain('OUTSIDE');
   });
+
+  it('readInRoot on an empty path (the root) gives the informative "is a directory" error, not a path-validation error', () => {
+    expect(() => readInRoot(fx.snapshotRoot, { path: '' })).toThrow(/is a directory/);
+  });
+
+  it('readInRoot on "." (the root) gives the same informative "is a directory" error', () => {
+    expect(() => readInRoot(fx.snapshotRoot, { path: '.' })).toThrow(/is a directory/);
+  });
 });
 
 describe('council_grep containment', () => {
@@ -208,6 +225,12 @@ describe('council_grep containment', () => {
     );
     expect(result.content[0]?.text).toContain('inside.txt:3');
   });
+
+  it('grepInRoot succeeds with an empty string as the search root, same as the default', () => {
+    const outcome = grepInRoot(fx.snapshotRoot, { pattern: 'secret-marker', path: '' });
+    expect(outcome.matches).toHaveLength(1);
+    expect(outcome.matches[0]?.path).toBe('inside.txt');
+  });
 });
 
 describe('council_list containment', () => {
@@ -245,6 +268,24 @@ describe('council_list containment', () => {
 
   it('the registered council_list tool succeeds for the root via execute()', async () => {
     const result = await councilListTool.execute('id', {}, undefined, undefined, {});
+    expect(result.content[0]?.text).toContain('inside.txt');
+  });
+
+  it('listInRoot succeeds for an empty string path, same as the root', () => {
+    const outcome = listInRoot(fx.snapshotRoot, { path: '' });
+    const names = outcome.entries.map((e) => e.path);
+    expect(names).toContain('inside.txt');
+    expect(names).toContain('subdir');
+    expect(names.some((n) => n.includes('secret'))).toBe(false);
+  });
+
+  it('the registered council_list tool succeeds for path "" via execute()', async () => {
+    const result = await councilListTool.execute('id', { path: '' }, undefined, undefined, {});
+    expect(result.content[0]?.text).toContain('inside.txt');
+  });
+
+  it('the registered council_list tool succeeds for path "." via execute()', async () => {
+    const result = await councilListTool.execute('id', { path: '.' }, undefined, undefined, {});
     expect(result.content[0]?.text).toContain('inside.txt');
   });
 
