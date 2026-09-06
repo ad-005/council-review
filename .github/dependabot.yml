@@ -11,7 +11,10 @@ updates:
         # declares peerOptional eslint@^10.0.0, and a standalone @eslint/js
         # bump (#15) left the repo on eslint@9 with no PR touching eslint
         # itself, so npm ci failed with ERESOLVE and the PR was unmergeable
-        # on its own.
+        # on its own. typescript-eslint@8.69.0 declares
+        # peerDependencies.typescript: ">=4.8.4 <6.1.0", so a standalone
+        # TypeScript bump breaks npm ci with ERESOLVE too (#22, TypeScript
+        # 7.0.2) — grouping typescript here makes them move together.
         patterns:
           - 'eslint'
           - '@eslint/*'
@@ -19,6 +22,7 @@ updates:
           - 'eslint-plugin-*'
           - 'typescript-eslint'
           - '@typescript-eslint/*'
+          - 'typescript'
       vitest:
         # vitest and its companion packages version in lockstep; splitting
         # them risks the same kind of unmergeable mismatch as the eslint

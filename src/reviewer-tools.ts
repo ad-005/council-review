@@ -132,10 +132,11 @@ function safeRealpath(target: string, label: string): string {
     const code =
       err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : undefined;
     if (code === 'ENOENT') {
-      throw new Error(`no such file or directory: ${label}`);
+      throw new Error(`no such file or directory: ${label}`, { cause: err });
     }
     throw new Error(
       `cannot resolve path "${label}": ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
     );
   }
 }
@@ -332,6 +333,7 @@ export function grepInRoot(root: string, params: GrepParams): GrepOutcome {
   } catch (err) {
     throw new Error(
       `invalid regular expression: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
     );
   }
 
@@ -651,7 +653,7 @@ export function runGitHistory(repoRoot: string, params: GitParams): string {
         : '';
     const message =
       stderr.trim().length > 0 ? stderr.trim() : err instanceof Error ? err.message : String(err);
-    throw new Error(`git ${String(params.subcommand)} failed: ${message}`);
+    throw new Error(`git ${String(params.subcommand)} failed: ${message}`, { cause: err });
   }
 }
 
