@@ -4,7 +4,42 @@ updates:
     directory: '/'
     schedule:
       interval: 'weekly'
+    open-pull-requests-limit: 10
+    groups:
+      eslint:
+        # eslint and its plugins/configs must bump together: @eslint/js@10
+        # declares peerOptional eslint@^10.0.0, and a standalone @eslint/js
+        # bump (#15) left the repo on eslint@9 with no PR touching eslint
+        # itself, so npm ci failed with ERESOLVE and the PR was unmergeable
+        # on its own.
+        patterns:
+          - 'eslint'
+          - '@eslint/*'
+          - 'eslint-config-*'
+          - 'eslint-plugin-*'
+          - 'typescript-eslint'
+          - '@typescript-eslint/*'
+      vitest:
+        # vitest and its companion packages version in lockstep; splitting
+        # them risks the same kind of unmergeable mismatch as the eslint
+        # group above.
+        patterns:
+          - 'vitest'
+          - '@vitest/*'
+    ignore:
+      - dependency-name: '@types/node'
+        # @types/node must track the lowest Node version this package
+        # supports, not the newest release — typing against a newer Node
+        # than we ship to lets TypeScript accept APIs that don't exist at
+        # runtime. Bump by hand when the supported floor moves (#16).
+        update-types: ['version-update:semver-major']
   - package-ecosystem: 'github-actions'
     directory: '/'
     schedule:
       interval: 'weekly'
+    groups:
+      actions:
+        # All of these are first-party actions/* steps pinned by SHA;
+        # bumping them one at a time is pure churn, so group everything.
+        patterns:
+          - '*'
