@@ -529,10 +529,16 @@ describe('mergeFindings: category resolution for mixed-category clusters', () =>
     }
 
     // Case A: the security-labelled finding's reviewerId sorts first alphabetically.
-    const caseA = mergeFindings(build('aaa-security-model', 'zzz-correctness-model'), DEFAULT_OPTIONS);
+    const caseA = mergeFindings(
+      build('aaa-security-model', 'zzz-correctness-model'),
+      DEFAULT_OPTIONS,
+    );
     // Case B: the identical pair of findings — only the reviewer NAMES are renamed, so the
     // CORRECTNESS-labelled finding's reviewerId now sorts first instead.
-    const caseB = mergeFindings(build('zzz-security-model', 'aaa-correctness-model'), DEFAULT_OPTIONS);
+    const caseB = mergeFindings(
+      build('zzz-security-model', 'aaa-correctness-model'),
+      DEFAULT_OPTIONS,
+    );
 
     expect(caseA.findings).toHaveLength(1);
     expect(caseB.findings).toHaveLength(1);

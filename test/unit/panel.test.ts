@@ -447,7 +447,11 @@ describe('resolveSpecPanel duplicate collapsing', () => {
   it('a spec naming the same model three times collapses to a single-model panel, refused by the guard', () => {
     // This is the "de-duplication must happen BEFORE the guard" requirement: --models 'a,a,a'
     // must be refused as ONE model (too few models), not silently pass as three.
-    const reviewers = resolveSpecPanel('minimax/MiniMax-M2.7,minimax/MiniMax-M2.7,minimax/MiniMax-M2.7', CATALOG, BASE_CONFIG);
+    const reviewers = resolveSpecPanel(
+      'minimax/MiniMax-M2.7,minimax/MiniMax-M2.7,minimax/MiniMax-M2.7',
+      CATALOG,
+      BASE_CONFIG,
+    );
     expect(reviewers).toHaveLength(1);
     expect(() => enforceIndependence(reviewers, false)).toThrow(GuardRefusal);
     try {
