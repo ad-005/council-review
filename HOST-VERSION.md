@@ -8,12 +8,14 @@ output shapes, which are **not** part of any stability contract `council-review`
 ## Currently verified against
 
 ```
-pi 0.84.4
+pi 0.85.1
 ```
 
-npm package: `@earendil-works/pi-coding-agent`. Verified on this development machine by static
-analysis of the installed package's shipped `.d.ts` declarations and its minified bundle (see
-[`docs/design/council-review-design.md`](./docs/design/council-review-design.md)'s
+npm package: `@earendil-works/pi-coding-agent`. Previously verified against `pi 0.84.4` (see the
+history below); re-verified against `0.85.1` on 2026-09-06 — see "Host re-verification
+(2026-09-06, pi 0.85.1)" below for that run's specifics. The original `0.84.4` verification was by
+static analysis of the installed package's shipped `.d.ts` declarations and its minified bundle
+(see [`docs/design/council-review-design.md`](./docs/design/council-review-design.md)'s
 "Empirical baseline" and the recon notes it was built from), plus `pi auth check`. No live model
 call was required to establish the facts this tool depends on.
 
@@ -26,6 +28,11 @@ What was verified, specifically (each has a corresponding assertion in the test 
 - The `--mode json` event stream shape: one JSON object per line, the event union `runner.ts`
   parses, and the fact that `console.log`/banner output is redirected to stderr in headless
   modes regardless of `-ne`, so the JSON stream on stdout is clean by construction.
+- Extension-discovery isolation (`-ne`): as of the 2026-09-06 re-verification this rests on
+  empirical evidence, not just static analysis — see "Host re-verification (2026-09-06,
+  pi 0.85.1)" below. A genuine third-party extension independently installed on this machine
+  (`~/.pi/agent/extensions/playwright`) was used as a real discovery target rather than a
+  synthetic one.
 - `pi auth check --provider <p> --json` returns `{"status":"ready","provider":...,"authType":...}`
   and nothing else — no credential material.
 - `~/.pi/agent/models-store.json` and `~/.pi/agent/models.json` shapes, including the tristate
@@ -151,6 +158,81 @@ select a partial-map model _dynamically_ at run time rather than trusting a hard
 the durable fix: it is no longer sensitive to which specific model happens to have a partial merged
 map on a given day.
 
+## Host re-verification (2026-09-06, pi 0.85.1)
+
+`pi 0.85.1` (npm `@earendil-works/pi-coding-agent`) was released and installed into an isolated
+prefix (never touching this machine's global `pi 0.84.4`) via the `COUNCIL_PI_BIN` seam, and every
+guarantee recorded above was re-checked against it. **Everything passed.** As with the 0.84.4
+verification, passing does not make the guarantee unconditional — it means this specific pinned
+version was checked on this specific date; see "Re-verifying after a host upgrade" below, which
+still applies in full to whatever version runs next.
+
+**Security suite:** `npm run test:security` — 5 files, 208/208 tests passed, including
+`reviewer-tool-surface.test.ts` and `reviewer-spawn.test.ts`.
+
+**Isolation flag surface: unchanged.** Every flag `buildReviewerArgv` composes (`-nbt`, `-ne`,
+`-e`, `-ns`, `-np`, `-na`, `--no-session`, `--no-themes`, `--mode json`, `-p`, `-nc`, `--provider`,
+`--model`, `--thinking`) still exists in the 0.85.1 bundle and in `pi --help`, with matching
+descriptions. No rename, no removal, no meaning change.
+
+**Extension-discovery isolation, re-confirmed empirically — stronger than the file's previous
+claim, which rested on static analysis alone.** This machine has a genuine third-party extension
+installed at `~/.pi/agent/extensions/playwright` that self-announces on load — a real independently
+installed extension, not a synthetic fixture. Running the isolated 0.85.1 binary with a dummy `-e`
+extension and a real `HOME`: _without_ `-ne`, that extension's banner appears, but on **stderr
+only** — stdout remains a clean, well-formed JSON-lines stream throughout; _with_ `-ne` (the actual
+reviewer flag set), the banner does not appear on either stream at all. This empirically confirms
+both that `-ne` fully suppresses discovery of a real third-party extension, and that banner output
+is routed to stderr so the stdout JSON stream is clean by construction — this is now the strongest
+check in this file for that guarantee, superseding the static-analysis-only claim it started as.
+
+**Clamp-timing chain: intact, but one layer deeper — record this for the next re-verifier.** This
+is the subtle check step 4 of "Re-verifying after a host upgrade" warns about. In the 0.85.1
+bundle (`chunks/chunk-JVUZSMYM.js`), `clampThinkingLevel(model,thinkingLevel)` appears at byte
+offset 3397665 and `new Agent({initialState:` at byte offset 3398811 — clamp strictly precedes
+construction, byte-for-byte the same shape as 0.84.4:
+`model?thinkingLevel=clampThinkingLevel(model,thinkingLevel):thinkingLevel="off"` … then
+`agent=new Agent({initialState:{systemPrompt:"",model,thinkingLevel,tools:[]}…`. The
+post-construction gate is likewise unchanged and still structurally incapable of changing the
+value.
+
+What did change: 0.85.1 refactored the _read_ path the `partial-thinking-map.test.ts` probe
+depends on, adding one more layer of indirection than 0.84.4's inline
+`thinkingLevel:this.session.thinkingLevel`. The chain is now: `ExtensionContext.thinkingLevel`
+getter → `runner.runtime.getThinkingLevel()` → wired via
+`this.runtime.getThinkingLevel=actions.getThinkingLevel` → `getThinkingLevel:()=>this.thinkingLevel`
+bound to the Session → the Session's own `get thinkingLevel(){return this.agent.state.thinkingLevel}`.
+Same terminus as before (the true, already-clamped `agent.state.thinkingLevel`), and still no lazy
+re-clamping anywhere in the chain — but it is a longer chain to re-trace than 0.84.4's, and a
+future re-verifier must walk all of it, not just the old inline getter, before trusting the probe's
+verdict against a version newer than this one.
+
+**Live suite, run exactly once, both tests, deliberately as post-upgrade re-verification:**
+
+- `smoke.test.ts`: dynamically selected `openrouter/mistralai/mistral-nemo`. `state=ok`,
+  `in=2084 out=114`, cost `$0.000043`, one schema-valid finding. Confirms the isolation flag
+  surface and `--mode json` event-stream shape still work end to end against 0.85.1.
+- `partial-thinking-map.test.ts`: target model `openrouter/openai/gpt-oss-safeguard-20b` for both
+  phases, same as the 0.84.4 run. Phase 1 (self-check) requested the explicitly-unsupported `off`
+  and observed the predicted clamp to `minimal`, proving the instrument can show a clamp through
+  the longer read path above. Phase 2 requested the omitted `minimal` and observed `minimal`
+  unclamped, exactly as `src/thinking.ts` predicts. **Verdict: CONFIRMED**, same as 0.84.4.
+
+**Other facts re-confirmed:** `pi auth check --provider openrouter --json` returns exactly
+`{"status":"ready","provider":"openrouter","authType":"api_key"}` — no credential material.
+`~/.pi/agent/models-store.json` and `models.json` shapes unchanged, with the tristate
+`thinkingLevelMap` genuinely exercised on this machine (e.g. `deepseek-v4-flash` →
+`{"minimal":null,"low":"low","medium":null,"high":"high","max":"max"}` — explicit nulls, present
+keys, and absent keys all coexisting in one real map). `--no-session` confirmed: zero files written
+under `~/.pi/agent/sessions/` during the whole exercise.
+
+**One non-security usage-surface change worth recording:** 0.85.1's `auth check` now hard-requires
+`--provider <p>` or `--model <m>`; a bare `pi auth check --json` errors with `Auth checks require
+--provider <provider> or --model <model>`. `council-review` always passes `--provider` (see
+`src/providers.ts`), so this does not affect this tool — but it is a real change to `pi`'s own CLI
+surface, not just an internal one, and is recorded here in case a future maintainer invokes
+`pi auth check` by hand and is surprised by the new error.
+
 ## Re-verifying after a host upgrade
 
 **Treat every `pi` upgrade on a machine running `council-review` as requiring re-verification
@@ -193,6 +275,19 @@ thinkingLevel},...})`), so the resolved state the extension reads is already the
    installed bundle for `clampThinkingLevel(` and confirm it still runs before `new Agent(...)`,
    as itemised in "Live end-to-end verification" above) before trusting a new run's verdict either
    way.
+
+   **The read path itself is not stable across host versions either — do not assume it stays a
+   single inline getter.** On 0.84.4 it was one hop: `thinkingLevel:this.session.thinkingLevel` at
+   the `ExtensionContext` construction site. On 0.85.1 (see "Host re-verification (2026-09-06, pi
+   0.85.1)" above) it had grown to five hops: `ExtensionContext.thinkingLevel` getter →
+   `runner.runtime.getThinkingLevel()` → `this.runtime.getThinkingLevel=actions.getThinkingLevel` →
+   `getThinkingLevel:()=>this.thinkingLevel` bound to the Session → the Session's own
+   `get thinkingLevel(){return this.agent.state.thinkingLevel}`. The terminus (the true,
+   already-clamped `agent.state.thinkingLevel`) and the absence of any lazy re-clamping along the
+   way both happened to survive that refactor, but nothing guarantees the next one does. **Re-trace
+   the full chain from `ExtensionContext.thinkingLevel` down to wherever it actually bottoms out,
+   every time, however many hops that turns out to be** — do not stop at the first indirection and
+   assume the rest is unchanged just because it was a single hop last time.
 
 Nothing in `council-review` pins an exact `pi` version at runtime — there is no version check
 against this file. This document is a maintainer's re-verification checklist, not an enforced

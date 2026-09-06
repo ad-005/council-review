@@ -102,9 +102,22 @@
  * conservative ATTEMPTED-INCONCLUSIVE while the fix was being authored) — both are kept there, not
  * erased, because that file's job is to say what was actually verified.
  *
+ * RESULT (2026-09-06, pi 0.85.1): run once, authorised, as post-upgrade re-verification against an
+ * isolated `pi 0.85.1` install (via `COUNCIL_PI_BIN`, never touching this machine's global
+ * `0.84.4`). Same target model both phases: `openrouter/openai/gpt-oss-safeguard-20b`. Phase 1
+ * requested `off`; observed clamp to `minimal` as predicted, proving the instrument can still show
+ * a clamp through 0.85.1's read path. Phase 2 requested the omitted `minimal`; observed `minimal`
+ * unclamped, exactly as predicted. **Verdict: CONFIRMED**, same as 0.84.4. Note that on 0.85.1
+ * `ExtensionContext.thinkingLevel` reaches `agent.state.thinkingLevel` through a longer chain than
+ * the single inline getter described above — see `HOST-VERSION.md`'s "Host re-verification
+ * (2026-09-06, pi 0.85.1)" section for the full traced chain, and its "Re-verifying after a host
+ * upgrade" step 4 for why that chain must be re-traced (not assumed unchanged) on every future
+ * upgrade.
+ *
  * DO NOT set COUNCIL_LIVE=1 or invoke `pi` as a side effect of reading, editing or reviewing this
- * file. It has already been run once, authorised (see RESULT above) — do not re-run it without a
- * fresh, explicit instruction, and never as a side effect of routine work on this file.
+ * file. It has already been run twice, each time authorised (see the RESULT entries above) — do
+ * not re-run it without a fresh, explicit instruction, and never as a side effect of routine work
+ * on this file.
  */
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
