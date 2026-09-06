@@ -407,7 +407,8 @@ function assembleCluster(
     const bestRank = SEVERITY_RANK[best.finding.severity];
     const mRank = SEVERITY_RANK[m.finding.severity];
     if (mRank !== bestRank) return mRank > bestRank ? m : best;
-    return fingerprint(file, m.finding.claim).localeCompare(fingerprint(file, best.finding.claim)) < 0
+    return fingerprint(file, m.finding.claim).localeCompare(fingerprint(file, best.finding.claim)) <
+      0
       ? m
       : best;
   }, members[0]!);

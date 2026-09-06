@@ -18,8 +18,11 @@ raw output, the merged findings, a human report, and a handoff prompt addressed 
 npm install -g council-review
 ```
 
-Requires Node.js 20 or later, and the [`pi`](#the-pi-host-dependency) coding-agent CLI on `PATH`,
-authenticated for at least one provider.
+Requires Node.js 20 or later to install and run `council-review` itself, plus the
+[`pi`](#the-pi-host-dependency) coding-agent CLI on `PATH`, authenticated for at least one
+provider. `pi` itself requires Node.js **>= 22.19.0**, which is the effective floor for actually
+running a review — a Node 20 or 21 install satisfies `council-review`'s own guard but leaves every
+reviewer failing to spawn.
 
 ## Quick start
 
@@ -86,12 +89,13 @@ hand-edited config is checked too. On refusal, nothing is spawned and the tool e
 
 ## Environment (herdr) flags
 
-Only meaningful inside a herdr pane (a terminal pane manager some users run coding agents under,
-detected via an environment marker). Every one of these flags is gated on that marker: outside
-that environment each degrades to exactly one printed notice, and the review itself proceeds and
-completes identically to how it would with none of these flags supplied — same artifacts, same
-exit code. A failing or unavailable herdr command is likewise reported as a warning only; it never
-changes the review's own outcome.
+Only meaningful inside a [herdr](https://herdr.dev) pane (an agent multiplexer some users run
+coding agents under, detected via an environment marker). herdr is an optional integration —
+install it with `brew install herdr` if you want it — and every one of these flags is gated on
+that marker: outside that environment each degrades to exactly one printed notice, and the review
+itself proceeds and completes identically to how it would with none of these flags supplied — same
+artifacts, same exit code. A failing or unavailable herdr command is likewise reported as a warning
+only; it never changes the review's own outcome.
 
 | Flag                                 | Meaning                                                                                                                                                      |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -230,7 +234,7 @@ a low-agreement finding as a hypothesis to test, not an established defect.
 
 Three third-party models read your repository's source under this tool. That is a real trust
 boundary, and this section describes it plainly rather than reassuringly. See
-[`docs/superpowers/specs/2026-09-03-council-review-design.md`](./docs/superpowers/specs/2026-09-03-council-review-design.md)'s
+[`docs/design/council-review-design.md`](./docs/design/council-review-design.md)'s
 "Decisions" and "Risks / Trade-offs" sections for the full reasoning; this is the summary a user
 needs before relying on it.
 
@@ -304,7 +308,9 @@ needs before relying on it.
 
 `council-review` spawns the `pi` coding-agent CLI (npm package `@earendil-works/pi-coding-agent`)
 headlessly per reviewer rather than calling each vendor's API directly, so it can reuse the
-authentication, model catalog and agentic tool loop you already have configured for it. See
+authentication, model catalog and agentic tool loop you already have configured for it. `pi`
+declares `engines: { node: ">=22.19.0" }`, so that version — not `council-review`'s own `>=20`
+floor — is what actually determines whether a review can run. See
 [`HOST-VERSION.md`](./HOST-VERSION.md) for the exact verified version and the re-verification
 procedure after a host upgrade.
 

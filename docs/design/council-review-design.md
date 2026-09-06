@@ -20,10 +20,9 @@ Nothing in the report is filtered by a model — merging is done in code.
 - Output must be machine-readable and traceable back to which model said what.
 - Must run in a herdr pane beside a coding agent, and must also work in a plain
   shell and in CI.
-- No git worktrees are created by this tool. The user's global CLAUDE.md
-  requires all worktree checkouts to be herdr-managed; an ephemeral review
-  snapshot should not consume that lifecycle, so the design avoids worktrees
-  entirely.
+- No git worktrees are created by this tool. An ephemeral review snapshot that
+  exists for seconds should not enter a managed worktree lifecycle, so the
+  design copies into scratch instead of running `git worktree add`.
 
 ## Shape
 

@@ -35,6 +35,13 @@
  * Re-run it only after an actual `pi` upgrade (per `HOST-VERSION.md`'s re-verification checklist)
  * or a change to the isolation flag vector in `reviewer-spawn.ts`.
  *
+ * RESULT (2026-09-06, pi 0.85.1): run once, authorised, as post-upgrade re-verification against an
+ * isolated `pi 0.85.1` install (via `COUNCIL_PI_BIN`, never touching this machine's global
+ * `0.84.4`). Dynamically selected `openrouter/mistralai/mistral-nemo`. `state=ok`, `in=2084
+ * out=114`, cost `$0.000043`, one schema-valid finding. Confirms the isolation flag surface and
+ * event-stream shape still work end to end against 0.85.1. See `HOST-VERSION.md`'s "Host
+ * re-verification (2026-09-06, pi 0.85.1)" section for the full record.
+ *
  * COST: bounded by `MAX_OUTPUT_TOKENS` (2000) and `TIMEOUT_SECONDS` (120) below, plus the input
  * side (the task prompt, a single-file diff of a few lines, and the findings-block instructions —
  * on the order of a few hundred input tokens). At typical OpenRouter-class rates for a genuinely
@@ -54,8 +61,9 @@
  *   - `COUNCIL_LIVE=1 npx vitest run --project live test/live/smoke.test.ts`
  *
  * DO NOT set COUNCIL_LIVE=1 or invoke `pi` as a side effect of reading, editing or reviewing this
- * file. It has already been run once, authorised (see RESULT above) — do not re-run it without a
- * fresh, explicit instruction, and never as a side effect of routine work on this file.
+ * file. It has already been run twice, each time authorised (see the RESULT entries above) — do
+ * not re-run it without a fresh, explicit instruction, and never as a side effect of routine work
+ * on this file.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';

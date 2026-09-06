@@ -4,6 +4,28 @@
   "description": "A read-only, multi-vendor code review panel over local git state.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ad-005/council-review.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ad-005/council-review/issues"
+  },
+  "homepage": "https://github.com/ad-005/council-review#readme",
+  "author": {
+    "name": "Antonije D.",
+    "url": "https://github.com/ad-005"
+  },
+  "keywords": [
+    "code-review",
+    "cli",
+    "git",
+    "multi-model",
+    "llm",
+    "ai-review",
+    "static-analysis",
+    "developer-tools"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -12,11 +34,13 @@
   },
   "files": [
     "dist/",
+    "src/",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",

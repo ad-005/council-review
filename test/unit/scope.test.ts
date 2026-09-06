@@ -366,7 +366,10 @@ describe('scope', () => {
       // Simulates a prior run's leftovers sitting in the tree, exactly as council-review itself
       // would leave them -- untracked, and with no .gitignore involved at all (the whole point
       // being that this must be excluded whether or not `init` ever ran).
-      repo.writeFile(reviewsRelFile(repo, '20260101T000000000Z', 'manifest.json'), '{"scope":{}}\n');
+      repo.writeFile(
+        reviewsRelFile(repo, '20260101T000000000Z', 'manifest.json'),
+        '{"scope":{}}\n',
+      );
       repo.writeFile(
         reviewsRelFile(repo, '20260101T000000000Z', 'reviewers', 'nova.trace.jsonl'),
         '{"line":1}\n',
@@ -384,13 +387,21 @@ describe('scope', () => {
       repo.writeAndCommit('base.txt', 'base\n', 'base commit');
       repo.git(['branch', 'main-base', 'HEAD']);
       const artifactPath = reviewsRelFile(repo, '20260101T000000000Z', 'manifest.json');
-      const rev = repo.writeAndCommit(artifactPath, '{"scope":{}}\n', 'accidentally committed a run');
+      const rev = repo.writeAndCommit(
+        artifactPath,
+        '{"scope":{}}\n',
+        'accidentally committed a run',
+      );
       repo.writeAndCommit('feature.txt', 'feature\n', 'real change');
 
       const worktree = await resolveScope(repo.root, {}, { baseBranch: 'main-base' });
       expect(worktree.files).toEqual(['feature.txt']);
 
-      const revision = await resolveScope(repo.root, { revision: rev }, { baseBranch: 'main-base' });
+      const revision = await resolveScope(
+        repo.root,
+        { revision: rev },
+        { baseBranch: 'main-base' },
+      );
       expect(revision.files).toEqual([]);
       expect(revision.empty).toBe(true);
 
