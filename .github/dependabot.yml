@@ -37,6 +37,17 @@ updates:
         # than we ship to lets TypeScript accept APIs that don't exist at
         # runtime. Bump by hand when the supported floor moves (#16).
         update-types: ['version-update:semver-major']
+      - dependency-name: 'typescript'
+        # typescript-eslint@8.69.0 (the newest release) declares
+        # peerDependencies.typescript: ">=4.8.4 <6.1.0", and no published
+        # typescript-eslint accepts TypeScript 7 yet. A major TypeScript
+        # bump therefore can't install: it broke npm ci with ERESOLVE both
+        # standalone (#22) and grouped with eslint (#25), since the group
+        # can't pair TypeScript 7 with a compatible typescript-eslint that
+        # doesn't exist. Remove this ignore once typescript-eslint ships
+        # support for TypeScript 7 — minor/patch updates within the
+        # current major still flow normally.
+        update-types: ['version-update:semver-major']
   - package-ecosystem: 'github-actions'
     directory: '/'
     schedule:
