@@ -14,9 +14,38 @@ raw output, the merged findings, a human report, and a handoff prompt addressed 
 
 ## Install
 
+This package is not yet published to npm, so the recommended install is directly from GitHub.
+
+### From GitHub (recommended)
+
+```
+npm install -g github:ad-005/council-review
+```
+
+This installs and builds straight from the repository and works today.
+
+### From npm
+
 ```
 npm install -g council-review
 ```
+
+This will be the install once the package is published to npm. It is not published yet, so this
+command currently fails — the GitHub install above is the one that works.
+
+### From source (development)
+
+```
+git clone https://github.com/ad-005/council-review.git
+cd council-review
+npm install
+npm run build
+npm link
+```
+
+Use this if you're contributing to `council-review` itself. `npm link` makes the `council-review`
+command available globally from your checkout; alternatively, run it directly with
+`node dist/bin.js`.
 
 Requires Node.js 20 or later to install and run `council-review` itself, plus the
 [`pi`](#the-pi-host-dependency) coding-agent CLI on `PATH`, authenticated for at least one
