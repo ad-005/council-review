@@ -40,7 +40,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run build",
+    "prepare": "npm run build",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
