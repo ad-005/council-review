@@ -62,7 +62,7 @@
     "test:live": "COUNCIL_LIVE=1 vitest run --project live"
   },
   "dependencies": {
-    "@inquirer/prompts": "^7.2.1",
+    "@inquirer/prompts": "^8.7.1",
     "@sinclair/typebox": "^0.34.14",
     "picomatch": "^4.0.2"
   },
