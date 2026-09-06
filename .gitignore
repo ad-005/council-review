@@ -3,3 +3,5 @@ node_modules/
 codegraph
 .codegraph/
 *.log
+openspec/
+.claude/
