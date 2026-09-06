@@ -13,7 +13,7 @@ pi 0.84.4
 
 npm package: `@earendil-works/pi-coding-agent`. Verified on this development machine by static
 analysis of the installed package's shipped `.d.ts` declarations and its minified bundle (see
-[`docs/superpowers/specs/2026-09-03-council-review-design.md`](./docs/superpowers/specs/2026-09-03-council-review-design.md)'s
+[`docs/design/council-review-design.md`](./docs/design/council-review-design.md)'s
 "Empirical baseline" and the recon notes it was built from), plus `pi auth check`. No live model
 call was required to establish the facts this tool depends on.
 
@@ -175,9 +175,8 @@ To re-verify:
    `--no-themes`, `--mode json`, `-p`, `-nc`, `--provider`, `--model`, `--thinking`) — this is a
    real, billable model call; see those files' headers before running them.
 3. If the tool surface has genuinely changed (a new built-in reappears, a flag is renamed, the
-   event stream shape changes), update this file's verified version, `SCRATCH/host-notes.md`'s
-   recon if it still exists in your working copy, and `src/reviewer-spawn.ts`/`src/runner.ts` as
-   needed, then re-run steps 1–2 to close the loop.
+   event stream shape changes), update this file's verified version and
+   `src/reviewer-spawn.ts`/`src/runner.ts` as needed, then re-run steps 1–2 to close the loop.
 4. **Before trusting `test/live/partial-thinking-map.test.ts`'s result against a new host version,
    re-verify the clamp-timing chain the probe depends on, not just that the probe still runs.**
    The probe reads `ExtensionContext.thinkingLevel` directly rather than watching for a change
