@@ -1,0 +1,54 @@
+# Publishes council-review to npm with provenance.
+#
+# Triggers only on pushing a tag matching `v*` (e.g. `v0.1.0`) — never on
+# branch pushes or pull requests, since this workflow publishes.
+#
+# Requires the `NPM_TOKEN` repository secret (an npm automation token with
+# publish rights) to be configured externally in the repo settings; that
+# setup step lives outside this file. The `id-token: write` permission
+# mints the OIDC token npm uses to attach a signed provenance attestation
+# binding the published tarball to this exact commit, repository and run.
+#
+# The pushed tag must match the version in package.json — this is a hard
+# requirement checked before build/lint/test run, so a mistagged release
+# fails fast with both values in the log instead of burning CI time or
+# failing deep inside `npm publish`.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+      - name: Verify tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)" >&2
+            exit 1
+          fi
+          echo "Tag matches package.json version: $PKG_VERSION"
+      - run: npm run build
+      - run: npm run lint
+      - run: npm run format
+      - run: npm run test:unit
+      - run: npm run test:security
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
