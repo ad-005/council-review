@@ -30,7 +30,7 @@
  * RESULT (2026-09-04, pi 0.84.4): run once, authorised. `state=ok`, one schema-valid finding
  * returned, real host round-trip confirmed end to end — this test's purpose (prove the flag
  * surface and event-stream shape still work against the pinned host) is satisfied. See
- * `HOST-VERSION.md` for the recorded verdict. Per the team lead: do NOT re-run this file solely to
+ * `HOST-VERSION.md` for the recorded verdict. Do NOT re-run this file solely to
  * re-confirm a fixed selector picks a different model — that is not worth a second live spend.
  * Re-run it only after an actual `pi` upgrade (per `HOST-VERSION.md`'s re-verification checklist)
  * or a change to the isolation flag vector in `reviewer-spawn.ts`.
