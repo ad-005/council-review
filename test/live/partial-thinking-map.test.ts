@@ -81,9 +81,9 @@
  * VERDICT: phase 2's assertion IS the verdict, conditioned on phase 1 having proven the instrument
  * sound. If phase 2 passes, `src/thinking.ts`'s per-key-inside-a-partial-map fallback reading is
  * confirmed for the selected model and the design's open risk is closed for the case exercised
- * here. If it fails, or either phase reports inconclusive, per the team lead's brief: report the
+ * here. If it fails, or either phase reports inconclusive, by design: report the
  * evidence; do not amend `src/thinking.ts` or the `model-discovery` spec from this file — routing
- * that change is the team lead's call.
+ * that change needs a deliberate decision, not an automatic one.
  *
  * COST: up to two tiny raw host calls (no findings-block prompt, no reviewer tools loaded at all —
  * this diagnostic extension registers none), each capped at `MAX_PROBE_OUTPUT_TOKENS` output
@@ -444,7 +444,7 @@ async function runProbeAndExtractLevel(
           `${provider}/${model} requesting "${level}": ${JSON.stringify(result.markers)} — this ` +
           `should be structurally impossible (both hooks read the same live ` +
           `ExtensionContext.thinkingLevel getter within the same, single, no-tool-call turn); ` +
-          `report this to the team lead before trusting either value.`,
+          `report this and stop before trusting either value.`,
       );
     }
 
@@ -514,7 +514,7 @@ describe.skipIf(!LIVE)('live check: partial (merged) thinkingLevelMap per-key fa
           `${selfCheck!.model.provider}/${selfCheck!.model.id} and ExtensionContext.thinkingLevel ` +
           `reported back the SAME level ("${selfCheckObserved}") instead of a clamped one. This ` +
           `instrument cannot demonstrate a clamp, so it cannot be trusted to demonstrate the ` +
-          `absence of one either — STOPPING before phase 2. Report this to the team lead; do not ` +
+          `absence of one either — STOPPING before phase 2. Report this and stop; do not ` +
           `treat phase 2 as meaningful even if it happens to "pass."`,
       ).not.toBe(selfCheckLevel);
       expect(
@@ -524,7 +524,7 @@ describe.skipIf(!LIVE)('live check: partial (merged) thinkingLevelMap per-key fa
           `"${selfCheckExpectedClamp}" but observed "${selfCheckObserved}" — the instrument DID ` +
           `show a clamp (differs from the request, so it is not the earlier vacuous-fallback ` +
           `failure mode), but not the one src/thinking.ts's own clampLevel predicts. Report this ` +
-          `mismatch to the team lead; do not proceed to treat phase 2 as settling anything until ` +
+          `mismatch and stop; do not proceed to treat phase 2 as settling anything until ` +
           `this is understood.`,
       ).toBe(selfCheckExpectedClamp);
       console.error(
@@ -554,7 +554,7 @@ describe.skipIf(!LIVE)('live check: partial (merged) thinkingLevelMap per-key fa
           `${JSON.stringify(supported)}); ExtensionContext.thinkingLevel reported "${observed}" ` +
           `directly from agent state. A mismatch here means the omitted-key fallback does NOT ` +
           `apply the same way inside a partial map as it does for a wholly absent one — report ` +
-          `this to the team lead; do not amend src/thinking.ts or the model-discovery spec from ` +
+          `this and do not amend src/thinking.ts or the model-discovery spec from ` +
           `this file.`,
       ).toBe(expected);
     },
