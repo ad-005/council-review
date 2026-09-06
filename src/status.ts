@@ -130,7 +130,7 @@ const GITIGNORE_REVIEWS_ENTRIES = ['.council/reviews/', '.council/reviews'];
  * one, so the read check (`status`) and the write check (`init`) can never drift apart.
  */
 export function gitignoreExcludesReviews(repoRoot: string): boolean {
-  let content = '';
+  let content: string;
   try {
     content = fs.readFileSync(path.join(repoRoot, '.gitignore'), 'utf8');
   } catch {
