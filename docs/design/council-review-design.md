@@ -26,7 +26,7 @@ Nothing in the report is filtered by a model — merging is done in code.
 
 ## Shape
 
-TypeScript, Node >= 20, one npm package, one binary: `council-review`.
+TypeScript, Node >= 22.19.0, one npm package, one binary: `council-review`.
 
 Install once with `npm i -g council-review`. Load into a project with
 `council-review init`, which runs the picker and writes:

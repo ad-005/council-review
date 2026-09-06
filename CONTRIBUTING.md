@@ -14,12 +14,10 @@ working `dist/` after cloning.
 
 ## Requirements
 
-- Node.js **>= 20** to install, build and run `council-review` itself.
+- Node.js **>= 22.19.0** to install, build and run `council-review` itself.
 - The `pi` coding-agent CLI (npm package `@earendil-works/pi-coding-agent`) on `PATH`,
   authenticated for at least one provider, to actually run a review. `pi` declares
-  `engines: { node: ">=22.19.0" }`, so that version — not `council-review`'s own `>=20` floor — is
-  the effective floor for running a review: a Node 20 or 21 install satisfies `council-review`'s
-  own guard but leaves every reviewer failing to spawn.
+  `engines: { node: ">=22.19.0" }`, matching `council-review`'s own floor.
 
 ## Checks
 
@@ -32,7 +30,7 @@ npm run format    # prettier --check . (use `npm run format:fix` to auto-fix)
 npm test          # vitest run --project unit --project security
 ```
 
-CI runs these on both Node 20 and Node 22.
+CI runs these on both Node 22 and Node 24.
 
 ## The live test suite — read before running
 

@@ -23,8 +23,8 @@ npm install -g github:ad-005/council-review
 Not published to npm yet, so install from GitHub. Requires the `pi` coding-agent CLI
 (`@earendil-works/pi-coding-agent`) on `PATH`, authenticated for at least one provider through
 `pi`'s own credential store — a key that exists only as a shell variable never reaches a reviewer,
-because reviewer processes get a tight environment allowlist. `pi` needs Node **>= 22.19.0**, which
-is the real floor for running a review.
+because reviewer processes get a tight environment allowlist. Both `council-review` and `pi` need
+Node **>= 22.19.0**.
 
 ## Use
 

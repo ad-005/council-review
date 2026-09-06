@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Initial release. Not yet published to npm; install from GitHub (see README's "Install" section).
 
+### Changed
+
+- **Breaking:** raised the minimum supported Node.js version from `>=20` to `>=22.19.0`. Node 20
+  reached its end of life; `22.19.0` is also what the `pi` host CLI already requires to run a
+  review, so this collapses what used to be a two-tier floor into one.
+
 ### Added
 
 - Multi-vendor review panel: sends the reviewed diff to several independent models from
