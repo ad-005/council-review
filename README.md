@@ -17,14 +17,19 @@ handoff prompt addressed to a coding agent (`HANDOFF.md`).
 ## Install
 
 ```
+npm install -g council-review
+```
+
+For unreleased changes from `main`, install straight from GitHub instead:
+
+```
 npm install -g github:ad-005/council-review
 ```
 
-Not published to npm yet, so install from GitHub. Requires the `pi` coding-agent CLI
-(`@earendil-works/pi-coding-agent`) on `PATH`, authenticated for at least one provider through
-`pi`'s own credential store — a key that exists only as a shell variable never reaches a reviewer,
-because reviewer processes get a tight environment allowlist. Both `council-review` and `pi` need
-Node **>= 22.19.0**.
+Requires the `pi` coding-agent CLI (`@earendil-works/pi-coding-agent`) on `PATH`, authenticated
+for at least one provider through `pi`'s own credential store — a key that exists only as a shell
+variable never reaches a reviewer, because reviewer processes get a tight environment allowlist.
+Both `council-review` and `pi` need Node **>= 22.19.0**.
 
 ## Use
 

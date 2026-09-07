@@ -1,6 +1,6 @@
 {
   "name": "council-review",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A read-only, multi-vendor code review panel over local git state.",
   "type": "module",
   "license": "MIT",
