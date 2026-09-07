@@ -5,15 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - Unreleased
-
-Initial release. Not yet published to npm; install from GitHub (see README's "Install" section).
+## [0.2.0] - Unreleased
 
 ### Changed
 
 - **Breaking:** raised the minimum supported Node.js version from `>=20` to `>=22.19.0`. Node 20
   reached its end of life; `22.19.0` is also what the `pi` host CLI already requires to run a
   review, so this collapses what used to be a two-tier floor into one.
+- Updated `@inquirer/prompts` to 8. Its own engines range (`>=23.5.0 || ^22.13.0 || ^20.17.0`) is
+  part of why the Node floor moved.
+- Updated the development toolchain: eslint 10, vitest 5, `globals` 17, `eslint-config-prettier`
+  10, `@types/picomatch` 4, and the GitHub Actions bumped to checkout v7 / setup-node v7.
+- ESLint 10's expanded default rule set surfaced four `throw` sites in `src/reviewer-tools.ts`
+  that discarded the original error; they now attach it via `{ cause }` for better diagnostics.
+
+## [0.1.0] - 2026-09-06
+
+Initial release.
 
 ### Added
 
@@ -45,4 +53,5 @@ Initial release. Not yet published to npm; install from GitHub (see README's "In
   `3` degraded (partial report, outranks `1`), `4` vendor-independence guard refusal, `130`
   interrupted.
 
-[0.1.0]: https://github.com/ad-005/council-review/releases/tag/v0.1.0
+[0.2.0]: https://github.com/ad-005/council-review/releases/tag/v0.2.0
+[0.1.0]: https://www.npmjs.com/package/council-review/v/0.1.0
