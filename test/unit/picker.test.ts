@@ -2,7 +2,17 @@ import { PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
 import type { Catalog, CatalogModel, ProviderInfo } from '../../src/providers.js';
-import { PickerCancelled, PickerNonInteractive, pickPanel } from '../../src/picker.js';
+import {
+  PickerCancelled,
+  PickerNonInteractive,
+  buildModelRows,
+  groupModelsByProvider,
+  modelGroupMessage,
+  pickPanel,
+  pickerCheckboxTheme,
+  type ModelChoice,
+} from '../../src/picker.js';
+import { Separator } from '@inquirer/prompts';
 
 // ---------------------------------------------------------------------------------------------
 // A scripted terminal: a real (non-TTY) duplex pair driving @inquirer/prompts exactly as the
@@ -252,6 +262,222 @@ describe('pickPanel — terminal width', () => {
     term.send(SPACE + ENTER); // select the only model; non-reasoning, so no thinking stage follows
 
     await resultPromise;
+  }, 10_000);
+});
+
+describe('groupModelsByProvider — provider groups', () => {
+  it('groups models by provider in first-appearance order', () => {
+    const groups = groupModelsByProvider([MINIMAX, KIMI, GLM]);
+
+    expect(groups.map((g) => g.provider)).toEqual(['minimax', 'opencode-go']);
+    expect(groups[0]?.models.map((m) => m.id)).toEqual(['MiniMax-M2.7']);
+    expect(groups[1]?.models.map((m) => m.id)).toEqual(['kimi-k2.6', 'glm-5.2']);
+  });
+
+  it('returns no groups for an empty model scope', () => {
+    expect(groupModelsByProvider([])).toEqual([]);
+  });
+});
+
+describe('modelGroupMessage — pinned group header', () => {
+  it('names the provider with a singular model count', () => {
+    expect(modelGroupMessage('minimax', 1)).toBe(
+      'Select models for the panel — minimax (1 model):',
+    );
+  });
+
+  it('names the provider with a plural model count', () => {
+    expect(modelGroupMessage('opencode-go', 25)).toBe(
+      'Select models for the panel — opencode-go (25 models):',
+    );
+  });
+});
+
+describe('buildModelRows — readable model rows', () => {
+  function rows(choices: Array<ModelChoice | Separator>): ModelChoice[] {
+    return choices.filter((c): c is ModelChoice => !Separator.isSeparator(c));
+  }
+
+  /** 'R' = model row, '.' = blank spacer. */
+  function shape(choices: Array<ModelChoice | Separator>): string {
+    return choices.map((c) => (Separator.isSeparator(c) ? '.' : 'R')).join('');
+  }
+
+  it('keeps the identity intact and shows vendor, context, costs, and thinking support', () => {
+    const [row] = rows(buildModelRows([MINIMAX]));
+    expect(row?.short).toBe('minimax/MiniMax-M2.7');
+    expect(row?.name).toContain('minimax/MiniMax-M2.7');
+    expect(row?.name).toContain('minimax');
+    expect(row?.name).toContain('100.0K ctx');
+    expect(row?.name).toContain('$1 in / $2 out /Mtok');
+    expect(row?.name).toContain('thinking');
+    expect(row?.description).toContain('vendor minimax');
+    expect(row?.description).toContain('supports thinking levels');
+  });
+
+  it('marks non-reasoning models so the skipped thinking prompt is no surprise', () => {
+    const [row] = rows(buildModelRows([KIMI]));
+    expect(row?.name).toContain('no thinking');
+    expect(row?.description).toContain('no thinking levels');
+  });
+
+  it('renders unknown figures as ? rather than dropping the column', () => {
+    const mystery = model({
+      id: 'mystery-1',
+      provider: 'p',
+      vendor: 'unknown',
+      contextWindow: null,
+      maxOutputTokens: null,
+      inputCostPerMTok: null,
+      outputCostPerMTok: null,
+    });
+    const [row] = rows(buildModelRows([mystery]));
+    expect(row?.name).toContain('? ctx');
+    expect(row?.name).toContain('? in / ? out /Mtok');
+  });
+
+  it('aligns the specs columns across rows of different identity lengths', () => {
+    const choices = buildModelRows([MINIMAX, GLM]);
+    const names = rows(choices).map((r) => r.name);
+    expect(names).toHaveLength(2);
+    // Both specs columns start at the same offset: the shorter identity is space-padded.
+    const specsAt = names.map((n) => n.indexOf('·'));
+    expect(specsAt[0]).toBe(specsAt[1]);
+    expect(specsAt[0]).toBeGreaterThan(0);
+  });
+
+  it('caps the identity column so one very long id cannot push the rest off-screen', () => {
+    const choices = buildModelRows([WIDE, MINIMAX]);
+    const names = rows(choices).map((r) => r.name);
+    // The short row stays padded to the 48-column cap, not to the 90+ character id.
+    expect(names[1]?.indexOf('·')).toBeLessThanOrEqual(60);
+    expect(names[0]).toContain(WIDE_ID);
+  });
+
+  it('returns no choices for an empty group', () => {
+    expect(buildModelRows([])).toEqual([]);
+  });
+
+  it('precedes every row with a blank spacer, distancing the first row from the header', () => {
+    expect(shape(buildModelRows([KIMI, GLM]))).toBe('.R.R');
+    expect(shape(buildModelRows([MINIMAX]))).toBe('.R');
+  });
+
+  it('uses larger square checkbox glyphs instead of the default small circles', () => {
+    expect(pickerCheckboxTheme.icon.unchecked).toBe('☐');
+    expect(pickerCheckboxTheme.icon.checked).toContain('☑');
+  });
+});
+
+describe('pickPanel — model stage rendering', () => {
+  it('renders square checkboxes and a blank line between model rows', async () => {
+    const catalog = catalogOf([KIMI, GLM]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER); // one provider, opencode-go
+
+    // The group header is the prompt message itself, so it can never scroll away with the rows.
+    await term.waitFor('Select models for the panel — opencode-go (2 models):');
+    expect(term.buffer).toContain('☐');
+    expect(term.buffer).not.toContain('◯');
+
+    term.send(SPACE); // check the highlighted row
+    await term.waitFor('☑');
+
+    term.send(DOWN + SPACE + ENTER); // DOWN skips the blank spacer onto GLM; select both
+    await term.waitFor('Thinking level for opencode-go/glm-5.2');
+    term.send(ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers.map((r) => r.model).sort()).toEqual(['glm-5.2', 'kimi-k2.6']);
+  }, 10_000);
+
+  it('walks one pinned-header prompt per provider group and accumulates selections', async () => {
+    const catalog = catalogOf([MINIMAX, KIMI]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    // Providers render in catalog order: minimax, opencode-go. Select both.
+    term.send(SPACE + DOWN + SPACE + ENTER);
+
+    await term.waitFor('Select models for the panel — minimax (1 model):');
+    term.send(SPACE + ENTER); // take MiniMax-M2.7; minimax group done
+
+    await term.waitFor('Select models for the panel — opencode-go (1 model):');
+    term.send(SPACE + ENTER); // take kimi-k2.6; KIMI skips thinking, MINIMAX prompts next
+
+    await term.waitFor('Thinking level for minimax/MiniMax-M2.7');
+    term.send(ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers.map((r) => `${r.provider}/${r.model}`).sort()).toEqual([
+      'minimax/MiniMax-M2.7',
+      'opencode-go/kimi-k2.6',
+    ]);
+  }, 10_000);
+
+  it('re-runs the model stage when nothing was selected anywhere', async () => {
+    const catalog = catalogOf([MINIMAX]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Select models for the panel — minimax (1 model):');
+    term.send(ENTER); // confirm with nothing selected
+
+    await term.waitFor('Select at least one model for the panel.');
+    term.send(SPACE + ENTER); // select the model on the second pass
+
+    await term.waitFor('Thinking level for minimax/MiniMax-M2.7');
+    term.send(ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers).toHaveLength(1);
+    expect(reviewers[0]?.model).toBe('MiniMax-M2.7');
+  }, 10_000);
+
+  it('loops the rows in a circle within the group', async () => {
+    const kimi2 = model({ id: 'kimi-k2.7', provider: 'opencode-go', vendor: 'moonshot' });
+    const kimi3 = model({ id: 'kimi-k2.8', provider: 'opencode-go', vendor: 'moonshot' });
+    const catalog = catalogOf([KIMI, kimi2, kimi3]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER); // one provider, opencode-go
+
+    await term.waitFor('Select models for the panel — opencode-go (3 models):');
+    // Four downs from the first row wraps past the end back onto the second row.
+    term.send(DOWN + DOWN + DOWN + DOWN + SPACE + ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers).toHaveLength(1);
+    expect(reviewers[0]?.model).toBe('kimi-k2.7');
   }, 10_000);
 });
 

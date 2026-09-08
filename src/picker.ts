@@ -10,8 +10,9 @@
  * selection finishes and again immediately before launch.
  */
 import { PassThrough } from 'node:stream';
+import { styleText } from 'node:util';
 
-import { checkbox, select } from '@inquirer/prompts';
+import { Separator, checkbox, select } from '@inquirer/prompts';
 
 import type { ThinkingLevel } from './levels.js';
 import type { Reviewer } from './panel.js';
@@ -82,11 +83,125 @@ function providerChoiceLabel(p: ProviderInfo): string {
   return `${p.id}  (${auth}, ${models})`;
 }
 
-function modelChoiceLabel(m: CatalogModel): string {
+function modelIdentity(m: CatalogModel): string {
+  return `${m.provider}/${m.id}`;
+}
+
+function formatCostPair(m: CatalogModel): string {
+  return `${formatCostRate(m.inputCostPerMTok)} in / ${formatCostRate(m.outputCostPerMTok)} out /Mtok`;
+}
+
+/**
+ * Expanded detail for the highlighted row. `@inquirer/checkbox` renders only the active choice's
+ * `description`, underneath the list — so the rows stay short enough to scan while the focused
+ * model still shows its exact figures.
+ */
+function modelDetailLine(m: CatalogModel): string {
+  const context = m.contextWindow === null ? '?' : `${m.contextWindow} tokens`;
+  const maxOut = m.maxOutputTokens === null ? '?' : `${m.maxOutputTokens} tokens`;
+  const thinking = m.reasoning ? 'supports thinking levels' : 'no thinking levels';
   return (
-    `${m.provider}/${m.id}  —  vendor: ${m.vendor}, context: ${formatTokenCount(m.contextWindow)}, ` +
-    `in: ${formatCostRate(m.inputCostPerMTok)}/Mtok, out: ${formatCostRate(m.outputCostPerMTok)}/Mtok`
+    `${modelIdentity(m)}  —  vendor ${m.vendor}, context ${context}, max output ${maxOut}, ` +
+    `${formatCostPair(m)}, ${thinking}`
   );
+}
+
+// Identity/vendor column widths are capped so one very long `provider/id` cannot push every
+// other row's specs off-screen; over-long entries simply overflow the column unaligned.
+const MAX_IDENTITY_WIDTH = 48;
+const MAX_VENDOR_WIDTH = 12;
+
+export interface ModelChoice {
+  value: string;
+  name: string;
+  description: string;
+  short: string;
+}
+
+/**
+ * Larger square checkbox glyphs (`☐`/`☑`) replacing the default small circles (`○`/`◉`) for
+ * the picker's checkbox stages. The checked glyph keeps the default green via `node:util`'s
+ * `styleText` — which, like the default theme, emits plain text when output is piped and color
+ * only on a real terminal. Only `checked`/`unchecked` are overridden, so the cursor (`❯`) and
+ * everything else stay on the inquirer defaults.
+ */
+export const pickerCheckboxTheme = {
+  icon: {
+    checked: styleText('green', '☑'),
+    unchecked: '☐',
+  },
+};
+
+export interface ModelGroup {
+  provider: string;
+  models: CatalogModel[];
+}
+
+/** Groups models by provider in first-appearance (catalog) order. */
+export function groupModelsByProvider(models: readonly CatalogModel[]): ModelGroup[] {
+  const groups = new Map<string, CatalogModel[]>();
+  for (const m of models) {
+    const group = groups.get(m.provider);
+    if (group) {
+      group.push(m);
+    } else {
+      groups.set(m.provider, [m]);
+    }
+  }
+  return [...groups.entries()].map(([provider, groupModels]) => ({
+    provider,
+    models: groupModels,
+  }));
+}
+
+/**
+ * The model-stage prompt message doubles as the provider group header: inquirer renders the
+ * message above the paginated list and never scrolls it, so the header stays pinned at the top
+ * — visually distinct (prompt-message styling) and distanced (a blank spacer row follows it)
+ * — no matter how far the rows scroll underneath.
+ */
+export function modelGroupMessage(provider: string, modelCount: number): string {
+  const count = modelCount === 1 ? '1 model' : `${modelCount} models`;
+  return `Select models for the panel — ${provider} (${count}):`;
+}
+
+/**
+ * Builds one provider group's checkbox rows: one padded, single-line row per model, each
+ * preceded by a blank `Separator` spacer (including the first, which distances the rows from
+ * the header message). Padding lines up the identity and vendor columns so the rows stop
+ * blurring into a wall of text. `short` stays the bare `provider/id` so the submitted answer
+ * line reads cleanly. Widths are measured within the group since each group is its own prompt.
+ *
+ * Blank separators are skipped by checkbox navigation (up/down/space/number keys all ignore
+ * them), so they are pure vertical air with no effect on selection.
+ */
+export function buildModelRows(models: readonly CatalogModel[]): Array<ModelChoice | Separator> {
+  const identityWidth = Math.min(
+    Math.max(0, ...models.map((m) => modelIdentity(m).length)),
+    MAX_IDENTITY_WIDTH,
+  );
+  const vendorWidth = Math.min(
+    Math.max(0, ...models.map((m) => m.vendor.length)),
+    MAX_VENDOR_WIDTH,
+  );
+
+  const choices: Array<ModelChoice | Separator> = [];
+  for (const m of models) {
+    // A single space: renders as an empty line. (`new Separator('')` would fall back to
+    // the default dashed line — the constructor ignores falsy values.)
+    choices.push(new Separator(' '));
+    const identity = modelIdentity(m);
+    const specs =
+      `${m.vendor.padEnd(vendorWidth)}  ·  ${formatTokenCount(m.contextWindow)} ctx  ·  ` +
+      `${formatCostPair(m)}  ·  ${m.reasoning ? 'thinking' : 'no thinking'}`;
+    choices.push({
+      value: modelKey(m.provider, m.id),
+      name: `${identity.padEnd(identityWidth)}  ${specs}`,
+      description: modelDetailLine(m),
+      short: identity,
+    });
+  }
+  return choices;
 }
 
 // JSON-encoded rather than joined with a separator character, because a host model id may
@@ -156,23 +271,49 @@ export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): P
         message: 'Select providers to draw reviewers from:',
         required: true,
         choices: readyProviders.map((p) => ({ value: p.id, name: providerChoiceLabel(p) })),
+        theme: pickerCheckboxTheme,
       },
       promptContext(io),
     );
 
     const scopedModels = catalog.models.filter((m) => selectedProviderIds.includes(m.provider));
+    const modelGroups = groupModelsByProvider(scopedModels);
+    if (modelGroups.length === 0) {
+      throw new Error('picker: no models available for the selected providers');
+    }
 
-    const selectedModelKeys = await checkbox<string>(
-      {
-        message: 'Select models for the panel:',
-        required: true,
-        choices: scopedModels.map((m) => ({
-          value: modelKey(m.provider, m.id),
-          name: modelChoiceLabel(m),
-        })),
-      },
-      promptContext(io),
-    );
+    // One checkbox prompt per provider group, with the group header as the prompt message.
+    // The message is rendered above the paginated list and never scrolls, so the header stays
+    // pinned at the top while the rows move beneath it.
+    let selectedModelKeys: string[] = [];
+    let modelsConfirmed = false;
+    while (!modelsConfirmed) {
+      selectedModelKeys = [];
+      for (const group of modelGroups) {
+        const keys = await checkbox<string>(
+          {
+            message: modelGroupMessage(group.provider, group.models.length),
+            required: false,
+            choices: buildModelRows(group.models),
+            theme: pickerCheckboxTheme,
+            // The rows scroll in a circle within their group; the header message stays put.
+            loop: true,
+            // Spacer rows roughly double the list height versus the default page size of 7; a
+            // larger page keeps a modest panel on one screen instead of forcing paging.
+            pageSize: 12,
+          },
+          promptContext(io),
+        );
+        selectedModelKeys.push(...keys);
+      }
+      // `required` cannot be per-group (a group may legitimately contribute nothing), so the
+      // at-least-one-model invariant is enforced across all groups by re-running the stage.
+      // Cancelling (Ctrl+C) still throws `PickerCancelled` from whichever prompt is active.
+      modelsConfirmed = selectedModelKeys.length > 0;
+      if (!modelsConfirmed) {
+        io.output.write('Select at least one model for the panel.\n');
+      }
+    }
 
     const selectedModels = selectedModelKeys.map((key) => {
       const { provider, id } = splitModelKey(key);

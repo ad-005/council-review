@@ -72,7 +72,7 @@ export const CONFIG_DEFAULTS: Readonly<Partial<CouncilConfig>> = Object.freeze({
   version: 1,
   baseBranch: 'main',
   includeContextFiles: false,
-  timeoutSeconds: 600,
+  timeoutSeconds: 10800,
   maxOutputTokens: null,
   mergeWindow: 10,
   claimSimilarity: 0.6,
