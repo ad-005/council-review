@@ -1,22 +1,31 @@
-# Publishes council-review to npm using trusted publishing (OIDC).
+# Stages a release of council-review to npm using trusted publishing (OIDC).
+# This workflow only STAGES the release; it does not make it public.
 #
 # Triggers only on pushing a tag matching `v*` (e.g. `v0.1.0`) — never on
-# branch pushes or pull requests, since this workflow publishes.
+# branch pushes or pull requests, since this workflow stages a publish.
 #
 # Authenticates via npm trusted publishing: no stored secret is used or
 # needed. The `id-token: write` permission mints a short-lived OIDC token
-# that npm exchanges for a one-time publish credential, and npm attaches a
-# signed provenance attestation automatically for public packages published
-# from a public repo. For this to work, a trusted publisher must be
-# configured once on npmjs.com for the `council-review` package: provider
-# GitHub Actions, org/user `ad-005`, repo `council-review`, workflow
-# filename `release.yml`. The filename matters — npm matches the trusted
-# publisher config against it, so this file must not be renamed.
+# that npm exchanges for a one-time publish credential, and npm attaches
+# signed provenance automatically. For this to work, a trusted publisher
+# must be configured once on npmjs.com for the `council-review` package:
+# provider GitHub Actions, org/user `ad-005`, repo `council-review`,
+# workflow filename `release.yml`. The filename matters because npm
+# matches the trusted publisher config against it, so this file must not
+# be renamed.
+#
+# The configured trusted publisher grants `npm stage publish` only, not
+# direct `npm publish`. After this workflow succeeds, the version sits in
+# npm's staging area — built and signed, but NOT installable — until a
+# maintainer approves it with 2FA: `npm stage approve <stage-id>` (requires
+# npm >= 11.15.0) or the equivalent on npmjs.com. `npm stage list
+# council-review` shows staged versions, `npm stage view <stage-id>`
+# inspects one, and `npm stage reject <stage-id>` discards it.
 #
 # The pushed tag must match the version in package.json — this is a hard
 # requirement checked before build/lint/test run, so a mistagged release
 # fails fast with both values in the log instead of burning CI time or
-# failing deep inside `npm publish`.
+# failing deep inside `npm stage publish`.
 name: Release
 
 on:
@@ -53,7 +62,7 @@ jobs:
       - run: npm run format
       - run: npm run test:unit
       - run: npm run test:security
-      # Trusted publishing requires npm >= 11.5.1; pin explicitly rather than
+      # `npm stage publish` requires npm >= 11.15.0; pin explicitly rather than
       # relying on whatever version the Node 24 image happens to bundle.
       - run: npm install -g npm@latest
-      - run: npm publish --access public
+      - run: npm stage publish --access public
