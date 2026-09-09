@@ -582,6 +582,29 @@ describe('init', () => {
     expect(cfg.panel).toHaveLength(3);
   });
 
+  it('init does not append a redundant entry when a parent .council/ entry already excludes reviews', async () => {
+    // The reported bug: a repository whose .gitignore already excludes the whole .council tree
+    // got a redundant `.council/reviews/` line appended on init, because the check only
+    // recognized the exact entry. The file must be left byte-identical.
+    writeMinimalPickerCatalog();
+    const before =
+      '# Local llm-council review harness — panel config, suppressions and stored runs.\n.council/\n';
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), before);
+
+    const term = new ScriptedTerminal();
+    const stdout = captureStream(process.stdout);
+    const runPromise = runCli(['init'], { pickerIO: term.io });
+    let code: number;
+    try {
+      await driveFullPickerSelection(term);
+      code = await runPromise;
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    expect(fs.readFileSync(path.join(repo.root, '.gitignore'), 'utf8')).toBe(before);
+  });
+
   it('init --pick behaves identically to plain init: the flag is a deliberate no-op, not an incidental one', async () => {
     // cmdInit's own comment states that init always re-opens selection regardless of --pick;
     // pinning it here means that claim is a tested fact, not just a comment nobody would notice
