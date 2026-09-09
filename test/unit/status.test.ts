@@ -398,6 +398,64 @@ describe('collectStatus: gitignore detection', () => {
     const report = await collectStatus(repo.root, { verify: false });
     expect(report.gitignore.excludesReviews).toBe(false);
   });
+
+  it.each([
+    ['no trailing slash', '.council/reviews\n'],
+    ['root-anchored entry', '/.council/reviews/\n'],
+    ['root-anchored entry without trailing slash', '/.council/reviews\n'],
+    ['parent directory entry', '.council/\n'],
+    ['parent directory entry without trailing slash', '.council\n'],
+    ['root-anchored parent entry', '/.council/\n'],
+    ['wildcard entry', '.council/*\n'],
+    ['entry with trailing whitespace', '.council/reviews/   \n'],
+    ['entry among other lines', 'node_modules/\n# Local review harness\n.council/\n'],
+  ])('reports excludesReviews=true for %s', async (_label, content) => {
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), content);
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(true);
+  });
+
+  it('reports excludesReviews=false when the entry appears only inside a comment', async () => {
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), '# .council/reviews/\nnode_modules/\n');
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(false);
+  });
+
+  it('reports excludesReviews=false when the entry has leading whitespace', async () => {
+    // Git treats leading spaces as literal pattern text (unlike trailing spaces), so this
+    // line matches nothing -- verified against `git check-ignore`, not just assumed.
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), '  .council/reviews/\n');
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(false);
+  });
+
+  it('reports excludesReviews=false when a later negation re-includes the reviews directory', async () => {
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), '.council/reviews/\n!.council/reviews/\n');
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(false);
+  });
+
+  it('reports excludesReviews=false when a later negation re-includes the parent directory', async () => {
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), '.council/\n!.council/\n');
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(false);
+  });
+
+  it('reports excludesReviews=true when reviews are negated under a still-excluded parent', async () => {
+    // Git cannot re-include paths under an excluded directory, so this negation is a no-op.
+    fs.writeFileSync(path.join(repo.root, '.gitignore'), '.council/\n!.council/reviews/\n');
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(true);
+  });
+
+  it('reports excludesReviews=true when the parent is re-included but a reviews entry still stands', async () => {
+    fs.writeFileSync(
+      path.join(repo.root, '.gitignore'),
+      '.council/reviews/\n.council/\n!.council/\n',
+    );
+    const report = await collectStatus(repo.root, { verify: false });
+    expect(report.gitignore.excludesReviews).toBe(true);
+  });
 });
 
 // -------------------------------------------------------------------------------------------

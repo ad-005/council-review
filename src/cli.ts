@@ -289,8 +289,9 @@ function ensureIgnoreFile(repoRoot: string): void {
 const GITIGNORE_ENTRY = '.council/reviews/';
 
 /** The write half of the gitignore check; `gitignoreExcludesReviews` (status.ts) is the read
- * half -- both match the same two accepted forms, so a project `status` reports as already
- * excluded is never one `init` would append a duplicate entry to, or vice versa. */
+ * half -- both go through the same matcher (exact entry, root-anchored variant, or a parent
+ * `.council/` entry), so a project `status` reports as already excluded is never one `init`
+ * would append a redundant entry to, or vice versa. */
 function ensureGitignoreEntry(repoRoot: string): void {
   if (gitignoreExcludesReviews(repoRoot)) return;
   const file = path.join(repoRoot, '.gitignore');

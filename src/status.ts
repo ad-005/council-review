@@ -122,12 +122,42 @@ function resolveLastRunId(reviewsDir: string): string | null {
   }
 }
 
-const GITIGNORE_REVIEWS_ENTRIES = ['.council/reviews/', '.council/reviews'];
+/** Patterns that exclude the reviews directory itself: the exact entry `init` appends,
+ * its no-trailing-slash twin (identical meaning for a directory), and `.council/*`, the
+ * "commit the config, ignore everything generated" form -- `*` matches the `reviews` component,
+ * so the directory is excluded the same way. */
+const GITIGNORE_REVIEWS_PATTERNS = ['.council/reviews', '.council/reviews/', '.council/*'];
+
+/** Patterns that exclude the whole `.council` tree: git never lists paths under an excluded
+ * directory, so these exclude `.council/reviews/` without naming it. */
+const GITIGNORE_COUNCIL_PARENT_PATTERNS = ['.council', '.council/'];
 
 /**
- * Whether `<repoRoot>/.gitignore` already excludes `.council/reviews/`, matched exactly the way
- * `cli.ts`'s `ensureGitignoreEntry` decides whether to append it -- that function now calls this
- * one, so the read check (`status`) and the write check (`init`) can never drift apart.
+ * Parses one raw `.gitignore` line for the reviews-exclusion check. Returns null for blank and
+ * comment lines (which match nothing), otherwise the pattern with git's own normalization: only
+ * trailing whitespace is stripped (leading spaces are literal in gitignore -- `  .council/` does
+ * NOT exclude `.council/`), and a single root-anchoring leading `/` is removed (in a repo-root
+ * `.gitignore`, `/.council/...` and `.council/...` mean the same thing).
+ */
+function parseGitignorePattern(line: string): { negated: boolean; pattern: string } | null {
+  const stripped = line.replace(/[ \t\r]+$/, '');
+  if (stripped === '' || stripped.startsWith('#')) return null;
+  const negated = stripped.startsWith('!');
+  const body = negated ? stripped.slice(1) : stripped;
+  const pattern = body.startsWith('/') ? body.slice(1) : body;
+  return { negated, pattern };
+}
+
+/**
+ * Whether `<repoRoot>/.gitignore` already excludes `.council/reviews/` -- via the exact entry,
+ * a root-anchored (`/...`) variant, or a parent `.council/` entry that swallows the whole tree.
+ * `cli.ts`'s `ensureGitignoreEntry` calls this one, so the read check (`status`) and the write
+ * check (`init`) can never drift apart.
+ *
+ * Lines are applied in order, like git does: the last matching pattern wins, tracked separately
+ * for the parent and the reviews directory because a negation only lifts what it names -- and
+ * git cannot re-include paths under a still-excluded parent, so `!.council/reviews/` after
+ * `.council/` still leaves reviews excluded (the parent flag rules).
  */
 export function gitignoreExcludesReviews(repoRoot: string): boolean {
   let content: string;
@@ -136,8 +166,18 @@ export function gitignoreExcludesReviews(repoRoot: string): boolean {
   } catch {
     return false;
   }
-  const lines = content.split('\n').map((l) => l.trim());
-  return GITIGNORE_REVIEWS_ENTRIES.some((entry) => lines.includes(entry));
+  let parentExcluded = false;
+  let reviewsExcluded = false;
+  for (const line of content.split('\n')) {
+    const parsed = parseGitignorePattern(line);
+    if (parsed === null) continue;
+    if (GITIGNORE_REVIEWS_PATTERNS.includes(parsed.pattern)) {
+      reviewsExcluded = !parsed.negated;
+    } else if (GITIGNORE_COUNCIL_PARENT_PATTERNS.includes(parsed.pattern)) {
+      parentExcluded = !parsed.negated;
+    }
+  }
+  return parentExcluded || reviewsExcluded;
 }
 
 // -------------------------------------------------------------------------------------------
