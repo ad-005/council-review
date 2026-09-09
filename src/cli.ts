@@ -375,7 +375,10 @@ async function withStdoutRedirectedToStderr<T>(active: boolean, fn: () => Promis
   }
 }
 
-const TASK_PROMPT = `You are one independent reviewer in a multi-model code review panel. You are
+/** The task instructions every reviewer receives. Exported (rather than kept module-private)
+ *  so the live smoke test sends exactly what production sends instead of maintaining a copy
+ *  that drifts the next time this paragraph changes. */
+export const TASK_PROMPT = `You are one independent reviewer in a multi-model code review panel. You are
 given a unified diff patch and read-only access to a frozen snapshot of the repository at the
 tree the patch ends at, via your council_read, council_grep, council_list, council_git and
 council_codegraph tools.

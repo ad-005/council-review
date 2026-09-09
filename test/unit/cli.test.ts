@@ -947,7 +947,12 @@ describe('codegraph indexing end to end', () => {
 
   it('records an available index and instructs reviewers CodeGraph-first', async () => {
     const stubPath = path.join(toolDir, 'codegraph');
-    fs.writeFileSync(stubPath, '#!/bin/sh\nexit 0\n', 'utf8');
+    // A successful build must produce the index artifact, not merely exit 0.
+    fs.writeFileSync(
+      stubPath,
+      '#!/bin/sh\nmkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db"\n',
+      'utf8',
+    );
     fs.chmodSync(stubPath, 0o755);
     const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
     process.env.COUNCIL_CODEGRAPH_BIN = stubPath;

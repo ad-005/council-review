@@ -9,7 +9,20 @@
  * (the reviewer runs without CodeGraph assistance). Only `node:` imports are needed.
  */
 import { execFile } from 'node:child_process';
+import { statSync } from 'node:fs';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
+
+/** Index layout the real binary produces inside the indexed root: `<root>/.codegraph/codegraph.db`.
+ *  The reviewer-side gate in `reviewer-tools.ts` probes this same path (it cannot import this
+ *  module -- the extension may only import `node:` builtins -- so the literal is duplicated
+ *  there); `snapshot.ts` imports these constants so the CLI side agrees by construction. */
+export const CODEGRAPH_INDEX_DIR = '.codegraph';
+export const CODEGRAPH_DB_NAME = 'codegraph.db';
+
+export function codegraphDbPath(snapshotRoot: string): string {
+  return join(snapshotRoot, CODEGRAPH_INDEX_DIR, CODEGRAPH_DB_NAME);
+}
 
 export type CodegraphIndexReason = 'disabled' | 'binary-missing' | 'index-timeout' | 'index-failed';
 
@@ -46,6 +59,11 @@ export interface EnsureSnapshotIndexOptions {
  * throws for an indexing outcome: a missing binary, a timeout, and any other failure
  * (nonzero exit, signal, unexpected error) each map to a `reason` string. `enabled:
  * false` short-circuits to `disabled` without spawning anything.
+ *
+ * Exit 0 alone is not enough for `available: true`: the artifact itself
+ * (`<snapshotRoot>/.codegraph/codegraph.db`, the same marker the reviewer-side gate
+ * probes) must exist, so the manifest can never claim an index every reviewer call
+ * then fails to find.
  */
 export async function ensureSnapshotIndex(
   snapshotRoot: string,
@@ -60,7 +78,17 @@ export async function ensureSnapshotIndex(
     await execFileAsync(bin, ['init', snapshotRoot], {
       timeout: timeoutSeconds * 1000,
       maxBuffer: INDEX_MAX_BUFFER,
+      // SIGKILL, not the default SIGTERM: a timed-out indexer must actually be dead before
+      // the caller freezes the tree and reviewers start querying it -- a child that ignores
+      // SIGTERM (or one whose workers outlive it) would otherwise keep mutating the index
+      // mid-review. Grandchildren that double-fork past even this are out of reach of any
+      // kill signal without process-group tracking; the failure-path cleanup in
+      // `buildSnapshot` removes whatever they might still be writing to.
+      killSignal: 'SIGKILL',
     });
+    if (!hasIndexArtifact(snapshotRoot)) {
+      return { available: false, reason: 'index-failed' };
+    }
     return { available: true };
   } catch (err) {
     if (isEnoent(err)) {
@@ -70,6 +98,14 @@ export async function ensureSnapshotIndex(
       return { available: false, reason: 'index-timeout' };
     }
     return { available: false, reason: 'index-failed' };
+  }
+}
+
+function hasIndexArtifact(snapshotRoot: string): boolean {
+  try {
+    return statSync(codegraphDbPath(snapshotRoot)).isFile();
+  } catch {
+    return false;
   }
 }
 

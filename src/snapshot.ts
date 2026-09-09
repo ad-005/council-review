@@ -39,6 +39,7 @@ import picomatch from 'picomatch';
 import type { ResolvedScope } from './scope.js';
 import type { CodegraphConfig } from './config.js';
 import {
+  CODEGRAPH_INDEX_DIR,
   ensureSnapshotIndex,
   resolveCodegraphBin,
   type CodegraphIndexStatus,
@@ -173,8 +174,27 @@ export async function buildSnapshot(
   const root = await mkdtemp(join(scratchBase, SNAPSHOT_PREFIX));
 
   try {
+    // Liveness marker for `sweepOrphans` (see its own comment): written first, while the
+    // root is still trivially writable, so a `gc` in another process never classifies this
+    // in-progress build as an orphan during the materialisation and indexing steps below
+    // (indexing alone can take up to `indexTimeoutSeconds`). Never added to
+    // `narrowed`/`files` -- it lives at the top of the scratch directory, not inside the
+    // reviewed tree.
+    writeFileSync(join(root, LIVENESS_MARKER), String(process.pid), 'utf8');
+
     const candidates = await listCandidates(repoRoot, scope);
-    const narrowed = narrowCandidates(candidates, scope.selectors.paths, opts.include, scope.files);
+    // The CLI-built index owns `<root>/.codegraph/`: a `.codegraph/` path coming from the
+    // reviewed tree (tracked, or untracked-but-not-ignored) is dropped here -- after
+    // narrowing, so even a patch file touching that directory cannot force it back in --
+    // and is therefore never materialised, hashed, or mistaken for this run's own index by
+    // the reviewer-side gate. Without this, a repo-supplied `codegraph.db` would be queried
+    // as authoritative even with indexing disabled or failed.
+    const narrowed = narrowCandidates(
+      candidates,
+      scope.selectors.paths,
+      opts.include,
+      scope.files,
+    ).filter((f) => f !== CODEGRAPH_INDEX_DIR && !f.startsWith(`${CODEGRAPH_INDEX_DIR}/`));
 
     if (scope.mode === 'worktree') {
       await materializeWorktree(repoRoot, root, narrowed);
@@ -194,12 +214,16 @@ export async function buildSnapshot(
       timeoutSeconds: opts.codegraph?.indexTimeoutSeconds,
     });
 
-    const treeHash = computeTreeHash(root, narrowed);
+    // A failed, timed-out, or skipped index build must leave no trace: a partial
+    // `codegraph.db` would otherwise satisfy the reviewer-side existence gate and be queried
+    // as a complete index, with nothing marking its results as incomplete. Removed while the
+    // tree is still writable (the freeze below would require a restore-then-remove dance),
+    // so after this point the directory's presence means a good index by construction.
+    if (!codegraph.available) {
+      removeCodegraphDir(root);
+    }
 
-    // Liveness marker for `sweepOrphans` (see its own comment): written before the freeze, since
-    // `root` is non-writable afterward, and never added to `narrowed`/`files` -- it lives at the
-    // top of the scratch directory, not inside the reviewed tree.
-    writeFileSync(join(root, LIVENESS_MARKER), String(process.pid), 'utf8');
+    const treeHash = computeTreeHash(root, narrowed);
 
     // Freeze last, immediately before this snapshot becomes visible to any caller -- nothing
     // after this point may write into the tree, except the read-only-queryable index dir below.
@@ -207,10 +231,12 @@ export async function buildSnapshot(
 
     // The CodeGraph SQLite index requires write access even for reads (verified by probe:
     // queries on a fully frozen tree fail with `attempt to write a readonly database`). Restore
-    // write bits on the index directory only; every reviewed source file stays frozen. A no-op
-    // when no index was built (disabled or failed). Freezing was never a same-user security
+    // write bits on the index directory only, and only when the build above succeeded --
+    // every reviewed source file stays frozen. Freezing was never a same-user security
     // boundary (see the module header) -- the read-only guarantee comes from the tool surface.
-    restoreCodegraphWritable(root);
+    if (codegraph.available) {
+      restoreCodegraphWritable(root);
+    }
 
     let cleaned = false;
     const cleanup = (): void => {
@@ -503,11 +529,19 @@ function forceRemove(root: string): void {
   rmSync(root, { recursive: true, force: true });
 }
 
+/** Removes the snapshot's `.codegraph/` directory when the index build did not succeed
+ *  (see the call site). Best-effort and idempotent: absent means already clean. Called while
+ *  the tree is still writable, so no permission restoration is needed first. */
+function removeCodegraphDir(root: string): void {
+  rmSync(join(root, CODEGRAPH_INDEX_DIR), { recursive: true, force: true });
+}
+
 /** Restores write bits on the snapshot's `.codegraph/` index directory only (see the call
- *  site for why reads need them). A no-op when the directory is absent or is not a directory --
- *  exactly the disabled/failed-index cases, where there is nothing to make queryable. */
+ *  site for why reads need them). Only ever called when the index build succeeded, so the
+ *  directory is always present here; a missing or non-directory path is still tolerated
+ *  defensively rather than failing the build. */
 function restoreCodegraphWritable(root: string): void {
-  const dir = join(root, '.codegraph');
+  const dir = join(root, CODEGRAPH_INDEX_DIR);
   let st;
   try {
     st = lstatSync(dir);

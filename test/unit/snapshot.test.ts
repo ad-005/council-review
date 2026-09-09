@@ -618,8 +618,11 @@ describe('buildSnapshot: codegraph indexing', () => {
   });
 
   it('indexes after materialisation, so the indexer sees the narrowed files', async () => {
-    // Exit nonzero unless the narrowed file is already materialised at the passed root.
-    process.env.COUNCIL_CODEGRAPH_BIN = writeStub('test -f "$2/src/a.ts"');
+    // Exit nonzero unless the narrowed file is already materialised at the passed root, then
+    // produce the index artifact a successful build must leave behind.
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub(
+      'test -f "$2/src/a.ts" && mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db"',
+    );
     const repo = createTestRepo();
     try {
       repo.writeAndCommit('src/a.ts', 'content\n', 'initial');
@@ -707,6 +710,77 @@ describe('buildSnapshot: codegraph indexing', () => {
         expect(snapshot.files).toContain('a.txt');
         assertReadOnly(join(snapshot.root, 'a.txt'));
       });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('removes a partial index left behind by a failing build', async () => {
+    // Fails *after* creating the artifact a killed indexer would leave behind: the directory
+    // must not survive to satisfy the reviewer-side existence gate.
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub(
+      'mkdir -p "$2/.codegraph" && echo partial > "$2/.codegraph/codegraph.db" && exit 1',
+    );
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('a.txt', 'content\n', 'initial');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope, {
+        codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+      });
+
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.codegraph).toEqual({ available: false, reason: 'index-failed' });
+        expect(existsSync(join(snapshot.root, '.codegraph'))).toBe(false);
+        expect(snapshot.files.every((f) => !f.startsWith('.codegraph'))).toBe(true);
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('excludes a .codegraph directory tracked by the reviewed repository', async () => {
+    // Indexing disabled: whatever the repo tracks at `.codegraph/` must never be
+    // materialised, hashed, or left on disk for the reviewer-side gate to find.
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('src/a.ts', 'content\n', 'initial');
+      repo.writeAndCommit('.codegraph/codegraph.db', 'planted\n', 'tracked index dir');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+
+      const snapshot = await buildSnapshot(repo.root, scope);
+      try {
+        expect(snapshot.codegraph).toEqual({ available: false, reason: 'disabled' });
+        expect(snapshot.files).not.toContain('.codegraph/codegraph.db');
+        expect(existsSync(join(snapshot.root, '.codegraph'))).toBe(false);
+      } finally {
+        snapshot.cleanup();
+      }
+
+      // Same exclusion with indexing enabled and a successful build: the file list and tree
+      // hash must be identical to a repo that never tracked the directory.
+      process.env.COUNCIL_CODEGRAPH_BIN = writeStub(
+        'mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db"',
+      );
+      const clean = createTestRepo();
+      try {
+        clean.writeAndCommit('src/a.ts', 'content\n', 'initial');
+        const cleanScope = await resolveScope(clean.root, {}, { baseBranch: 'main' });
+        const indexed = await buildSnapshot(repo.root, scope, {
+          codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+        });
+        const plain = await buildSnapshot(clean.root, cleanScope);
+        try {
+          expect(indexed.codegraph).toEqual({ available: true });
+          expect(indexed.files).toEqual(plain.files);
+          expect(indexed.identity.treeHash).toBe(plain.identity.treeHash);
+        } finally {
+          indexed.cleanup();
+          plain.cleanup();
+        }
+      } finally {
+        clean.cleanup();
+      }
     } finally {
       repo.cleanup();
     }

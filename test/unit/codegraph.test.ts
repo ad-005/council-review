@@ -49,13 +49,28 @@ describe('ensureSnapshotIndex', () => {
   it('returns available on exit 0 and passes argv `init <root>`', async () => {
     const dir = makeTmpDir();
     const argsFile = join(dir, 'args');
-    const stub = writeStub(dir, 'codegraph-ok', `echo "$@" > ${argsFile}`);
+    const stub = writeStub(
+      dir,
+      'codegraph-ok',
+      `mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db" && echo "$@" > ${argsFile}`,
+    );
     const root = join(dir, 'snapshot-root');
 
     const status = await ensureSnapshotIndex(root, { bin: stub });
 
     expect(status).toEqual({ available: true });
     expect(readFileSync(argsFile, 'utf8').trim()).toBe(`init ${root}`);
+  });
+
+  it('maps exit 0 without the index artifact to index-failed', async () => {
+    const dir = makeTmpDir();
+    // Exits 0 but produces nothing: without the artifact check this would be recorded as a
+    // good index while every reviewer call fell back.
+    const stub = writeStub(dir, 'codegraph-hollow', 'exit 0');
+
+    const status = await ensureSnapshotIndex(join(dir, 'snapshot-root'), { bin: stub });
+
+    expect(status).toEqual({ available: false, reason: 'index-failed' });
   });
 
   it('maps a missing binary to binary-missing', async () => {

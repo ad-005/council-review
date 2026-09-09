@@ -6,9 +6,17 @@
  * always injects `-p <snapshotRoot>` server-side, so reviewer input can neither smuggle a flag
  * nor aim a query at any other tree.
  */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -279,23 +287,32 @@ describe('snapshot path containment', () => {
     ).toThrow(/files must be an array of strings/);
   });
 
-  it('passes a contained node file as a resolved absolute path', () => {
+  it('passes a contained node file as a project-relative path', () => {
     const root = makeSnapshot(false);
     const argv = buildCodegraphArgv(root, { subcommand: 'node', file: 'real.txt' });
     const flagIndex = argv.indexOf('--file');
     expect(flagIndex).toBeGreaterThanOrEqual(0);
-    const passed = argv[flagIndex + 1] as string;
-    expect(isAbsolute(passed)).toBe(true);
-    expect(passed).toMatch(/real\.txt$/);
-    expect(passed).not.toContain('..');
+    // The index is keyed by project-relative path: an absolute path misses every file
+    // against the real binary, so containment validation must not leak into the argv form.
+    expect(argv[flagIndex + 1]).toBe('real.txt');
   });
 
-  it('passes contained affected files as resolved absolute paths', () => {
+  it('normalises an absolute contained file to project-relative form', () => {
+    const root = makeSnapshot(false);
+    const argv = buildCodegraphArgv(root, {
+      subcommand: 'node',
+      file: join(realpathSync(root), 'real.txt'),
+    });
+    const flagIndex = argv.indexOf('--file');
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(argv[flagIndex + 1]).toBe('real.txt');
+  });
+
+  it('passes contained affected files as project-relative paths', () => {
     const root = makeSnapshot(false);
     const argv = buildCodegraphArgv(root, { subcommand: 'affected', files: ['real.txt'] });
     expect(argv.slice(0, 3)).toEqual(['affected', '-p', root]);
-    expect(argv[3]).toMatch(/real\.txt$/);
-    expect(isAbsolute(argv[3] as string)).toBe(true);
+    expect(argv[3]).toBe('real.txt');
   });
 });
 

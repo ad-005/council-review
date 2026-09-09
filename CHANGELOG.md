@@ -18,6 +18,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `codegraph` binary degrades to grep/read, and the manifest (`codegraph: { available, reason? }`)
   plus REPORT.md record the outcome.
 
+### Fixed
+
+- `council_codegraph` file arguments are passed to the binary as project-relative paths. The
+  index is keyed by relative path, so the previous absolute form made `node --file` silently
+  miss every file against a real index.
+- An index build that exits 0 without producing `codegraph.db` is now reported as
+  `index-failed` instead of `available`, and a failed or timed-out build leaves no partial
+  index behind — reviewers can no longer query a torn database they are told is complete.
+- A `.codegraph/` directory tracked by the reviewed repository is excluded from the snapshot,
+  so a repo-supplied database can no longer pose as this run's own index (or leak into the
+  file list and tree hash).
+- The snapshot liveness marker is written before materialisation and indexing, closing a
+  window in which a concurrent `council-review gc` could remove the snapshot mid-index.
+- A timed-out index build is now killed with SIGKILL instead of SIGTERM, so an indexer that
+  ignores SIGTERM cannot keep mutating the tree reviewers are reading.
+
 ## [0.1.1] - 2026-09-08
 
 ### Changed

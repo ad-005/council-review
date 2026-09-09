@@ -798,7 +798,7 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
         argv.push(codegraphStringField('symbol', params.symbol));
       }
       if (hasFile) {
-        argv.push('--file', resolveContained(root, params.file));
+        argv.push('--file', codegraphIndexPath(root, params.file));
       }
       if (params.offset !== undefined) {
         if (!hasFile) {
@@ -838,7 +838,7 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
           if (typeof entry !== 'string') {
             throw new Error('files must be an array of strings');
           }
-          argv.push(resolveContained(root, entry));
+          argv.push(codegraphIndexPath(root, entry));
         }
       }
       if (params.depth !== undefined) {
@@ -849,6 +849,20 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
   }
 
   return argv;
+}
+
+/**
+ * Validates a reviewer-supplied file path exactly like every other snapshot tool (full
+ * containment check, symlink-aware), then converts it to the project-root-relative form the
+ * index itself is keyed by. Passing the absolute path fails against the real binary: `node
+ * --file <absolute>` answers 'No indexed file matches ...' even for indexed files, while the
+ * same path relative to the project resolves (verified by probe against the installed
+ * binary). Computed against `resolveRoot(root)` per that function's own warning -- the raw
+ * `root` string may route through a symlinked parent (macOS `/tmp`) that would corrupt the
+ * `relative()` result.
+ */
+function codegraphIndexPath(root: string, requestedPath: unknown): string {
+  return relative(resolveRoot(root), resolveContained(root, requestedPath));
 }
 
 function hasCodegraphIndex(root: string): boolean {

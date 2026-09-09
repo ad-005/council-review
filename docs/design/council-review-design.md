@@ -73,7 +73,7 @@ The read-only guarantee is layered so that no single mistake removes it.
 | Repo resources | `-ne -ns -np -na` — no extension discovery, no skills, no prompt templates, no project trust. A reviewed repo cannot get its own `.pi/extensions` executed. |
 | Injection surface | `-nc` drops `AGENTS.md`/`CLAUDE.md`, which Pi loads regardless of trust. Opt back in with config `includeContextFiles: true`. |
 | Filesystem | Reviewers run in a frozen snapshot, `chmod -R a-w`. Every tool path is realpath-resolved and rejected if it escapes the snapshot root, symlinks included. Exception: the per-run `.codegraph/` index dir stays writable (SQLite needs write access even for reads — see "Review root"); reviewers still have no write tool. |
-| Network | Removing `bash` removes the reviewers' only egress path. This matters: three third-party models are reading source. |
+| Network | No shell and no model-composed command line: reviewers spawn only two fixed binaries from tool code — `git` (read-only `log`/`show`/`blame`/`diff`) and `codegraph` (read-only query allowlist, project pinned server-side via `-p`) — so a reviewer has no path to arbitrary egress. This matters: three third-party models are reading source. (The `codegraph` binary itself is third-party code running with the reviewer's allowlisted environment; its networking/mutating subcommands — `daemon`, `telemetry`, `init`, `sync`, and friends — are excluded from the allowlist.) |
 | Writes | Reviewers return text on stdout. Only the runner writes files. |
 | Sessions | `--no-session` keeps reviewer transcripts out of `~/.pi/agent/sessions`. |
 
@@ -126,7 +126,10 @@ Consequences:
 
 - Reviewers see one immutable tree fixed at t=0. On the default scope that is
   the working tree as it was when the run started, so the coding agent in the
-  adjacent pane can keep editing with no effect on the run.
+  adjacent pane can keep editing with no effect on the run. (The per-run
+  `.codegraph/` index directory is the one exception: it stays writable because
+  SQLite needs write access even for reads, and reviewers still have no write
+  tool — see the Filesystem row above.)
 - Line numbers in findings stay valid relative to a single tree, so the merge
   step's line-proximity clustering compares like with like.
 - The manifest records HEAD sha, dirty flag, and a tree-hash (sha256 over
