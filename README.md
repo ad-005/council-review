@@ -20,11 +20,21 @@ handoff prompt addressed to a coding agent (`HANDOFF.md`).
 npm install -g council-review
 ```
 
-For unreleased changes from `main`, install straight from GitHub instead:
+For unreleased changes from `main`, build from a clone:
 
 ```
-npm install -g github:ad-005/council-review
+git clone https://github.com/ad-005/council-review
+cd council-review
+npm install
+npm pack
+npm install -g ./council-review-*.tgz
 ```
+
+Installing straight from the git URL is unreliable across npm versions: on the npm bundled with
+Node 22 (10.x) `npm install -g github:ad-005/council-review` fails, because npm installs no
+dependencies into its temporary clone and the `prepare` build cannot run; npm 12 fixed that but
+disables git fetching by default, so it needs `--allow-git=all`. `npx github:ad-005/council-review`
+works on npm 10, and needs `--allow-git=all` on npm 12.
 
 Requires the `pi` coding-agent CLI (`@earendil-works/pi-coding-agent`) on `PATH`, authenticated
 for at least one provider through `pi`'s own credential store — a key that exists only as a shell

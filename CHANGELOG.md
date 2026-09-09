@@ -33,6 +33,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window in which a concurrent `council-review gc` could remove the snapshot mid-index.
 - A timed-out index build is now killed with SIGKILL instead of SIGTERM, so an indexer that
   ignores SIGTERM cannot keep mutating the tree reviewers are reading.
+- README no longer tells you to install unreleased changes with
+  `npm install -g github:ad-005/council-review`. That fails on the npm bundled with Node 22, which
+  installs no dependencies into its temporary git clone and so cannot run the `prepare` build; the
+  documented path is now a clone plus `npm pack`.
 
 ## [0.1.1] - 2026-09-08
 
