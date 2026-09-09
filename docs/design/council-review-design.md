@@ -69,10 +69,10 @@ The read-only guarantee is layered so that no single mistake removes it.
 
 | Layer | Mechanism |
 |---|---|
-| Tool surface | `-nbt` removes every Pi built-in. Only `council_read`, `council_grep`, `council_list`, `council_git` exist. |
+| Tool surface | `-nbt` removes every Pi built-in. Only `council_read`, `council_grep`, `council_list`, `council_git`, `council_codegraph` exist. |
 | Repo resources | `-ne -ns -np -na` — no extension discovery, no skills, no prompt templates, no project trust. A reviewed repo cannot get its own `.pi/extensions` executed. |
 | Injection surface | `-nc` drops `AGENTS.md`/`CLAUDE.md`, which Pi loads regardless of trust. Opt back in with config `includeContextFiles: true`. |
-| Filesystem | Reviewers run in a frozen snapshot, `chmod -R a-w`. Every tool path is realpath-resolved and rejected if it escapes the snapshot root, symlinks included. |
+| Filesystem | Reviewers run in a frozen snapshot, `chmod -R a-w`. Every tool path is realpath-resolved and rejected if it escapes the snapshot root, symlinks included. Exception: the per-run `.codegraph/` index dir stays writable (SQLite needs write access even for reads — see "Review root"); reviewers still have no write tool. |
 | Network | Removing `bash` removes the reviewers' only egress path. This matters: three third-party models are reading source. |
 | Writes | Reviewers return text on stdout. Only the runner writes files. |
 | Sessions | `--no-session` keeps reviewer transcripts out of `~/.pi/agent/sessions`. |
@@ -90,6 +90,19 @@ removal, not on instructions to the model.
 ## Review root — frozen photograph
 
 At t=0 the runner builds a snapshot in scratch and runs `chmod -R a-w` on it.
+
+Before the freeze, the CLI builds a CodeGraph index of the snapshot
+(`codegraph init <snap>`, unless config `codegraph.enabled` is false), so the
+index covers exactly the tree reviewers read and symbol positions match the
+frozen files. After the freeze, write bits are restored on `<snap>/.codegraph`
+only: the SQLite index requires write access even for reads — verified by probe
+(2026-09-09, real binary), where `query`/`explore` on a fully frozen tree fail
+with `attempt to write a readonly database` (exit 1). Index files never enter
+the file list or tree hash, and reviewers still have no write tool (the new
+`council_codegraph` tool runs a read-only subcommand allowlist), so the
+read-only guarantee is unchanged; freezing was never a same-user security
+boundary. Indexing never fails a run: a missing, slow, or broken binary degrades
+to grep/read, and the manifest records `codegraph: { available, reason? }`.
 
 The snapshot must depict the state the reviewed diff *ends at*, so its source
 follows the scope. Three builders, one selected per run:
@@ -410,6 +423,7 @@ printed notice, and the tool works normally in a plain shell and in CI.
   "claimSimilarity": 0.45,
   "failOn": "none",
   "snapshot": { "include": [] },
+  "codegraph": { "enabled": true, "indexTimeoutSeconds": 300 },
   "vendorOverrides": {}
 }
 ```

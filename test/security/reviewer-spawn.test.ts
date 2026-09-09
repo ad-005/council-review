@@ -135,6 +135,11 @@ describe('buildReviewerEnv', () => {
     expect(env.COUNCIL_REPO_ROOT).toBe('/repo');
   });
 
+  it('keeps the resolved CodeGraph binary path', () => {
+    const env = buildReviewerEnv({ COUNCIL_CODEGRAPH_BIN: '/opt/bin/codegraph' });
+    expect(env.COUNCIL_CODEGRAPH_BIN).toBe('/opt/bin/codegraph');
+  });
+
   it("keeps the host's own PI_* namespace", () => {
     const env = buildReviewerEnv({ PI_OFFLINE: '1', PI_TELEMETRY: '0' });
     expect(env.PI_OFFLINE).toBe('1');
@@ -163,12 +168,13 @@ describe('resolveHostBin', () => {
 });
 
 describe('REVIEWER_TOOL_NAMES', () => {
-  it('is exactly the four council tools', () => {
+  it('is exactly the five council tools', () => {
     expect(REVIEWER_TOOL_NAMES).toEqual([
       'council_read',
       'council_grep',
       'council_list',
       'council_git',
+      'council_codegraph',
     ]);
   });
 });

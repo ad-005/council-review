@@ -5,9 +5,11 @@
  * rather than spawning a subprocess per scenario, so a run's outcome can be asserted directly
  * without re-parsing captured stdio for every case.
  *
- * No real `pi` or `herdr` binary is ever invoked: `COUNCIL_PI_BIN` points at a small combined
- * stub (auth-check plus delegation to the shared fake host for the reviewer-stream replay) and
- * `HERDR_ENV` is never set, so every herdr interaction degrades to its documented no-op.
+ * No real `pi`, `herdr`, or `codegraph` binary is ever invoked: `COUNCIL_PI_BIN` points at
+ * a small combined stub (auth-check plus delegation to the shared fake host for the
+ * reviewer-stream replay), `HERDR_ENV` is never set (so every herdr interaction degrades to its
+ * documented no-op), and CodeGraph indexing is disabled in the base config (the one enabled test
+ * uses its own exit-0 stub via `COUNCIL_CODEGRAPH_BIN`).
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -56,6 +58,12 @@ function baseConfig(overrides: Partial<CouncilConfig> = {}): Partial<CouncilConf
     claimSimilarity: 0.6,
     failOn: 'high',
     retain: 20,
+    // CodeGraph indexing stays off for every CLI test by default: with it on, a machine that
+    // happens to have the real `codegraph` binary would run a real index build inside every
+    // review here (slow, environment-dependent), while a machine without it would take the
+    // binary-missing path instead. The enabled path is covered by its own tests below with a
+    // stub binary, and by snapshot.test.ts.
+    codegraph: { enabled: false, indexTimeoutSeconds: 300 },
     ...overrides,
   };
 }
@@ -72,7 +80,8 @@ let fakePiCounter = 0;
  * The fixture map is baked into the generated script's own source text (a `JSON.stringify`'d
  * literal), NOT read from an environment variable at spawn time: `reviewer-spawn.ts`'s
  * `buildReviewerEnv` is a strict, security-critical allowlist (`PATH`, `HOME`,
- * `COUNCIL_SNAPSHOT_ROOT`, `COUNCIL_REPO_ROOT`, `PI_*` only) that strips any test-only variable
+ * `COUNCIL_SNAPSHOT_ROOT`, `COUNCIL_REPO_ROOT`, `COUNCIL_CODEGRAPH_BIN`, `PI_*` only) that strips
+ * any test-only variable
  * before a reviewer child ever sees it — the same reason `test/helpers/fake-host.ts`'s own
  * `fixtureEnv`/`sequenceEnv` bake their selector into a generated wrapper binary rather than
  * pass it by environment. `--provider`/`--model` are real argv, unaffected by that allowlist, so
@@ -898,6 +907,75 @@ describe('review run exit codes', () => {
     expect(parsed.length).toBeGreaterThan(0);
     // Nothing else was written to stdout: the whole stream parses as exactly one JSON document.
     expect(stdout.text().trim().endsWith(']')).toBe(true);
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// CodeGraph indexing end to end: config opt-out/in, manifest + report recording, and the
+// CodeGraph-first reviewer instruction -- all through a real `runCli` review with a stub binary.
+// -------------------------------------------------------------------------------------------
+
+describe('codegraph indexing end to end', () => {
+  function onlyRunDir(): string {
+    const reviewsDir = path.join(repo.root, '.council', 'reviews');
+    const runId = fs.readdirSync(reviewsDir).find((e) => e !== 'last')!;
+    return path.join(reviewsDir, runId);
+  }
+
+  async function runReview(): Promise<number> {
+    useFixtures({ defaultFixture: 'valid-findings' }); // one "high" finding
+    makeWorkingChange();
+    const stdout = captureStream(process.stdout);
+    try {
+      return await runCli([]);
+    } finally {
+      stdout.restore();
+    }
+  }
+
+  it('records a disabled index in the manifest and report', async () => {
+    writeConfigFile(); // codegraph disabled by the base config
+    expect(await runReview()).toBe(1);
+
+    const runDir = onlyRunDir();
+    const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
+    expect(manifest.codegraph).toEqual({ available: false, reason: 'disabled' });
+    expect(fs.readFileSync(path.join(runDir, 'REPORT.md'), 'utf8')).toContain(
+      '- CodeGraph index: unavailable (disabled)',
+    );
+  });
+
+  it('records an available index and instructs reviewers CodeGraph-first', async () => {
+    const stubPath = path.join(toolDir, 'codegraph');
+    fs.writeFileSync(stubPath, '#!/bin/sh\nexit 0\n', 'utf8');
+    fs.chmodSync(stubPath, 0o755);
+    const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    process.env.COUNCIL_CODEGRAPH_BIN = stubPath;
+    try {
+      writeConfigFile({ codegraph: { enabled: true, indexTimeoutSeconds: 60 } });
+      expect(await runReview()).toBe(1);
+
+      const runDir = onlyRunDir();
+      const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
+      expect(manifest.codegraph).toEqual({ available: true });
+
+      // The task prompt reviewers actually receive names all five tools and prescribes the
+      // CodeGraph-first workflow (tool description + task prompt + envelope notice together).
+      const prompt = fs.readFileSync(path.join(runDir, 'prompts', 'initial-prompt.txt'), 'utf8');
+      for (const tool of [
+        'council_read',
+        'council_grep',
+        'council_list',
+        'council_git',
+        'council_codegraph',
+      ]) {
+        expect(prompt).toContain(tool);
+      }
+      expect(prompt).toContain('Start with council_codegraph before plain-text search');
+    } finally {
+      if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
+      else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    }
   });
 });
 

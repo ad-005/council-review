@@ -21,6 +21,7 @@ export * from './panel.js';
 export * from './picker.js';
 export * from './scope.js';
 export * from './snapshot.js';
+export * from './codegraph.js';
 export * from './runner.js';
 export * from './schema.js';
 export * from './merge.js';

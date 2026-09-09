@@ -18,7 +18,8 @@ export const REVIEWER_TOOL_NAMES: readonly [
   'council_grep',
   'council_list',
   'council_git',
-] = ['council_read', 'council_grep', 'council_list', 'council_git'];
+  'council_codegraph',
+] = ['council_read', 'council_grep', 'council_list', 'council_git', 'council_codegraph'];
 
 export interface SpawnOptions {
   /** Absolute path to the built extension module (dist/reviewer-tools.js). */
@@ -87,6 +88,7 @@ const ALLOWLISTED_EXACT_VARS: readonly string[] = [
   'HOME',
   'COUNCIL_SNAPSHOT_ROOT',
   'COUNCIL_REPO_ROOT',
+  'COUNCIL_CODEGRAPH_BIN',
 ];
 
 /** pi's own env-var namespace (host-notes section D): startup/debug/telemetry toggles, none of
@@ -98,7 +100,8 @@ const ALLOWLISTED_PREFIXES: readonly string[] = ['PI_'];
  * Builds the reviewer process environment: an allowlist, not a denylist. Every variable from
  * `parentEnv` is dropped unless it is the executable search path, the home directory (needed so
  * the host can find its own config and credentials under `~/.pi/agent/`), one of the two roots
- * `reviewer-tools.ts` reads, or one of the host's own `PI_*` variables. In particular, no
+ * `reviewer-tools.ts` reads, the resolved CodeGraph binary path, or one of the host's own `PI_*`
+ * variables. In particular, no
  * provider `*_API_KEY`-shaped variable and no unrelated secret from the invoking environment
  * ever reaches a reviewer process -- per spec, a reviewer authenticates only through the host's
  * own OAuth store under `HOME`, never through an inherited API key.

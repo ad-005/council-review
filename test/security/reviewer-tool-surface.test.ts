@@ -6,7 +6,7 @@
  *
  * This is the zero-model-call structural half of that assertion: it loads the built extension
  * module and calls its default export against a stub `ExtensionAPI` that records every
- * `registerTool` call, then asserts the recorded name set is exactly the four `council_*` tools
+ * `registerTool` call, then asserts the recorded name set is exactly the five `council_*` tools
  * -- nothing more, nothing fewer -- and explicitly that none of pi's own built-in tool names
  * (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`; see
  * `SCRATCH/host-notes.md` section B point 1) ever appears.
@@ -48,13 +48,13 @@ class StubExtensionAPI implements ReviewerExtensionAPI {
 }
 
 describe('reviewer tool surface (zero-cost, structural)', () => {
-  it('registers exactly the four council_* tools, by name', () => {
+  it('registers exactly the five council_* tools, by name', () => {
     const stub = new StubExtensionAPI();
     registerReviewerTools(stub);
     expect(stub.registeredNames.sort()).toEqual(
       [...REVIEWER_TOOL_NAMES].sort((a, b) => a.localeCompare(b)),
     );
-    expect(stub.registeredNames).toHaveLength(4);
+    expect(stub.registeredNames).toHaveLength(5);
   });
 
   it('registers no duplicate tool names', () => {
@@ -83,7 +83,7 @@ describe('reviewer tool surface (zero-cost, structural)', () => {
     expect(new Set(stub.registeredNames)).toEqual(new Set(REVIEWER_TOOL_NAMES));
   });
 
-  it('none of the four tools declares write/edit/execute-shaped capability in its description', () => {
+  it('none of the five tools declares write/edit/execute-shaped capability in its description', () => {
     // A lightweight guard against a future tool being registered with mutating intent even
     // though its name still starts with council_ -- the requirement is capability, not naming.
     for (const tool of REVIEWER_TOOLS) {

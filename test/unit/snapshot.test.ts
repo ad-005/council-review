@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readdirSync,
@@ -567,6 +568,145 @@ describe('buildSnapshot: liveness marker', () => {
       expect(readFileSync(join(snapshot.root, 'a.txt'), 'utf8')).toBe('content\n');
       snapshot.cleanup();
       expect(existsSync(snapshot.root)).toBe(false);
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+
+describe('buildSnapshot: codegraph indexing', () => {
+  let prevBin: string | undefined;
+  let stubDir = '';
+
+  beforeEach(() => {
+    prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    stubDir = mkdtempSync(join(tmpdir(), 'council-codegraph-stub-'));
+  });
+
+  afterEach(() => {
+    if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
+    else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    rmSync(stubDir, { recursive: true, force: true });
+  });
+
+  /** Writes an executable `codegraph` stand-in; the stub sees `init <root>` as $1/$2. */
+  function writeStub(body: string): string {
+    const binPath = join(stubDir, 'codegraph');
+    writeFileSync(binPath, `#!/bin/sh\n${body}\n`, 'utf8');
+    chmodSync(binPath, 0o755);
+    return binPath;
+  }
+
+  it('is disabled by default and reports that without needing the binary', async () => {
+    process.env.COUNCIL_CODEGRAPH_BIN = join(stubDir, 'does-not-exist');
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('a.txt', 'content\n', 'initial');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope);
+
+      await withSnapshot(snapshot, () => {
+        // A nonexistent binary path with no codegraph opts: nothing was spawned, and the
+        // snapshot still built and froze exactly as before.
+        expect(snapshot.codegraph).toEqual({ available: false, reason: 'disabled' });
+        expect(existsSync(join(snapshot.root, '.codegraph'))).toBe(false);
+        assertReadOnly(join(snapshot.root, 'a.txt'));
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('indexes after materialisation, so the indexer sees the narrowed files', async () => {
+    // Exit nonzero unless the narrowed file is already materialised at the passed root.
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub('test -f "$2/src/a.ts"');
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('src/a.ts', 'content\n', 'initial');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope, {
+        codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+      });
+
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.codegraph).toEqual({ available: true });
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('leaves sources frozen while the index directory stays writable', async () => {
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub(
+      'mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db"',
+    );
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('src/a.ts', 'content\n', 'initial');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope, {
+        codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+      });
+
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.codegraph).toEqual({ available: true });
+        // Reviewed sources are frozen...
+        assertReadOnly(join(snapshot.root, 'src', 'a.ts'));
+        assertReadOnly(snapshot.root);
+        // ...while the index directory and its files are writable in practice, not just by
+        // mode bits: the SQLite index needs real write access even for reads.
+        const indexDir = join(snapshot.root, '.codegraph');
+        expect(statSync(indexDir).mode & 0o200).not.toBe(0);
+        expect(statSync(join(indexDir, 'codegraph.db')).mode & 0o200).not.toBe(0);
+        expect(() => writeFileSync(join(indexDir, '__probe__'), 'x')).not.toThrow();
+      });
+      expect(existsSync(snapshot.root)).toBe(false); // cleanup still removes everything
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('keeps index files out of the file list and tree hash', async () => {
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub(
+      'mkdir -p "$2/.codegraph" && echo junk > "$2/.codegraph/codegraph.db"',
+    );
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('src/a.ts', 'content\n', 'initial');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+
+      const indexed = await buildSnapshot(repo.root, scope, {
+        codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+      });
+      const plain = await buildSnapshot(repo.root, scope);
+      try {
+        expect(indexed.files).toEqual(plain.files);
+        expect(indexed.files.every((f) => !f.startsWith('.codegraph'))).toBe(true);
+        expect(indexed.identity.treeHash).toBe(plain.identity.treeHash);
+      } finally {
+        indexed.cleanup();
+        plain.cleanup();
+      }
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('a failing index build still freezes and reports its reason', async () => {
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub('exit 1');
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('a.txt', 'content\n', 'initial');
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope, {
+        codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+      });
+
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.codegraph).toEqual({ available: false, reason: 'index-failed' });
+        expect(snapshot.files).toContain('a.txt');
+        assertReadOnly(join(snapshot.root, 'a.txt'));
+      });
     } finally {
       repo.cleanup();
     }

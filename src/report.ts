@@ -25,6 +25,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
+import type { CodegraphIndexStatus } from './codegraph.js';
 import type { MergedFinding } from './merge.js';
 import type { ResolutionOutcome, ResolutionState } from './resolve.js';
 import type { ReviewerResult, RunPanelOutcome } from './runner.js';
@@ -227,6 +228,7 @@ export interface ManifestInput {
   suppressed: number;
   overrides: { allowCorrelated: boolean; includeContextFiles: boolean; noSuppress: boolean };
   hostVersion: string | null;
+  codegraph: CodegraphIndexStatus;
 }
 
 /**
@@ -259,6 +261,10 @@ export function writeManifest(i: ManifestInput): string {
       dirty: i.scope.dirty,
       empty: i.scope.empty,
       files: i.scope.files,
+    },
+    codegraph: {
+      available: i.codegraph.available,
+      ...(i.codegraph.reason !== undefined ? { reason: i.codegraph.reason } : {}),
     },
     panel: i.outcome.results.map((r) => ({
       provider: r.reviewer.provider,
@@ -443,6 +449,11 @@ export function writeReport(
   lines.push('## Summary', '');
   lines.push(`- Launched: ${i.outcome.launched}, reporting: ${i.outcome.reporting}`);
   lines.push(`- Suppressed: ${i.suppressed}`);
+  lines.push(
+    i.codegraph.available
+      ? '- CodeGraph index: available'
+      : `- CodeGraph index: unavailable (${i.codegraph.reason ?? 'unknown reason'})`,
+  );
 
   const degradedReviewers = i.outcome.results.filter((r) => r.state !== 'ok');
   if (degradedReviewers.length > 0) {

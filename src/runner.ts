@@ -22,6 +22,7 @@ import {
   resolveHostBin,
   reviewerCwd,
 } from './reviewer-spawn.js';
+import { resolveCodegraphBin } from './codegraph.js';
 import type { Reviewer } from './panel.js';
 import {
   extractFindings,
@@ -156,7 +157,8 @@ const FILE_ENVELOPE_NOTICE =
   'of that file wrapped in a `<file name="...">` tag around everything below. That path is a ' +
   'delivery artifact only -- it is not part of the repository under review and does not exist ' +
   'in your snapshot. Do not attempt to read, grep, or list it. Your only readable surface is the ' +
-  'frozen snapshot, via your council_read, council_grep, council_list and council_git tools.';
+  'frozen snapshot, via your council_read, council_grep, council_list, council_git and ' +
+  'council_codegraph tools.';
 
 /**
  * Writes prompt text to a file under the run directory and returns the argv token that delivers
@@ -271,9 +273,10 @@ function computeCost(
 
 /**
  * Derives the depth signal from recorded tool calls: which files were opened (`council_read`,
- * `args.path`) and how many searches were run (`council_grep` call count). Other tool calls
- * (`council_list`, `council_git`) are still recorded in `toolCalls` but do not contribute here —
- * the spec names files-opened and searches-run as the minimum signal.
+ * `args.path`) and how many searches were run (`council_grep` and `council_codegraph` call
+ * counts). Other tool calls (`council_list`, `council_git`) are still recorded in `toolCalls`
+ * but do not contribute here — the spec names files-opened and searches-run as the minimum
+ * signal.
  */
 function computeDepth(toolCalls: readonly ToolCall[]): { filesOpened: string[]; searches: number } {
   const files = new Set<string>();
@@ -281,7 +284,7 @@ function computeDepth(toolCalls: readonly ToolCall[]): { filesOpened: string[]; 
   for (const call of toolCalls) {
     if (call.name === 'council_read' && typeof call.args.path === 'string') {
       files.add(call.args.path);
-    } else if (call.name === 'council_grep') {
+    } else if (call.name === 'council_grep' || call.name === 'council_codegraph') {
       searches += 1;
     }
   }
@@ -495,17 +498,21 @@ interface AttemptOptions {
 
 /**
  * Builds the child's environment: exactly `reviewer-spawn.ts`'s security allowlist, plus the two
- * roots the extension needs. No exception is carved out here for anything test-only -- the fake
- * host used throughout this suite selects its fixture from an argument baked into the binary path
- * `COUNCIL_PI_BIN` resolves to (see `test/helpers/fake-host.ts`), precisely so that this function
- * never has to know the fake host exists. The child's environment is always, exactly,
- * `buildReviewerEnv`'s output.
+ * roots the extension needs and the resolved CodeGraph binary path (same tier as the two roots:
+ * set explicitly here so the reviewer always execs the exact binary the CLI indexed with,
+ * whether that came from `COUNCIL_CODEGRAPH_BIN` or the `codegraph`-on-PATH default). No
+ * exception is carved out here for anything test-only -- the fake host used throughout this
+ * suite selects its fixture from an argument baked into the binary path `COUNCIL_PI_BIN`
+ * resolves to (see `test/helpers/fake-host.ts`), precisely so that this function never has to
+ * know the fake host exists. The child's environment is always, exactly, `buildReviewerEnv`'s
+ * output.
  */
 function buildAttemptEnv(snapshotRoot: string, repoRoot: string): NodeJS.ProcessEnv {
   return buildReviewerEnv({
     ...process.env,
     COUNCIL_SNAPSHOT_ROOT: snapshotRoot,
     COUNCIL_REPO_ROOT: repoRoot,
+    COUNCIL_CODEGRAPH_BIN: resolveCodegraphBin(),
   });
 }
 
