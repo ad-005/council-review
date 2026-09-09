@@ -22,11 +22,15 @@ part of it are in scope:
 
 - The stripped host tool surface — a reviewer must never gain a shell, a file-write tool, or a
   file-edit tool.
-- Path containment: any path given to `council_read`, `council_grep`, `council_list` or
-  `council_git` must be realpath-resolved and rejected if it escapes the snapshot root, including
-  via a symlink or an intermediate symlinked directory.
+- Path containment: any path given to `council_read`, `council_grep`, `council_list`,
+  `council_git` or `council_codegraph` must be realpath-resolved and rejected if it escapes the
+  snapshot root, including via a symlink or an intermediate symlinked directory.
 - The `council_git` read-only subcommand allowlist (log, show, blame, diff) with structured
   arguments — never a composed command line reaching the real repository.
+- The `council_codegraph` read-only subcommand allowlist (explore, query, node, callers,
+  callees, impact, affected) with structured arguments and a server-side project path — never
+  a composed command line, and never a networking or mutating subcommand (daemon, telemetry,
+  init, sync, and friends).
 - The environment allowlist a reviewer process is spawned with — it must keep unrelated secrets
   (credentials for other services, arbitrary variables from the invoking shell) out of a reviewer
   process.
@@ -57,7 +61,8 @@ file these as security reports:
   a review requires a model to read the diff and the surrounding repository. Nothing in the
   isolation model prevents a model provider from seeing your code as part of serving the review
   request — it only prevents that model, or the repository it's reviewing, from writing anything,
-  executing anything, or reaching the network on its own.
+  running anything of its own choosing (tool code spawns only fixed `git`/`codegraph` binaries
+  with allowlisted subcommands), or reaching the network on its own.
 
 ## The host-version caveat
 

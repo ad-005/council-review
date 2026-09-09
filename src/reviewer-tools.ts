@@ -8,8 +8,9 @@
  *  - This file may import nothing but `node:` builtins. It is loaded by path (via jiti) into a
  *    foreign reviewer process; it is never imported by any other `src/` module and never by the
  *    council-review CLI process itself.
- *  - It registers exactly four tools — `council_read`, `council_grep`, `council_list`,
- *    `council_git` — and nothing else. No shell, no write, no edit, no network capability.
+ *  - It registers exactly five tools — `council_read`, `council_grep`, `council_list`,
+ *    `council_git`, `council_codegraph` — and nothing else. No shell, no write, no edit, no
+ *    network capability.
  *
  * The file's default export is the extension factory pi calls: `export default function(pi) {
  * pi.registerTool(...) }`. `pi`'s real `ExtensionAPI`/`ToolDefinition` types live in
@@ -23,7 +24,8 @@
  *
  * Two roots matter here, and they must never be confused:
  *  - the **snapshot root** (`COUNCIL_SNAPSHOT_ROOT`) — a frozen, non-writable copy of the
- *    reviewed tree. `council_read`, `council_grep` and `council_list` operate only inside it.
+ *    reviewed tree. `council_read`, `council_grep` and `council_list` operate only inside it,
+ *    and `council_codegraph` queries a per-run index of it (built before the freeze).
  *  - the **real repository** (`COUNCIL_REPO_ROOT`) — has no snapshot equivalent because history
  *    metadata was deliberately not copied (see design.md). Only `council_git` touches it, and
  *    only through a fixed read-only subcommand allowlist with structured, literal arguments.
@@ -700,6 +702,294 @@ export const councilGitTool: ReviewerToolDefinition = {
 };
 
 // -------------------------------------------------------------------------------------------
+// council_codegraph -- semantic code intelligence over the SNAPSHOT, never the real repo.
+// Mirrors council_git's shape: structured params become a literal argv executed from tool code
+// via execFileSync, never a model-composed command line and never through a shell. The `-p
+// <snapshotRoot>` project flag is always injected server-side from the caller's root argument,
+// so reviewer input can never aim a query at any other tree. The binary reads a per-run index
+// of the snapshot (built before the freeze); when that index is absent the call degrades to a
+// reviewer-facing fallback message instead of failing.
+// -------------------------------------------------------------------------------------------
+
+export const CODEGRAPH_SUBCOMMANDS = [
+  'explore',
+  'query',
+  'node',
+  'callers',
+  'callees',
+  'impact',
+  'affected',
+] as const;
+type CodegraphSubcommand = (typeof CODEGRAPH_SUBCOMMANDS)[number];
+
+export interface CodegraphParams {
+  subcommand?: unknown;
+  query?: unknown;
+  symbol?: unknown;
+  file?: unknown;
+  files?: unknown;
+  kind?: unknown;
+  limit?: unknown;
+  depth?: unknown;
+  maxFiles?: unknown;
+  offset?: unknown;
+}
+
+export const MAX_CODEGRAPH_OUTPUT_CHARS = 100_000;
+
+export const CODEGRAPH_FALLBACK_MESSAGE =
+  'The CodeGraph index is not available for this run (it was not built, is disabled, or failed ' +
+  'to build). Continue the review with council_grep and council_read instead.';
+
+export function getCodegraphBin(env: NodeJS.ProcessEnv = process.env): string {
+  return env.COUNCIL_CODEGRAPH_BIN ?? 'codegraph';
+}
+
+function isCodegraphSubcommand(v: unknown): v is CodegraphSubcommand {
+  return typeof v === 'string' && (CODEGRAPH_SUBCOMMANDS as readonly string[]).includes(v);
+}
+
+/** A structured string field's value is passed to the binary as one literal argv entry (never
+ *  through a shell), so shell metacharacters carry no special meaning -- same rationale as
+ *  `assertLiteralArgValue` for git: only a leading '-' (option smuggling) and NUL/empty are
+ *  rejected. */
+function codegraphStringField(label: string, value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new Error(`${label} must be a string`);
+  }
+  assertLiteralArgValue(label, value);
+  return value;
+}
+
+export function buildCodegraphArgv(root: string, params: CodegraphParams): string[] {
+  if (!isCodegraphSubcommand(params.subcommand)) {
+    throw new Error(
+      `unsupported codegraph subcommand: ${String(params.subcommand)} (allowed: ${CODEGRAPH_SUBCOMMANDS.join(', ')})`,
+    );
+  }
+  const subcommand = params.subcommand;
+  const argv: string[] = [subcommand, '-p', root];
+
+  switch (subcommand) {
+    case 'explore': {
+      argv.push(codegraphStringField('query', params.query));
+      if (params.maxFiles !== undefined) {
+        argv.push('--max-files', String(clampInt(params.maxFiles, 10, 1, 50, 'maxFiles')));
+      }
+      break;
+    }
+    case 'query': {
+      argv.push(codegraphStringField('query', params.query));
+      if (params.limit !== undefined) {
+        argv.push('--limit', String(clampInt(params.limit, 10, 1, 100, 'limit')));
+      }
+      if (params.kind !== undefined) {
+        argv.push('--kind', codegraphStringField('kind', params.kind));
+      }
+      break;
+    }
+    case 'node': {
+      const hasSymbol = params.symbol !== undefined;
+      const hasFile = params.file !== undefined;
+      if (!hasSymbol && !hasFile) {
+        throw new Error('node requires symbol and/or file');
+      }
+      if (hasSymbol) {
+        argv.push(codegraphStringField('symbol', params.symbol));
+      }
+      if (hasFile) {
+        argv.push('--file', codegraphIndexPath(root, params.file));
+      }
+      if (params.offset !== undefined) {
+        if (!hasFile) {
+          throw new Error('offset is only supported with file');
+        }
+        argv.push('--offset', String(clampInt(params.offset, 1, 1, 1_000_000, 'offset')));
+      }
+      if (params.limit !== undefined) {
+        if (!hasFile) {
+          throw new Error('limit is only supported with file');
+        }
+        argv.push('--limit', String(clampInt(params.limit, 20, 1, 1000, 'limit')));
+      }
+      break;
+    }
+    case 'callers':
+    case 'callees': {
+      argv.push(codegraphStringField('symbol', params.symbol));
+      if (params.limit !== undefined) {
+        argv.push('--limit', String(clampInt(params.limit, 20, 1, 100, 'limit')));
+      }
+      break;
+    }
+    case 'impact': {
+      argv.push(codegraphStringField('symbol', params.symbol));
+      if (params.depth !== undefined) {
+        argv.push('--depth', String(clampInt(params.depth, 2, 1, 10, 'depth')));
+      }
+      break;
+    }
+    case 'affected': {
+      if (params.files !== undefined) {
+        if (!Array.isArray(params.files)) {
+          throw new Error('files must be an array of strings');
+        }
+        for (const entry of params.files) {
+          if (typeof entry !== 'string') {
+            throw new Error('files must be an array of strings');
+          }
+          argv.push(codegraphIndexPath(root, entry));
+        }
+      }
+      if (params.depth !== undefined) {
+        argv.push('--depth', String(clampInt(params.depth, 5, 1, 10, 'depth')));
+      }
+      break;
+    }
+  }
+
+  return argv;
+}
+
+/**
+ * Validates a reviewer-supplied file path exactly like every other snapshot tool (full
+ * containment check, symlink-aware), then converts it to the project-root-relative form the
+ * index itself is keyed by. Passing the absolute path fails against the real binary: `node
+ * --file <absolute>` answers 'No indexed file matches ...' even for indexed files, while the
+ * same path relative to the project resolves (verified by probe against the installed
+ * binary). Computed against `resolveRoot(root)` per that function's own warning -- the raw
+ * `root` string may route through a symlinked parent (macOS `/tmp`) that would corrupt the
+ * `relative()` result.
+ */
+function codegraphIndexPath(root: string, requestedPath: unknown): string {
+  return relative(resolveRoot(root), resolveContained(root, requestedPath));
+}
+
+function hasCodegraphIndex(root: string): boolean {
+  try {
+    statSync(join(root, '.codegraph', 'codegraph.db'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function runCodegraph(
+  root: string,
+  params: CodegraphParams,
+  opts: { timeoutMs?: number } = {},
+): string {
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  // Graceful degradation, checked before any validation or spawn: without an index every call
+  // returns the fallback message and nothing is ever executed.
+  if (!hasCodegraphIndex(root)) {
+    return CODEGRAPH_FALLBACK_MESSAGE;
+  }
+  const argv = buildCodegraphArgv(root, params);
+  let output: string;
+  try {
+    output = execFileSync(getCodegraphBin(), argv, {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (err) {
+    const code =
+      err && typeof err === 'object' && 'code' in err
+        ? (err as { code?: unknown }).code
+        : undefined;
+    if (code === 'ETIMEDOUT') {
+      throw new Error(
+        `codegraph ${String(params.subcommand)} timed out after ${timeoutMs}ms; narrow the query to a more specific symbol or file and try again`,
+        { cause: err },
+      );
+    }
+    const stderr =
+      err && typeof err === 'object' && 'stderr' in err
+        ? String((err as { stderr?: unknown }).stderr ?? '')
+        : '';
+    const message =
+      stderr.trim().length > 0 ? stderr.trim() : err instanceof Error ? err.message : String(err);
+    throw new Error(`codegraph ${String(params.subcommand)} failed: ${message}`, { cause: err });
+  }
+  if (output.length > MAX_CODEGRAPH_OUTPUT_CHARS) {
+    return (
+      output.slice(0, MAX_CODEGRAPH_OUTPUT_CHARS) +
+      `\n[output truncated: ${output.length} characters total, showing the first ${MAX_CODEGRAPH_OUTPUT_CHARS}; narrow the query to a more specific symbol, file, or lower limit]`
+    );
+  }
+  return output;
+}
+
+const codegraphParameters = {
+  type: 'object',
+  properties: {
+    subcommand: {
+      type: 'string',
+      enum: ['explore', 'query', 'node', 'callers', 'callees', 'impact', 'affected'],
+      description: 'Read-only CodeGraph operation to run.',
+    },
+    query: {
+      type: 'string',
+      description: 'Free-text exploration or symbol-search query (explore, query).',
+    },
+    symbol: {
+      type: 'string',
+      description: 'Symbol name to look up or trace (node, callers, callees, impact).',
+    },
+    file: {
+      type: 'string',
+      description:
+        'Snapshot-relative file path to read through the index (node file mode; enables offset/limit).',
+    },
+    files: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Snapshot-relative file paths whose affected tests to find (affected).',
+    },
+    kind: {
+      type: 'string',
+      description: 'Symbol-kind filter for query (e.g. "function", "class").',
+    },
+    limit: {
+      type: 'number',
+      description: 'Maximum results or lines (query, node file mode, callers, callees).',
+    },
+    depth: {
+      type: 'number',
+      description: 'Dependency-traversal depth for impact/affected (1-10).',
+    },
+    maxFiles: {
+      type: 'number',
+      description: 'Maximum files to include source from, for explore (1-50).',
+    },
+    offset: {
+      type: 'number',
+      description: '1-based first line for node file mode.',
+    },
+  },
+  required: ['subcommand'],
+  additionalProperties: false,
+} as const;
+
+export const councilCodegraphTool: ReviewerToolDefinition = {
+  name: 'council_codegraph',
+  label: 'Code intelligence',
+  description:
+    'Start here before council_grep/council_read: query the CodeGraph symbol index of the reviewed snapshot for symbol-accurate call paths and transitive impact that plain-text search misses. Use explore for an area, node for one symbol, and callers/callees/impact to trace who calls what, e.g. { "subcommand": "callers", "symbol": "functionName" }. When the index is unavailable the tool returns a fallback message instead of results; use council_grep/council_read then.',
+  parameters: codegraphParameters,
+  async execute(_toolCallId, params) {
+    const root = getSnapshotRoot();
+    const output = runCodegraph(root, (params ?? {}) as CodegraphParams);
+    return {
+      content: [{ type: 'text', text: output.length > 0 ? output : '(no output)' }],
+      details: { subcommand: (params as CodegraphParams | undefined)?.subcommand },
+    };
+  },
+};
+
+// -------------------------------------------------------------------------------------------
 // Extension entry point
 // -------------------------------------------------------------------------------------------
 
@@ -708,6 +998,7 @@ export const REVIEWER_TOOLS: readonly ReviewerToolDefinition[] = [
   councilGrepTool,
   councilListTool,
   councilGitTool,
+  councilCodegraphTool,
 ];
 
 export default function registerReviewerTools(pi: ReviewerExtensionAPI): void {

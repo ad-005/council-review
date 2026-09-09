@@ -156,6 +156,7 @@ const BASE_CONFIG: CouncilConfig = {
   mergeWindow: 10,
   claimSimilarity: 0.6,
   failOn: 'high',
+  codegraph: { enabled: true, indexTimeoutSeconds: 300 },
 };
 
 // ---------------------------------------------------------------------------------------------

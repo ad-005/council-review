@@ -36,6 +36,12 @@ export interface CouncilConfig {
   snapshot?: { include?: string[] };
   vendorOverrides?: Record<string, string>;
   retain?: number;
+  codegraph: CodegraphConfig;
+}
+
+export interface CodegraphConfig {
+  enabled: boolean;
+  indexTimeoutSeconds: number;
 }
 
 export interface IgnoreEntry {
@@ -78,6 +84,11 @@ export const CONFIG_DEFAULTS: Readonly<Partial<CouncilConfig>> = Object.freeze({
   claimSimilarity: 0.6,
   failOn: 'high',
   retain: 20,
+});
+
+export const CODEGRAPH_DEFAULTS: Readonly<CodegraphConfig> = Object.freeze({
+  enabled: true,
+  indexTimeoutSeconds: 300,
 });
 
 export function configPath(projectRoot: string): string {
@@ -130,6 +141,12 @@ const ConfigSchema = Type.Object({
   ),
   vendorOverrides: Type.Optional(Type.Record(Type.String(), Type.String())),
   retain: Type.Optional(Type.Integer({ minimum: 0 })),
+  codegraph: Type.Optional(
+    Type.Object({
+      enabled: Type.Optional(Type.Boolean()),
+      indexTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
+    }),
+  ),
 });
 
 type RawConfig = Static<typeof ConfigSchema>;
@@ -236,6 +253,11 @@ function applyDefaults(raw: RawConfig): CouncilConfig {
     snapshot: raw.snapshot,
     vendorOverrides: raw.vendorOverrides,
     retain: raw.retain ?? CONFIG_DEFAULTS.retain!,
+    codegraph: {
+      enabled: raw.codegraph?.enabled ?? CODEGRAPH_DEFAULTS.enabled,
+      indexTimeoutSeconds:
+        raw.codegraph?.indexTimeoutSeconds ?? CODEGRAPH_DEFAULTS.indexTimeoutSeconds,
+    },
   };
 }
 

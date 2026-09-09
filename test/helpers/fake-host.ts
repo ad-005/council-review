@@ -33,6 +33,11 @@ export const FIXTURE_NAMES = [
   /** A single turn, no tool calls, with a valid, non-empty findings block — the "repair
    * succeeded" half of the invalid-then-valid pair. */
   'valid-findings',
+  /** A valid-findings turn preceded by exactly two `council_grep` and three
+   * `council_codegraph` `tool_execution_start` events. Exercises the review-depth signal
+   * counting both search tools; the findings block is valid on purpose so no repair attempt
+   * replays the stream a second time and doubles the counts. */
+  'mixed-searches',
   /** Cuts off mid-response: partial `text_delta` events, then nothing — no `text_end`, no
    * `message_end`, no `turn_end`, no `agent_end`. The stub exits(1) right after the last written
    * line, with no closing event, simulating a crashed host process. */

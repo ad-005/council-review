@@ -72,6 +72,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadCatalog, readyModels, type CatalogModel } from '../../src/providers.js';
+import { TASK_PROMPT as PRODUCTION_TASK_PROMPT } from '../../src/cli.js';
 import { resolveThinking } from '../../src/thinking.js';
 import { resolveScope } from '../../src/scope.js';
 import { buildSnapshot, writePatch, type Snapshot } from '../../src/snapshot.js';
@@ -89,12 +90,12 @@ const LIVE = process.env.COUNCIL_LIVE === '1';
 
 const EXTENSION_PATH = fileURLToPath(new URL('../../dist/reviewer-tools.js', import.meta.url));
 
-const TASK_PROMPT = `You are one independent reviewer in a multi-model code review panel. You are
-given a unified diff patch and read-only access to a frozen snapshot of the repository at the
-tree the patch ends at, via your council_read, council_grep, council_list and council_git tools.
-
-This is a smoke test with a trivial, deliberately obvious patch. Review it briefly and honestly;
-do not pad your answer.`;
+// The production task prompt, verbatim, plus the smoke test's own brevity instruction --
+// imported, not copied, so this file always sends what `cli.ts` sends (including the
+// CodeGraph-first paragraph) no matter how the production prompt evolves.
+const TASK_PROMPT =
+  `${PRODUCTION_TASK_PROMPT}\n\nThis is a smoke test with a trivial, deliberately obvious ` +
+  `patch. Review it briefly and honestly; do not pad your answer.`;
 
 const TIMEOUT_SECONDS = 120;
 const MAX_OUTPUT_TOKENS = 2000;
@@ -204,7 +205,12 @@ describe.skipIf(!LIVE)('live smoke: one cheap model end-to-end against the real 
       };
 
       // --- 3. Real frozen snapshot of the tree the patch ends at (worktree scope: on-disk state). ---
-      snapshot = await buildSnapshot(repo.root, scope, {});
+      // Indexing enabled (best-effort, as in production): when a real `codegraph` binary is
+      // present this exercises the `council_codegraph` tool path end to end; when it is absent
+      // the run degrades to grep/read exactly as a production run would.
+      snapshot = await buildSnapshot(repo.root, scope, {
+        codegraph: { enabled: true, indexTimeoutSeconds: 60 },
+      });
 
       // --- 4. Real runner, real host process, real isolation flags. ---
       const outcome = await runPanel({

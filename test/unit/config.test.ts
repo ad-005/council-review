@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  CODEGRAPH_DEFAULTS,
   CONFIG_DEFAULTS,
   ConfigError,
   SUPPORTED_CONFIG_VERSIONS,
@@ -62,6 +63,7 @@ describe('loadConfig: valid document round-trip', () => {
       snapshot: { include: ['dist/**'] },
       vendorOverrides: { 'openrouter/some-model': 'anthropic' },
       retain: 3,
+      codegraph: { enabled: false, indexTimeoutSeconds: 60 },
     };
     writeRawConfig(full);
 
@@ -116,6 +118,82 @@ describe('loadConfig: default fill-in for every optional key', () => {
   it('preserves an explicitly provided value instead of the default', () => {
     writeRawConfig({ version: 1, panel: validPanel, mergeWindow: 42 });
     expect(loadConfig(root).mergeWindow).toBe(42);
+  });
+});
+
+describe('loadConfig: codegraph defaults and partial fill-in', () => {
+  it('applies enabled=true and indexTimeoutSeconds=300 when the codegraph key is omitted', () => {
+    writeRawConfig({ version: 1, panel: validPanel });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.enabled).toBe(true);
+    expect(loaded.codegraph.indexTimeoutSeconds).toBe(300);
+    expect(loaded.codegraph.enabled).toBe(CODEGRAPH_DEFAULTS.enabled);
+    expect(loaded.codegraph.indexTimeoutSeconds).toBe(CODEGRAPH_DEFAULTS.indexTimeoutSeconds);
+  });
+
+  it('fills indexTimeoutSeconds with the default when only enabled is provided', () => {
+    writeRawConfig({ version: 1, panel: validPanel, codegraph: { enabled: false } });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.enabled).toBe(false);
+    expect(loaded.codegraph.indexTimeoutSeconds).toBe(CODEGRAPH_DEFAULTS.indexTimeoutSeconds);
+  });
+
+  it('fills enabled with the default when only indexTimeoutSeconds is provided', () => {
+    writeRawConfig({ version: 1, panel: validPanel, codegraph: { indexTimeoutSeconds: 60 } });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.enabled).toBe(CODEGRAPH_DEFAULTS.enabled);
+    expect(loaded.codegraph.indexTimeoutSeconds).toBe(60);
+  });
+
+  it('preserves explicit codegraph values on a writeConfig/loadConfig round-trip', () => {
+    writeConfig(root, {
+      version: 1,
+      panel: validPanel,
+      codegraph: { enabled: false, indexTimeoutSeconds: 60 },
+    });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph).toEqual({ enabled: false, indexTimeoutSeconds: 60 });
+  });
+});
+
+describe('loadConfig: codegraph rejection paths', () => {
+  it.each([0, -5, 1.5, '300'])(
+    'rejects indexTimeoutSeconds=%s as a ConfigError',
+    (indexTimeoutSeconds) => {
+      writeRawConfig({ version: 1, panel: validPanel, codegraph: { indexTimeoutSeconds } });
+
+      try {
+        loadConfig(root);
+        expect.unreachable();
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConfigError);
+        const e = err as ConfigError;
+        expect(e.exitCode).toBe(2);
+        expect(e.keyPath).toBe('/codegraph/indexTimeoutSeconds');
+      }
+    },
+  );
+
+  it('rejects a non-boolean enabled as a ConfigError', () => {
+    writeRawConfig({ version: 1, panel: validPanel, codegraph: { enabled: 'yes' } });
+
+    try {
+      loadConfig(root);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      const e = err as ConfigError;
+      expect(e.exitCode).toBe(2);
+      expect(e.keyPath).toBe('/codegraph/enabled');
+    }
   });
 });
 

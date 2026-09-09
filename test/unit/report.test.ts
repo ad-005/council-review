@@ -158,6 +158,7 @@ function makeManifestInput(run: RunDir, over: Partial<ManifestInput> = {}): Mani
     suppressed: 0,
     overrides: { allowCorrelated: false, includeContextFiles: false, noSuppress: false },
     hostVersion: '0.84.4',
+    codegraph: { available: true },
     ...over,
   };
 }
@@ -490,6 +491,26 @@ describe('writeManifest', () => {
     expect(manifest.degraded).toBe(true);
   });
 
+  it('records an available CodeGraph index without a reason', () => {
+    const run = createRunDir(projectRoot);
+    const input = makeManifestInput(run, { codegraph: { available: true } });
+
+    const manifest = JSON.parse(readFileSync(writeManifest(input), 'utf8'));
+
+    expect(manifest.codegraph).toEqual({ available: true });
+  });
+
+  it('records an unavailable CodeGraph index with its reason', () => {
+    const run = createRunDir(projectRoot);
+    const input = makeManifestInput(run, {
+      codegraph: { available: false, reason: 'binary-missing' },
+    });
+
+    const manifest = JSON.parse(readFileSync(writeManifest(input), 'utf8'));
+
+    expect(manifest.codegraph).toEqual({ available: false, reason: 'binary-missing' });
+  });
+
   it('never carries credential-shaped content, even when the environment holds a live-looking secret', () => {
     const fakeSecret = 'sk-live-abcdefghijklmnopqrstuvwxyz0123456789';
     const previous = process.env.OPENROUTER_API_KEY;
@@ -576,6 +597,27 @@ describe('writeReport', () => {
     const text = readFileSync(writeReport(run, input, [], null), 'utf8');
     expect(text).toMatch(/Suppressed:\s*3/);
     expect(text).toMatch(/Degraded \(1\).*openrouter\/model-a.*timeout/s);
+  });
+
+  it('surfaces CodeGraph index availability in the summary footer', () => {
+    const run = createRunDir(projectRoot);
+
+    const availableText = readFileSync(
+      writeReport(run, makeManifestInput(run, { codegraph: { available: true } }), [], null),
+      'utf8',
+    );
+    expect(availableText).toContain('- CodeGraph index: available');
+
+    const unavailableText = readFileSync(
+      writeReport(
+        run,
+        makeManifestInput(run, { codegraph: { available: false, reason: 'disabled' } }),
+        [],
+        null,
+      ),
+      'utf8',
+    );
+    expect(unavailableText).toContain('- CodeGraph index: unavailable (disabled)');
   });
 
   it('renders the no-baseline case distinctly, never as "N new findings"', () => {

@@ -18,6 +18,7 @@ import { isThinkingLevel, type ThinkingLevel } from './levels.js';
 import {
   ConfigError,
   CONFIG_DEFAULTS,
+  CODEGRAPH_DEFAULTS,
   configPath,
   ignorePath,
   loadConfig,
@@ -374,9 +375,18 @@ async function withStdoutRedirectedToStderr<T>(active: boolean, fn: () => Promis
   }
 }
 
-const TASK_PROMPT = `You are one independent reviewer in a multi-model code review panel. You are
+/** The task instructions every reviewer receives. Exported (rather than kept module-private)
+ *  so the live smoke test sends exactly what production sends instead of maintaining a copy
+ *  that drifts the next time this paragraph changes. */
+export const TASK_PROMPT = `You are one independent reviewer in a multi-model code review panel. You are
 given a unified diff patch and read-only access to a frozen snapshot of the repository at the
-tree the patch ends at, via your council_read, council_grep, council_list and council_git tools.
+tree the patch ends at, via your council_read, council_grep, council_list, council_git and
+council_codegraph tools.
+
+Start with council_codegraph before plain-text search: explore the symbols the patch touches,
+then trace their callers, callees, and transitive impact to find affected code that shares no
+text with the diff. Use council_grep and council_read for what the index cannot answer, or for
+everything when council_codegraph reports its index is unavailable for this run.
 
 Review the patch for correctness bugs, security issues, and other defects a careful senior
 engineer would flag before merging: logic errors, unhandled edge cases, resource leaks, race
@@ -719,6 +729,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       claimSimilarity: CONFIG_DEFAULTS.claimSimilarity!,
       failOn: CONFIG_DEFAULTS.failOn!,
       retain: CONFIG_DEFAULTS.retain!,
+      codegraph: { ...CODEGRAPH_DEFAULTS },
     };
   } else {
     // Missing config with no override throws here, its message already directing to `init`
@@ -794,6 +805,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
     snapshot = await buildSnapshot(repoRoot, scope, {
       include: cfg.snapshot?.include,
       handleSignals: false,
+      codegraph: cfg.codegraph,
     });
 
     const timeoutSeconds =
@@ -867,6 +879,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       suppressed: mergeOutcome.suppressed,
       overrides: { allowCorrelated, includeContextFiles: cfg.includeContextFiles, noSuppress },
       hostVersion: null,
+      codegraph: activeSnapshot.codegraph,
     };
     writeManifest(manifestInput);
     const reportPath = writeReport(run, manifestInput, mergeOutcome.findings, resolution);

@@ -76,6 +76,7 @@ function makeSnapshot(files: string[] = ['src/foo.ts']): Snapshot {
     root,
     files,
     identity: { head: 'deadbeef', dirty: false, treeHash: 'abc123' },
+    codegraph: { available: false },
     cleanup: vi.fn(),
   };
 }
@@ -339,6 +340,16 @@ describe('review depth', () => {
     const result = outcome.results[0]!;
 
     expect(result.depth).toEqual({ filesOpened: ['src/foo.ts'], searches: 1 });
+  });
+
+  it('counts both council_grep and council_codegraph calls as searches', async () => {
+    setFixture('mixed-searches');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
+    const result = outcome.results[0]!;
+
+    expect(result.depth).toEqual({ filesOpened: [], searches: 5 });
   });
 
   it('makes a shallow reviewer visibly different from a thorough one', async () => {
@@ -672,7 +683,9 @@ describe('file-envelope notice', () => {
     expect(promptFileContent).toContain('delivered as file content');
     expect(promptFileContent).toContain('not part of the repository under review');
     expect(promptFileContent).toContain('Do not attempt to read, grep, or list it');
-    expect(promptFileContent).toContain('council_read, council_grep, council_list and council_git');
+    expect(promptFileContent).toContain(
+      'council_read, council_grep, council_list, council_git and council_codegraph',
+    );
 
     // The notice comes BEFORE the actual task content, since the model reads top to bottom.
     const noticeIndex = promptFileContent.indexOf('delivered as file content');
@@ -745,11 +758,57 @@ describe('child environment', () => {
       ...process.env,
       COUNCIL_SNAPSHOT_ROOT: snapshot.root,
       COUNCIL_REPO_ROOT: repoRoot,
+      COUNCIL_CODEGRAPH_BIN: process.env.COUNCIL_CODEGRAPH_BIN ?? 'codegraph',
     });
 
     expect(opts.env).toEqual(expectedEnv);
     expect(Object.keys(opts.env).sort()).toEqual(Object.keys(expectedEnv).sort());
     expect(opts.env.COUNCIL_FAKE_HOST_STREAM).toBeUndefined();
+  });
+
+  it('injects the resolved CodeGraph binary path like the two roots', async () => {
+    setFixture('clean-with-tools');
+    const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    process.env.COUNCIL_CODEGRAPH_BIN = '/opt/bin/codegraph';
+    try {
+      const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+      const spawnSpy = vi.spyOn(cp, 'spawn');
+
+      const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
+      expect(outcome.results[0]!.state).toBe('ok');
+
+      const [, , opts] = spawnSpy.mock.calls[0] as unknown as [
+        string,
+        string[],
+        { env: NodeJS.ProcessEnv },
+      ];
+      expect(opts.env.COUNCIL_CODEGRAPH_BIN).toBe('/opt/bin/codegraph');
+    } finally {
+      if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
+      else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    }
+  });
+
+  it("defaults the injected CodeGraph binary path to 'codegraph' when unset", async () => {
+    setFixture('clean-with-tools');
+    const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    delete process.env.COUNCIL_CODEGRAPH_BIN;
+    try {
+      const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+      const spawnSpy = vi.spyOn(cp, 'spawn');
+
+      const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
+      expect(outcome.results[0]!.state).toBe('ok');
+
+      const [, , opts] = spawnSpy.mock.calls[0] as unknown as [
+        string,
+        string[],
+        { env: NodeJS.ProcessEnv },
+      ];
+      expect(opts.env.COUNCIL_CODEGRAPH_BIN).toBe('codegraph');
+    } finally {
+      if (prevBin !== undefined) process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    }
   });
 });
 
