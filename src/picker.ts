@@ -217,6 +217,49 @@ function splitModelKey(key: string): { provider: string; id: string } {
 }
 
 /**
+ * Sentinel value for the thinking prompt's "back" choice. A plain string (rather than a
+ * `Symbol`) so it flows through inquirer's generic `select<Value>` typing untouched; it can
+ * never collide with a real pick because no `ThinkingLevel` equals it.
+ */
+export const THINKING_BACK_VALUE = '__council_thinking_back__' as const;
+
+export type ThinkingPromptValue = ThinkingLevel | typeof THINKING_BACK_VALUE;
+
+export interface ThinkingChoice {
+  value: ThinkingPromptValue;
+  name: string;
+  short?: string;
+}
+
+/**
+ * Builds one thinking prompt's choices: the model's supported levels, plus — when `prevLabel`
+ * names a previous reasoning model — a trailing, separator-spaced "back" choice that returns to
+ * it. The first reasoning model gets `prevLabel: null` and therefore no back choice. The back
+ * choice goes last so the levels keep their positions (and existing key sequences still land on
+ * the same level), and it names the model it returns to so the destination is unambiguous.
+ */
+export function buildThinkingChoices(
+  supported: readonly ThinkingLevel[],
+  prevLabel: string | null,
+): Array<ThinkingChoice | Separator> {
+  const choices: Array<ThinkingChoice | Separator> = supported.map((level) => ({
+    value: level,
+    name: level,
+  }));
+  if (prevLabel !== null) {
+    // A single space: renders as an empty line. (`new Separator('')` would fall back to
+    // the default dashed line — the constructor ignores falsy values.)
+    choices.push(new Separator(' '));
+    choices.push({
+      value: THINKING_BACK_VALUE,
+      name: `← Back (re-pick ${prevLabel})`,
+      short: '← Back',
+    });
+  }
+  return choices;
+}
+
+/**
  * Builds a fresh `{ input, output }` context for one prompt call. Each `@inquirer/prompts` call
  * ends its own internal stream wrapped around whatever `output` it is given as part of normal
  * cleanup, which — unlike `process.stdout`, which silently tolerates `.end()` — would close a
@@ -251,9 +294,11 @@ function promptContext(io: PickerIO): {
 /**
  * Runs the three-stage picker: providers, then models scoped to those providers, then a
  * thinking level per selected reasoning model (non-reasoning selections are shown as "no
- * thinking" and skip the prompt entirely). Throws `PickerNonInteractive` (exit code 2) without a
- * terminal, before any prompt runs, and `PickerCancelled` (exit code 2) if the user cancels at
- * any stage.
+ * thinking" and skip the prompt entirely). From the second reasoning model on, each thinking
+ * prompt offers a trailing "back" choice that returns to the previous reasoning model, so a
+ * mis-picked level can be corrected without restarting selection; a re-visited prompt re-opens
+ * on its previous pick. Throws `PickerNonInteractive` (exit code 2) without a terminal, before
+ * any prompt runs, and `PickerCancelled` (exit code 2) if the user cancels at any stage.
  */
 export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): Promise<Reviewer[]> {
   if (!io.isTTY) {
@@ -327,39 +372,71 @@ export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): P
       return found;
     });
 
-    const reviewers: Reviewer[] = [];
-    for (const model of selectedModels) {
+    // Thinking stage: an index-driven loop (rather than a for-of) so "back" can move the
+    // cursor to the previous *reasoning* model, skipping non-reasoning selections, which never
+    // prompt. Picks live in a map so a re-visited prompt re-opens on its previous pick via
+    // `default`, and "no thinking" announcements print once even when backtracking passes over a
+    // non-reasoning selection again. Reviewers are built after the loop, in selection order.
+    const thinkingPicks = new Map<number, ThinkingLevel>();
+    const announcedNoThinking = new Set<number>();
+    let index = 0;
+    while (index < selectedModels.length) {
+      const model = selectedModels[index]!;
       const supported = supportedLevels(model);
       const label = `${model.provider}/${model.id}`;
 
       if (supported.length === 0) {
-        io.output.write(`${label}: no thinking (model does not support reasoning)\n`);
-        reviewers.push({
-          provider: model.provider,
-          model: model.id,
-          vendor: model.vendor,
-          catalog: model,
-          thinking: resolveThinking(model, {}),
-        });
+        if (!announcedNoThinking.has(index)) {
+          io.output.write(`${label}: no thinking (model does not support reasoning)\n`);
+          announcedNoThinking.add(index);
+        }
+        index += 1;
         continue;
       }
 
-      const picked = await select<ThinkingLevel>(
+      let prevIndex: number | null = null;
+      for (let j = index - 1; j >= 0; j--) {
+        if (supportedLevels(selectedModels[j]!).length > 0) {
+          prevIndex = j;
+          break;
+        }
+      }
+      const prevLabel =
+        prevIndex === null
+          ? null
+          : `${selectedModels[prevIndex]!.provider}/${selectedModels[prevIndex]!.id}`;
+      const previousPick = thinkingPicks.get(index);
+
+      const picked = await select<ThinkingPromptValue>(
         {
           message: `Thinking level for ${label}:`,
-          choices: supported.map((level) => ({ value: level, name: level })),
+          choices: buildThinkingChoices(supported, prevLabel),
+          ...(previousPick !== undefined ? { default: previousPick } : {}),
         },
         promptContext(io),
       );
 
-      reviewers.push({
+      if (picked === THINKING_BACK_VALUE) {
+        // `prevIndex` is non-null whenever the back choice was offered; the fallback keeps
+        // the loop total rather than asserted.
+        index = prevIndex ?? Math.max(0, index - 1);
+        continue;
+      }
+
+      thinkingPicks.set(index, picked);
+      index += 1;
+    }
+
+    const reviewers: Reviewer[] = selectedModels.map((model, i) => {
+      const pin = thinkingPicks.get(i);
+      return {
         provider: model.provider,
         model: model.id,
         vendor: model.vendor,
         catalog: model,
-        thinking: resolveThinking(model, { cliPin: picked }),
-      });
-    }
+        thinking: resolveThinking(model, pin === undefined ? {} : { cliPin: pin }),
+      };
+    });
 
     return reviewers;
   } catch (err) {
