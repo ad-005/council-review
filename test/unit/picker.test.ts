@@ -2,10 +2,13 @@ import { PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
 import type { Catalog, CatalogModel, ProviderInfo } from '../../src/providers.js';
+import type { ThinkingLevel } from '../../src/levels.js';
 import {
   PickerCancelled,
   PickerNonInteractive,
+  THINKING_BACK_VALUE,
   buildModelRows,
+  buildThinkingChoices,
   groupModelsByProvider,
   modelGroupMessage,
   pickPanel,
@@ -22,6 +25,7 @@ import { Separator } from '@inquirer/prompts';
 // own `PickerIO.isTTY` field is this module's own interactivity gate, not passed to inquirer.
 // ---------------------------------------------------------------------------------------------
 
+const UP = '\x1B[A';
 const DOWN = '\x1B[B';
 const SPACE = ' ';
 const ENTER = '\r';
@@ -103,6 +107,27 @@ const KIMI = model({
   reasoning: false,
 });
 const GLM = model({ id: 'glm-5.2', provider: 'opencode-go', vendor: 'zhipu', reasoning: true });
+
+// Same-provider reasoning pair (plus a non-reasoning stablemate) for the back-navigation
+// tests: one provider checkbox and one model group keep the scripted key sequences short.
+const REASON_A = model({
+  id: 'model-a',
+  provider: 'test-gw',
+  vendor: 'vendor-a',
+  reasoning: true,
+});
+const REASON_B = model({
+  id: 'model-b',
+  provider: 'test-gw',
+  vendor: 'vendor-b',
+  reasoning: true,
+});
+const PLAIN = model({
+  id: 'model-plain',
+  provider: 'test-gw',
+  vendor: 'vendor-p',
+  reasoning: false,
+});
 
 // `provider/id` alone is ~99 characters here — over the inquirer fallback width of 80 columns,
 // but under the 120-column terminal the test below drives the picker at.
@@ -541,5 +566,155 @@ describe('pickPanel — cancellation', () => {
     term.send(CTRL_C);
 
     await expect(resultPromise).rejects.toBeInstanceOf(PickerCancelled);
+  }, 10_000);
+});
+
+describe('buildThinkingChoices — back choice', () => {
+  const levels: ThinkingLevel[] = ['off', 'minimal', 'low'];
+
+  it('offers only levels when there is no previous reasoning model', () => {
+    const choices = buildThinkingChoices(levels, null);
+    expect(choices).toHaveLength(3);
+    expect(choices.every((c) => !Separator.isSeparator(c))).toBe(true);
+    expect(choices).toMatchObject([
+      { value: 'off', name: 'off' },
+      { value: 'minimal', name: 'minimal' },
+      { value: 'low', name: 'low' },
+    ]);
+  });
+
+  it('appends a separator-spaced back choice naming the previous model otherwise', () => {
+    const choices = buildThinkingChoices(levels, 'test-gw/model-a');
+    expect(choices).toHaveLength(5);
+    // Levels keep their positions; the back choice is trailing.
+    expect(choices.slice(0, 3)).toMatchObject([
+      { value: 'off' },
+      { value: 'minimal' },
+      { value: 'low' },
+    ]);
+    expect(Separator.isSeparator(choices[3])).toBe(true);
+    const back = choices[4];
+    expect(Separator.isSeparator(back)).toBe(false);
+    expect(back).toMatchObject({ value: THINKING_BACK_VALUE });
+    if (!Separator.isSeparator(back)) {
+      expect(back.name).toContain('Back');
+      expect(back.name).toContain('test-gw/model-a');
+    }
+  });
+});
+
+describe('pickPanel — thinking back navigation', () => {
+  it('the first reasoning model offers no back choice', async () => {
+    const catalog = catalogOf([REASON_A]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Select models');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Thinking level for test-gw/model-a');
+    expect(term.buffer).not.toContain('Back');
+    term.send(ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers).toHaveLength(1);
+    expect(reviewers[0]?.thinking).toMatchObject({ requested: 'off', effective: 'off' });
+  }, 10_000);
+
+  it('going back re-opens the previous model on its previous pick for correction', async () => {
+    const catalog = catalogOf([REASON_A, REASON_B]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Select models');
+    term.send(SPACE + DOWN + SPACE + ENTER); // select both models
+
+    await term.waitFor('Thinking level for test-gw/model-a');
+    term.send(DOWN + DOWN + ENTER); // model-a: off -> minimal -> low
+
+    await term.waitFor('Thinking level for test-gw/model-b');
+    expect(term.buffer).toContain('Back');
+    // The re-prompted message is identical to the already-rendered one, so the buffer is
+    // cleared before each transition and the wait below only matches the fresh render.
+    term.buffer = '';
+    term.send(UP + ENTER); // UP wraps past the top onto the trailing back choice
+
+    await term.waitFor('Thinking level for test-gw/model-a');
+    term.buffer = '';
+    term.send(DOWN + ENTER); // re-opened on low (the previous pick); move to medium
+
+    await term.waitFor('Thinking level for test-gw/model-b');
+    term.send(DOWN + DOWN + DOWN + DOWN + ENTER); // model-b: high
+
+    const reviewers = await resultPromise;
+    expect(reviewers).toHaveLength(2);
+    // If the re-visited prompt had re-opened on off instead of low, DOWN would have landed on
+    // minimal rather than medium.
+    expect(reviewers[0]).toMatchObject({ model: 'model-a' });
+    expect(reviewers[0]?.thinking).toMatchObject({ requested: 'medium', effective: 'medium' });
+    expect(reviewers[1]).toMatchObject({ model: 'model-b' });
+    expect(reviewers[1]?.thinking).toMatchObject({ requested: 'high', effective: 'high' });
+  }, 10_000);
+
+  it('going back lands on the previous reasoning model and announces "no thinking" once', async () => {
+    const catalog = catalogOf([REASON_A, PLAIN, REASON_B]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Select models');
+    term.send(SPACE + DOWN + SPACE + DOWN + SPACE + ENTER); // select all three
+
+    await term.waitFor('Thinking level for test-gw/model-a');
+    term.send(ENTER); // model-a: off
+
+    await term.waitFor('Thinking level for test-gw/model-b');
+    // The non-reasoning selection in between was skipped with its announcement.
+    const announcement = 'test-gw/model-plain: no thinking';
+    expect(term.buffer).toContain(announcement);
+    expect(term.buffer.split(announcement)).toHaveLength(2);
+
+    term.buffer = '';
+    term.send(UP + ENTER); // back: must land on model-a, skipping model-plain
+
+    await term.waitFor('Thinking level for test-gw/model-a');
+    term.buffer = '';
+    term.send(ENTER); // keep off (re-opened on the previous pick)
+
+    await term.waitFor('Thinking level for test-gw/model-b');
+    term.send(ENTER); // model-b: off
+
+    const reviewers = await resultPromise;
+    expect(reviewers.map((r) => r.model)).toEqual(['model-a', 'model-plain', 'model-b']);
+    expect(reviewers[1]?.thinking).toMatchObject({
+      applicable: false,
+      requested: null,
+      effective: null,
+    });
+    // Backtracking passed over model-plain a second time without re-announcing it.
+    expect(term.buffer).not.toContain(announcement);
   }, 10_000);
 });
