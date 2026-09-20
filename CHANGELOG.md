@@ -5,10 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-20
 
 ### Added
 
+- Deterministic blast-radius map: each run now traces the changed symbols to their direct
+  callers, transitive impact, and affected tests from the snapshot CodeGraph index, and
+  embeds the identical map in every reviewer's initial prompt as a starting point to verify,
+  not ground truth. Best-effort like indexing — a missing binary, timeout, or unavailable
+  index degrades to no (or a partial) block with a machine-readable reason recorded in the
+  manifest and a one-line summary in `REPORT.md`; exit codes are unchanged. Removed symbols
+  are named explicitly, since the end-state index cannot resolve their references.
+- New `codegraph.blastRadius` config object (`enabled`, default `true`; `depth`,
+  `maxSymbols`, `maxBlockChars`). Setting `enabled` to `false` restores exactly the
+  pre-step behavior.
+- The review-depth signal is now split into per-tool grep and codegraph counts, persisted
+  in the manifest.
 - Each thinking-level prompt from the second reasoning model on offers a trailing "back"
   choice that returns to the previous reasoning model, so a mis-picked effort level can be
   corrected without restarting `init`. A re-visited prompt re-opens on its previous pick.
@@ -94,6 +106,7 @@ Initial release.
   `3` degraded (partial report, outranks `1`), `4` vendor-independence guard refusal, `130`
   interrupted.
 
+[0.2.0]: https://github.com/ad-005/council-review/releases/tag/v0.2.0
 [0.1.2]: https://github.com/ad-005/council-review/releases/tag/v0.1.2
 [0.1.1]: https://github.com/ad-005/council-review/releases/tag/v0.1.1
 [0.1.0]: https://www.npmjs.com/package/council-review/v/0.1.0
