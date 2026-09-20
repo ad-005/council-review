@@ -463,6 +463,28 @@ describe('writeManifest', () => {
     expect(manifest.hostVersion).toBe('0.84.4');
   });
 
+  it('persists the per-tool search split alongside the combined searches count', () => {
+    const run = createRunDir(projectRoot);
+    const reviewer = makeReviewer({ provider: 'openrouter', model: 'model-a' });
+    const results = [
+      makeReviewerResult({
+        reviewer,
+        depth: { filesOpened: ['src/a.ts'], searches: 4, grepCalls: 3, codegraphCalls: 1 },
+      }),
+    ];
+    const input = makeManifestInput(run, { outcome: makeOutcome(results) });
+
+    const manifest = JSON.parse(readFileSync(writeManifest(input), 'utf8'));
+
+    expect(manifest.reviewers[0].depth).toEqual({
+      filesOpenedCount: 1,
+      filesOpened: ['src/a.ts'],
+      searches: 4,
+      grepCalls: 3,
+      codegraphCalls: 1,
+    });
+  });
+
   it('records unknown cost as null, not zero, and marks the run total incomplete', () => {
     const run = createRunDir(projectRoot);
     const reviewer = makeReviewer({ provider: 'openrouter', model: 'model-a' });
@@ -598,6 +620,22 @@ describe('writeReport', () => {
     expect(text).toContain('test-vendor');
     expect(text).toContain('medium'); // effective thinking level
     expect(text).toContain('file'); // depth signal wording
+  });
+
+  it('shows the per-tool search split in the panel depth column', () => {
+    const run = createRunDir(projectRoot);
+    const reviewer = makeReviewer({ provider: 'openrouter', model: 'model-a' });
+    const results = [
+      makeReviewerResult({
+        reviewer,
+        depth: { filesOpened: ['src/a.ts'], searches: 4, grepCalls: 3, codegraphCalls: 1 },
+      }),
+    ];
+    const input = makeManifestInput(run, { outcome: makeOutcome(results) });
+
+    const text = readFileSync(writeReport(run, input, [], null), 'utf8');
+
+    expect(text).toContain('1 file opened, 4 searches (grep: 3, codegraph: 1)');
   });
 
   it('orders findings by merged (agreement) order, most-agreed first', () => {

@@ -34,8 +34,14 @@ import type { ResolvedScope } from './scope.js';
 // query tunables)
 // -------------------------------------------------------------------------------------------
 
-/** `--limit` passed to every `callers` query and enforced again at render time. */
+/** Maximum callers shown per symbol at render time. */
 export const BLAST_RADIUS_CALLERS_LIMIT = 20;
+
+/** `--limit` passed to every `callers` query: one past the render cap, so a full page
+ *  proves truncation and the block can disclose it instead of rendering a truncated
+ *  list as complete. The binary reports no total count, so this detects truncation
+ *  honestly without claiming an exact hidden remainder. */
+export const BLAST_RADIUS_CALLERS_QUERY_LIMIT = BLAST_RADIUS_CALLERS_LIMIT + 1;
 
 /** `impact` is traced when a symbol's caller count exceeds this, or when the symbol's kind
  *  marks it as shared surface (see `IMPACT_ALWAYS_KINDS`). Keeps the common small-change
@@ -130,6 +136,9 @@ interface MutablePatchFile {
   newFile: boolean;
   deletedFile: boolean;
   renamed: boolean;
+  /** Set once the first `@@` header is seen; `---`/`+++` lines after that point are
+   *  hunk content, never path headers. */
+  seenHunk: boolean;
   hunks: PatchHunk[];
 }
 
@@ -158,7 +167,10 @@ function finishPatchFile(current: MutablePatchFile | null, out: PatchFile[]): vo
  * function of its input. Handles new files (`--- /dev/null`), deleted files
  * (`+++ /dev/null`), renames (`rename from/to` or differing `---`/`+++` paths), binary
  * diffs (emitted with zero hunks so they still feed the `affected` query), and multi-hunk
- * files. Content lines are never inspected — only headers.
+ * files. Only headers are inspected, and `---`/`+++` path headers are only accepted
+ * before the first hunk header of each file section (real headers always precede the
+ * hunks, including `/dev/null` ones): a deleted `-- x` or added `++ y` content line
+ * would otherwise mimic a path header once prefixed with `-`/`+` and corrupt the paths.
  */
 export function parsePatchHunks(patch: string): PatchFile[] {
   const out: PatchFile[] = [];
@@ -178,6 +190,7 @@ export function parsePatchHunks(patch: string): PatchFile[] {
         newFile: false,
         deletedFile: false,
         renamed: false,
+        seenHunk: false,
         hunks: [],
       };
       continue;
@@ -193,15 +206,16 @@ export function parsePatchHunks(patch: string): PatchFile[] {
     } else if (line.startsWith('rename to ')) {
       current.renamed = true;
       current.newPath = stripDiffPrefix(line.slice('rename to '.length).trim(), 'b/');
-    } else if (line.startsWith('--- ')) {
+    } else if (line.startsWith('--- ') && !current.seenHunk) {
       const p = stripDiffPrefix(line.slice(4).trim().split('\t')[0] as string, 'a/');
       current.oldPath = p;
-    } else if (line.startsWith('+++ ')) {
+    } else if (line.startsWith('+++ ') && !current.seenHunk) {
       const p = stripDiffPrefix(line.slice(4).trim().split('\t')[0] as string, 'b/');
       current.newPath = p;
     } else {
       const hunk = HUNK_HEADER_RE.exec(line);
       if (hunk) {
+        current.seenHunk = true;
         current.hunks.push({
           start: Number(hunk[1]),
           count: hunk[2] === undefined ? 1 : Number(hunk[2]),
@@ -347,6 +361,17 @@ function assertIndexPath(label: string, value: string): void {
   }
 }
 
+/** Non-throwing probe around `assertIndexPath` for partitioning data-dependent paths
+ *  (from the diff) into queryable vs degraded-without-spawning. */
+function isQueryablePath(value: string): boolean {
+  try {
+    assertIndexPath('files entry', value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function assertRoot(label: string, value: string): void {
   if (value.length === 0) {
     throw new Error(`${label} must not be empty`);
@@ -369,7 +394,9 @@ export function buildNodeSymbolsOnlyArgv(snapshotRoot: string, relPath: string):
   return ['node', '-p', snapshotRoot, '--file', relPath, '--symbols-only'];
 }
 
-/** `callers -j`: direct callers of one symbol as JSON. */
+/** `callers -j`: direct callers of one symbol as JSON. Name-only: codegraph v1.6.0
+ *  accepts no file scope for `callers` (verified empirically — no flag, no
+ *  `file:symbol` syntax), so same-named symbols elsewhere merge into the result. */
 export function buildCallersArgv(
   snapshotRoot: string,
   symbol: string,
@@ -381,7 +408,8 @@ export function buildCallersArgv(
   return ['callers', '-p', snapshotRoot, symbol, '-j', '--limit', String(limit)];
 }
 
-/** `impact -j`: transitive impact of one symbol as JSON. */
+/** `impact -j`: transitive impact of one symbol as JSON. Name-only, like `callers`:
+ *  no file scope exists, so same-named symbols elsewhere merge into the result. */
 export function buildImpactArgv(snapshotRoot: string, symbol: string, depth: number): string[] {
   assertRoot('snapshotRoot', snapshotRoot);
   assertArgValue('symbol', symbol);
@@ -494,12 +522,20 @@ export function parseAffectedJson(output: string): AffectedParse {
 // -------------------------------------------------------------------------------------------
 
 /**
- * Precision filtering for one symbol's refs (callers or impact nodes):
+ * Best-effort filtering for one symbol's refs (callers or impact nodes):
  * - drops same-name symbols from other files (ambiguous with this symbol's own
  *   definition; a same-name ref only counts with a file match),
  * - drops file-level-only (`kind: 'file'`) refs unless nothing else references the
  *   symbol, in which case they are kept rather than reporting zero refs,
  * - dedupes and sorts (codepoint order) for determinism.
+ *
+ * Residual over-approximation, stated explicitly: the queries are name-only —
+ * codegraph v1.6.0 offers no file scoping for `callers`/`impact` (verified empirically:
+ * no flag, no `file:symbol` syntax) and the JSON exposes no resolved definition site
+ * for caller refs, which carry caller identity only. When two files define the same
+ * symbol name, their callers merge indistinguishably and this filter cannot attribute
+ * them, so the block over-approximates by design. Only same-name definition entries
+ * (notably `impact` root nodes) are attributable, via the file match above.
  */
 export function filterRefs(
   refs: readonly CodeRef[],
@@ -541,6 +577,9 @@ export interface SymbolBlast {
   symbol: ChangedSymbol;
   /** Filtered direct callers. Null when the callers query itself failed. */
   callers: CodeRef[] | null;
+  /** True when the callers query returned a full page (`BLAST_RADIUS_CALLERS_QUERY_LIMIT`
+   *  raw refs), proving truncation: more callers may exist beyond those listed. */
+  callersTruncated?: boolean;
   /** Filtered transitive impact, minus the symbol's own root entry. Null when impact was
    *  not traced (below threshold) or its query failed — see `impactTraced`/`failure`. */
   impact: CodeRef[] | null;
@@ -581,12 +620,17 @@ function formatSymbol(s: ChangedSymbol): string {
   return `\`${s.name}\` (${s.kind}) ${s.file}:${s.startLine}`;
 }
 
-function renderRefList(refs: readonly CodeRef[], cap: number): string {
-  if (refs.length === 0) return 'none';
+function renderRefList(refs: readonly CodeRef[], cap: number, truncated = false): string {
+  if (refs.length === 0) return truncated ? 'none (+more)' : 'none';
   const shown = refs.slice(0, cap);
   const extra = refs.length - shown.length;
   const text = shown.map(formatRef).join('; ');
-  return extra > 0 ? `${text} (+${extra} more)` : text;
+  if (extra > 0) {
+    // An exact `(+N more)` would understate when the query itself truncated: the
+    // binary reports no total count, so the hidden remainder is only bounded below.
+    return truncated ? `${text} (+${extra} more, truncated)` : `${text} (+${extra} more)`;
+  }
+  return truncated ? `${text} (+more)` : text;
 }
 
 /**
@@ -633,10 +677,10 @@ export function renderBlastRadiusBlock(input: RenderInput): string {
         );
       } else {
         lines.push(
-          `  callers (${s.callers.length}): ${renderRefList(s.callers, BLAST_RADIUS_CALLERS_LIMIT)}`,
+          `  callers (${s.callers.length}): ${renderRefList(s.callers, BLAST_RADIUS_CALLERS_LIMIT, s.callersTruncated === true)}`,
         );
       }
-      if (!s.impactTraced) {
+      if (!s.impactTraced && s.failure === undefined) {
         lines.push('  impact: not traced (below threshold)');
       } else if (s.impact === null) {
         lines.push(
@@ -782,9 +826,10 @@ async function mapBounded<T, R>(
 /**
  * Computes the blast radius for one run. Never throws for a blast-radius outcome: every
  * spawn failure, timeout, and parse failure degrades to a reason (or, where a per-file /
- * per-symbol fallback applies, to a partial block with an in-block note). Throws only for
- * caller bugs (invalid snapshot root / options), matching `buildCodegraphArgv`'s
- * validate-then-spawn precedent.
+ * per-symbol fallback applies, to a partial block with an in-block note), as do
+ * data-dependent argv-validation failures (odd paths from the diff, odd symbol names
+ * from the index). Throws only for caller bugs (invalid snapshot root / options),
+ * matching `buildCodegraphArgv`'s validate-then-spawn precedent.
  */
 export async function computeBlastRadius(
   snapshotRoot: string,
@@ -827,12 +872,18 @@ export async function computeBlastRadius(
   // Per-file symbol maps (bounded concurrency). A malformed map — or a failed spawn —
   // degrades that file to a file-level entry, never the whole step.
   const fileOutcomes = await mapBounded(queryFiles, concurrency, async (f) => {
-    const outcome = await runBlastQuery(
-      bin,
-      buildNodeSymbolsOnlyArgv(snapshotRoot, f.path),
-      snapshotRoot,
-      timeoutMs,
-    );
+    let argv: string[];
+    try {
+      argv = buildNodeSymbolsOnlyArgv(snapshotRoot, f.path);
+    } catch {
+      // Data-dependent validation failure (an odd path from the diff, e.g. one
+      // starting with `-`): snapshotRoot was validated above, so only the path can
+      // throw here. Degrade exactly like a spawn failure — per-file fallback, never
+      // a rejected run.
+      anySpawnFailed = true;
+      return { file: f, kind: 'fallback' as const, dependents: [] as string[] };
+    }
+    const outcome = await runBlastQuery(bin, argv, snapshotRoot, timeoutMs);
     if (outcome.status === 'spawn-failed') {
       anySpawnFailed = true;
       return { file: f, kind: 'fallback' as const, dependents: [] as string[] };
@@ -878,12 +929,18 @@ export async function computeBlastRadius(
   const removedSymbols: ChangedSymbol[] = [];
   const symbolBlasts: SymbolBlast[] = [];
   const callerOutcomes = await mapBounded(tracedSymbols, concurrency, async (symbol) => {
-    const outcome = await runBlastQuery(
-      bin,
-      buildCallersArgv(snapshotRoot, symbol.name),
-      snapshotRoot,
-      timeoutMs,
-    );
+    let argv: string[];
+    try {
+      argv = buildCallersArgv(snapshotRoot, symbol.name, BLAST_RADIUS_CALLERS_QUERY_LIMIT);
+    } catch {
+      // Data-dependent validation failure (an odd symbol name from the index, e.g. one
+      // starting with `-`): snapshotRoot and the limit were validated above, so only
+      // the name can throw here. Degrade exactly like a spawn failure — a per-symbol
+      // unavailable note, never a rejected run.
+      const outcome: QueryOutcome = { status: 'spawn-failed' };
+      return { symbol, outcome };
+    }
+    const outcome = await runBlastQuery(bin, argv, snapshotRoot, timeoutMs);
     return { symbol, outcome };
   });
   // Impact queries run after all callers resolve: whether impact is traced depends on the
@@ -919,10 +976,15 @@ export async function computeBlastRadius(
       removedSymbols.push(symbol);
       continue;
     }
+    // Truncation is judged on the raw page, before filtering: the query asked for one
+    // past the render cap, so a full page proves the binary had more to give — even
+    // when the filter then lands exactly on the cap.
+    const callersTruncated = parsed.refs.length > BLAST_RADIUS_CALLERS_LIMIT;
     const callers = filterRefs(parsed.refs, { symbolName: symbol.name, symbolFile: symbol.file });
     const blast: SymbolBlast = {
       symbol,
       callers,
+      callersTruncated,
       impact: null,
       impactTraced: shouldTraceImpact(symbol, callers.length),
     };
@@ -964,27 +1026,36 @@ export async function computeBlastRadius(
   symbolBlasts.sort((a, b) => compareSymbols(a.symbol, b.symbol));
   removedSymbols.sort(compareSymbols);
 
-  // One `affected` call over all changed (non-deleted) files.
+  // One `affected` call over all changed (non-deleted) files. Data-dependent
+  // validation failures partition, not reject: unqueryable paths (the same ones that
+  // degraded to file-level fallbacks above) are dropped so one bad path cannot kill
+  // the rest; when none remain the step degrades like a spawn failure.
   let affectedTests: string[] = [];
   let affectedFailure: SymbolQueryFailure | undefined;
   const affectedFiles = [...new Set(queryFiles.map((f) => f.path))].sort(compareStr);
   if (affectedFiles.length > 0) {
-    const outcome = await runBlastQuery(
-      bin,
-      buildAffectedArgv(snapshotRoot, affectedFiles),
-      snapshotRoot,
-      timeoutMs,
-    );
-    if (outcome.status === 'spawn-failed') {
+    const validFiles = affectedFiles.filter(isQueryablePath);
+    if (validFiles.length === 0) {
       anySpawnFailed = true;
       affectedFailure = 'query-failed';
     } else {
-      const parsed = parseAffectedJson(outcome.stdout);
-      if (parsed.status === 'malformed') {
-        affectedFailure = 'parse-failed';
+      const outcome = await runBlastQuery(
+        bin,
+        buildAffectedArgv(snapshotRoot, validFiles),
+        snapshotRoot,
+        timeoutMs,
+      );
+      if (outcome.status === 'spawn-failed') {
+        anySpawnFailed = true;
+        affectedFailure = 'query-failed';
       } else {
-        anyQueryOk = true;
-        affectedTests = [...new Set(parsed.affectedTests)].sort(compareStr);
+        const parsed = parseAffectedJson(outcome.stdout);
+        if (parsed.status === 'malformed') {
+          affectedFailure = 'parse-failed';
+        } else {
+          anyQueryOk = true;
+          affectedTests = [...new Set(parsed.affectedTests)].sort(compareStr);
+        }
       }
     }
   }

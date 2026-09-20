@@ -1079,6 +1079,17 @@ describe('codegraph indexing end to end', () => {
       expect(patchIndex).toBeGreaterThanOrEqual(0);
       expect(blockIndex).toBeGreaterThan(patchIndex);
       expect(findingsIndex).toBeGreaterThan(blockIndex);
+
+      // The computed outcome is recorded for machines and humans alike.
+      const runDir = onlyRunDir();
+      const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
+      expect(manifest.blastRadius).toEqual({
+        available: true,
+        stats: { symbols: 1, callers: 1, tests: 1 },
+      });
+      expect(fs.readFileSync(path.join(runDir, 'REPORT.md'), 'utf8')).toContain(
+        '- Blast radius: available (1 symbol, 1 caller, 1 test)',
+      );
     } finally {
       if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
       else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
@@ -1089,12 +1100,23 @@ describe('codegraph indexing end to end', () => {
     writeConfigFile(); // codegraph disabled; the step has no index to query
     expect(await runReview()).toBe(1); // same exit as the enabled run: nothing failed, nothing skipped
 
-    const prompt = fs.readFileSync(
-      path.join(onlyRunDir(), 'prompts', 'initial-prompt.txt'),
-      'utf8',
-    );
+    const runDir = onlyRunDir();
+    const prompt = fs.readFileSync(path.join(runDir, 'prompts', 'initial-prompt.txt'), 'utf8');
     expect(prompt).not.toContain('## Deterministic blast-radius map');
+    // No block, no reference to one: the framing sentence travels with the block.
+    expect(prompt).not.toContain('blast-radius map');
+    expect(prompt).not.toContain('starting map to verify');
     expect(prompt).toContain('When you have finished reviewing');
+
+    const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
+    expect(manifest.blastRadius).toEqual({
+      available: false,
+      reason: 'index-unavailable',
+      stats: { symbols: 0, callers: 0, tests: 0 },
+    });
+    expect(fs.readFileSync(path.join(runDir, 'REPORT.md'), 'utf8')).toContain(
+      '- Blast radius: unavailable (index-unavailable)',
+    );
   });
 
   it('embeds no block and issues no blast query when the step is disabled', async () => {
@@ -1130,6 +1152,14 @@ describe('codegraph indexing end to end', () => {
       const runDir = onlyRunDir();
       const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
       expect(manifest.codegraph).toEqual({ available: true }); // index built; only the step is off
+      expect(manifest.blastRadius).toEqual({
+        available: false,
+        reason: 'disabled',
+        stats: { symbols: 0, callers: 0, tests: 0 },
+      });
+      expect(fs.readFileSync(path.join(runDir, 'REPORT.md'), 'utf8')).toContain(
+        '- Blast radius: unavailable (disabled)',
+      );
 
       const invocations = fs
         .readFileSync(invocationsPath, 'utf8')
@@ -1143,6 +1173,9 @@ describe('codegraph indexing end to end', () => {
 
       const prompt = fs.readFileSync(path.join(runDir, 'prompts', 'initial-prompt.txt'), 'utf8');
       expect(prompt).not.toContain('## Deterministic blast-radius map');
+      // Disabled restores exactly the pre-step prompt: no block, no reference to one.
+      expect(prompt).not.toContain('blast-radius map');
+      expect(prompt).not.toContain('starting map to verify');
       expect(prompt).toContain('When you have finished reviewing');
     } finally {
       if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
@@ -1173,12 +1206,22 @@ describe('codegraph indexing end to end', () => {
       writeConfigFile({ codegraph: { enabled: true, indexTimeoutSeconds: 60 } });
       expect(await runReview()).toBe(1); // the "high" finding still breaches: run continued
 
-      const prompt = fs.readFileSync(
-        path.join(onlyRunDir(), 'prompts', 'initial-prompt.txt'),
-        'utf8',
-      );
+      const runDir = onlyRunDir();
+      const prompt = fs.readFileSync(path.join(runDir, 'prompts', 'initial-prompt.txt'), 'utf8');
       expect(prompt).not.toContain('## Deterministic blast-radius map');
+      expect(prompt).not.toContain('blast-radius map');
+      expect(prompt).not.toContain('starting map to verify');
       expect(prompt).toContain('When you have finished reviewing');
+
+      const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
+      expect(manifest.blastRadius).toEqual({
+        available: false,
+        reason: 'query-failed',
+        stats: { symbols: 0, callers: 0, tests: 0 },
+      });
+      expect(fs.readFileSync(path.join(runDir, 'REPORT.md'), 'utf8')).toContain(
+        '- Blast radius: unavailable (query-failed)',
+      );
     } finally {
       if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
       else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;

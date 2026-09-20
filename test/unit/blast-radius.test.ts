@@ -5,12 +5,13 @@
  * Tmp dirs are removed after each test.
  */
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   BLAST_RADIUS_CALLERS_LIMIT,
+  BLAST_RADIUS_CALLERS_QUERY_LIMIT,
   buildAffectedArgv,
   buildCallersArgv,
   buildImpactArgv,
@@ -221,6 +222,48 @@ describe('parsePatchHunks', () => {
         oldPath: 'src/old.js',
         status: 'renamed',
         hunks: [{ start: 1, count: 1 }],
+      },
+    ]);
+  });
+
+  it('ignores a deleted `-- x` content line that mimics the `---` header', () => {
+    const patch = [
+      'diff --git a/a.js b/a.js',
+      '--- a/a.js',
+      '+++ b/a.js',
+      '@@ -1,2 +1 @@',
+      '--- x',
+      ' context',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      {
+        path: 'a.js',
+        oldPath: 'a.js',
+        status: 'modified',
+        hunks: [{ start: 1, count: 1 }],
+      },
+    ]);
+  });
+
+  it('ignores an added `++ y` content line that mimics the `+++` header', () => {
+    const patch = [
+      'diff --git a/a.js b/a.js',
+      '--- a/a.js',
+      '+++ b/a.js',
+      '@@ -1 +1 @@',
+      ' context',
+      '@@ -10 +10 @@',
+      '+++ y',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      {
+        path: 'a.js',
+        oldPath: 'a.js',
+        status: 'modified',
+        hunks: [
+          { start: 1, count: 1 },
+          { start: 10, count: 1 },
+        ],
       },
     ]);
   });
@@ -442,6 +485,10 @@ describe('argv builders', () => {
     expect(() => buildCallersArgv(ROOT, 'add', 0)).toThrow('positive integer');
     expect(() => buildImpactArgv(ROOT, 'add', -1)).toThrow('positive integer');
   });
+
+  it('queries one past the render cap so truncation is detectable', () => {
+    expect(BLAST_RADIUS_CALLERS_QUERY_LIMIT).toBe(BLAST_RADIUS_CALLERS_LIMIT + 1);
+  });
 });
 
 describe('JSON parsing', () => {
@@ -567,6 +614,25 @@ describe('filterRefs', () => {
     ]);
   });
 
+  it('keeps caller-named refs from other files: name-only queries over-approximate', () => {
+    // `render` is defined in both src/a.js and src/b.js; the binary answers the
+    // name-only query with both definitions' callers merged, and caller refs carry
+    // caller identity only — unattributable to either definition (verified against
+    // codegraph 1.6.0: no file scoping, no resolved definition site in the JSON).
+    expect(
+      filterRefs(
+        [
+          ref('callerA', 'function', 'src/caller-a.js', 2),
+          ref('callerB', 'function', 'src/caller-b.js', 2),
+        ],
+        { symbolName: 'render', symbolFile: 'src/a.js' },
+      ),
+    ).toEqual([
+      ref('callerA', 'function', 'src/caller-a.js', 2),
+      ref('callerB', 'function', 'src/caller-b.js', 2),
+    ]);
+  });
+
   it('dedupes and sorts by file, line, kind, name', () => {
     expect(
       filterRefs(
@@ -662,6 +728,66 @@ describe('renderBlastRadiusBlock', () => {
     expect(block).toContain('Changed symbols (1 of 4; 3 omitted):');
     expect(block).toContain('callers (25):');
     expect(block).toContain('(+5 more)');
+  });
+
+  it('discloses query truncation without overstating exactness', () => {
+    const twenty = Array.from({ length: 20 }, (_, i) => ref(`c${i}`, 'function', 'f.js', i + 1));
+    const many = Array.from({ length: 25 }, (_, i) => ref(`d${i}`, 'function', 'g.js', i + 1));
+    const block = renderBlastRadiusBlock({
+      ...BASE,
+      symbols: [
+        {
+          symbol: sym('a', 'function', 'a.js', 1),
+          callers: twenty,
+          callersTruncated: true,
+          impact: [],
+          impactTraced: true,
+        },
+        {
+          symbol: sym('b', 'function', 'b.js', 1),
+          callers: many,
+          callersTruncated: true,
+          impact: [],
+          impactTraced: true,
+        },
+        {
+          symbol: sym('c', 'function', 'c.js', 1),
+          callers: [],
+          callersTruncated: true,
+          impact: [],
+          impactTraced: true,
+        },
+      ],
+    });
+    expect(block).toContain('callers (20):');
+    expect(block).toContain('(+more)');
+    expect(block).toContain('(+5 more, truncated)');
+    expect(block).toContain('callers (0): none (+more)');
+  });
+
+  it('renders impact as unavailable rather than below-threshold when the symbol failed', () => {
+    const block = renderBlastRadiusBlock({
+      ...BASE,
+      symbols: [
+        {
+          symbol: sym('b', 'function', 's.js', 5),
+          callers: null,
+          impact: null,
+          impactTraced: false,
+          failure: 'query-failed',
+        },
+        {
+          symbol: sym('c', 'function', 's.js', 9),
+          callers: null,
+          impact: null,
+          impactTraced: false,
+          failure: 'parse-failed',
+        },
+      ],
+    });
+    expect(block).toContain('impact: unavailable (query failed)');
+    expect(block).toContain('impact: unavailable (unparsable output)');
+    expect(block).not.toContain('below threshold');
   });
 
   it('marks removals with the not-computable note', () => {
@@ -843,7 +969,9 @@ describe('computeBlastRadius', () => {
     await computeBlastRadius(dir, makeScope(PATCH_ADD), { bin: stub });
     const logged = readFileSync(log, 'utf8');
     expect(logged).toContain(`node -p ${dir} --file src/add.js --symbols-only`);
-    expect(logged).toContain(`callers -p ${dir} add -j --limit 20`);
+    expect(logged).toContain(
+      `callers -p ${dir} add -j --limit ${BLAST_RADIUS_CALLERS_QUERY_LIMIT}`,
+    );
     expect(logged).toContain(`impact -p ${dir} add -j --depth 2`);
     expect(logged).toContain(`affected -p ${dir} src/add.js -j`);
   });
@@ -1110,6 +1238,165 @@ describe('computeBlastRadius', () => {
     expect(result.available).toBe(true);
     expect(result.block).toContain('impact: not traced (below threshold)');
     expect(readFileSync(log, 'utf8')).not.toContain('impact -p');
+  });
+
+  it('discloses callers truncation on the production path (limit+1 probe)', async () => {
+    const dir = makeTmpDir();
+    // The stub ignores --limit and answers a full page, simulating a binary that
+    // truncated at the limit+1 ceiling.
+    const refs21 = Array.from({ length: 21 }, (_, i) => ({
+      name: `c${i}`,
+      kind: 'function',
+      filePath: 'f.js',
+      startLine: i + 1,
+    }));
+    const stub = writeBlastStub(dir, {
+      node: SYMBOLS_ADD,
+      callers: JSON.stringify({ symbol: 'add', callers: refs21 }),
+      impact: IMPACT_ADD,
+      affected: AFFECTED,
+    });
+    const result = await computeBlastRadius(dir, makeScope(PATCH_ADD), { bin: stub });
+    expect(result.available).toBe(true);
+    // All 21 raw refs survive the filter, so the render cap cuts one — but the query
+    // itself also truncated, which an exact `(+1 more)` would understate.
+    expect(result.block).toContain('(+1 more, truncated)');
+  });
+
+  it('marks a full page as truncated even when filtering lands exactly on the cap', async () => {
+    const dir = makeTmpDir();
+    const refs = [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        name: `c${i}`,
+        kind: 'function',
+        filePath: 'f.js',
+        startLine: i + 1,
+      })),
+      // Same-name definition elsewhere: dropped by the filter, leaving exactly 20 —
+      // previously rendered as a complete list with no overflow note.
+      { name: 'add', kind: 'function', filePath: 'src/other.js', startLine: 1 },
+    ];
+    const stub = writeBlastStub(dir, {
+      node: SYMBOLS_ADD,
+      callers: JSON.stringify({ symbol: 'add', callers: refs }),
+      impact: IMPACT_ADD,
+      affected: AFFECTED,
+    });
+    const result = await computeBlastRadius(dir, makeScope(PATCH_ADD), { bin: stub });
+    expect(result.available).toBe(true);
+    expect(result.block).toContain('callers (20):');
+    expect(result.block).toContain('(+more)');
+  });
+
+  it('degrades a dash-leading path instead of rejecting the run', async () => {
+    const dir = makeTmpDir();
+    const patch = [
+      'diff --git a/-foo.js b/-foo.js',
+      '--- a/-foo.js',
+      '+++ b/-foo.js',
+      '@@ -1 +1 @@',
+      ' x',
+    ].join('\n');
+    const log = join(dir, 'argv.log');
+    const stub = writeBlastStub(dir, {
+      node: SYMBOLS_ADD,
+      callers: CALLERS_ADD,
+      impact: IMPACT_ADD,
+      affected: AFFECTED,
+      log,
+    });
+    const result = await computeBlastRadius(dir, makeScope(patch), { bin: stub });
+    expect(result).toEqual({
+      available: false,
+      reason: 'query-failed',
+      block: '',
+      stats: { symbols: 0, callers: 0, tests: 0 },
+    });
+    // Neither the node query nor the affected call could be built, so the binary
+    // was never spawned with the bad path.
+    expect(existsSync(log)).toBe(false);
+  });
+
+  it('drops one bad path from the affected call without killing the rest', async () => {
+    const dir = makeTmpDir();
+    const patch = [
+      'diff --git a/good.js b/good.js',
+      '--- a/good.js',
+      '+++ b/good.js',
+      '@@ -1 +1 @@',
+      ' x',
+      'diff --git a/-bad.js b/-bad.js',
+      '--- a/-bad.js',
+      '+++ b/-bad.js',
+      '@@ -1 +1 @@',
+      ' y',
+    ].join('\n');
+    const symbolsGood = [
+      '**good.js** — 1 symbol, no other indexed file depends on it',
+      '',
+      '**Symbols**',
+      '- `top` (function) () — :1',
+    ].join('\n');
+    const log = join(dir, 'argv.log');
+    const stub = writeStub(
+      dir,
+      'codegraph-stub',
+      [
+        'case "$1" in',
+        `  node) echo "$@" >> "${log}"; printf '%s' '${symbolsGood}' ;;`,
+        `  callers) echo "$@" >> "${log}"; printf '%s' '${JSON.stringify({ symbol: 'top', callers: [] })}' ;;`,
+        `  impact) echo "$@" >> "${log}"; printf '%s' '${JSON.stringify({ symbol: 'top', affected: [] })}' ;;`,
+        `  affected) echo "$@" >> "${log}"; printf '%s' '${AFFECTED}' ;;`,
+        'esac',
+      ].join('\n'),
+    );
+    const result = await computeBlastRadius(dir, makeScope(patch), { bin: stub });
+    expect(result.available).toBe(true);
+    expect(result.block).toContain('- `top` (function) good.js:1');
+    expect(result.block).toContain('File-level (symbol map unavailable) (1):');
+    expect(result.block).toContain('- -bad.js');
+    const logged = readFileSync(log, 'utf8');
+    expect(logged).toContain(`affected -p ${dir} good.js -j`);
+    expect(logged).not.toContain('-bad.js');
+  });
+
+  it('degrades a dash-leading symbol name per-symbol instead of rejecting', async () => {
+    const dir = makeTmpDir();
+    const patch = [
+      'diff --git a/s.js b/s.js',
+      '--- a/s.js',
+      '+++ b/s.js',
+      '@@ -1 +1 @@',
+      ' x',
+      '@@ -5 +5 @@',
+      ' y',
+    ].join('\n');
+    const symbols = [
+      '**s.js** — 2 symbols, no other indexed file depends on it',
+      '',
+      '**Symbols**',
+      '- `ok` (function) () — :1',
+      '- `-weird` (function) () — :4',
+    ].join('\n');
+    const stub = writeStub(
+      dir,
+      'codegraph-stub',
+      [
+        'case "$1" in',
+        `  node) printf '%s' '${symbols}' ;;`,
+        `  callers) printf '%s' '${JSON.stringify({ symbol: 'ok', callers: [] })}' ;;`,
+        `  impact) printf '%s' '${JSON.stringify({ symbol: 'ok', affected: [] })}' ;;`,
+        `  affected) printf '%s' '${JSON.stringify({ changedFiles: ['s.js'], affectedTests: [] })}' ;;`,
+        'esac',
+      ].join('\n'),
+    );
+    const result = await computeBlastRadius(dir, makeScope(patch), { bin: stub });
+    expect(result.available).toBe(true);
+    expect(result.block).toContain('- `ok` (function) s.js:1');
+    expect(result.block).toContain('- `-weird` (function) s.js:4');
+    expect(result.block).toContain('callers: unavailable (query failed)');
+    expect(result.block).toContain('impact: unavailable (query failed)');
+    expect(result.stats).toEqual({ symbols: 2, callers: 0, tests: 0 });
   });
 
   it('validates options', async () => {

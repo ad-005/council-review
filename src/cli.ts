@@ -380,7 +380,9 @@ async function withStdoutRedirectedToStderr<T>(active: boolean, fn: () => Promis
 
 /** The task instructions every reviewer receives. Exported (rather than kept module-private)
  *  so the live smoke test sends exactly what production sends instead of maintaining a copy
- *  that drifts the next time this paragraph changes. */
+ *  that drifts the next time this paragraph changes. Deliberately carries no blast-radius
+ *  framing: that sentence travels with the block itself (see `BLAST_RADIUS_FRAMING`), so a
+ *  run without a block reads exactly as before the step existed. */
 export const TASK_PROMPT = `You are one independent reviewer in a multi-model code review panel. You are
 given a unified diff patch and read-only access to a frozen snapshot of the repository at the
 tree the patch ends at, via your council_read, council_grep, council_list, council_git and
@@ -391,9 +393,6 @@ then trace their callers, callees, and transitive impact to find affected code t
 text with the diff. Use council_grep and council_read for what the index cannot answer, or for
 everything when council_codegraph reports its index is unavailable for this run.
 
-The prompt includes a deterministic blast-radius map of the changed code below: treat it as a
-starting map to verify with your own tools, not as ground truth.
-
 Review the patch for correctness bugs, security issues, and other defects a careful senior
 engineer would flag before merging: logic errors, unhandled edge cases, resource leaks, race
 conditions, broken error handling, security vulnerabilities, and violations of the codebase's own
@@ -403,6 +402,12 @@ issues.
 You do not know which other models, if any, are also reviewing this patch, and you will never see
 their output or the fact that they exist. Form your own independent judgment using only what you
 can read yourself.`;
+
+/** Framing sentence for the blast-radius block. Prepended to the block in `cmdReview` when one
+ *  was computed, so the sentence and the section it names are present together or absent
+ *  together — a run with no block never tells reviewers a map is included below. */
+const BLAST_RADIUS_FRAMING = `The prompt includes a deterministic blast-radius map of the changed code below: treat it as a
+starting map to verify with your own tools, not as ground truth.`;
 
 // -------------------------------------------------------------------------------------------
 // init
@@ -847,7 +852,9 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
           repoRoot,
           patchPath,
           prompt: TASK_PROMPT,
-          blastRadiusBlock: blastRadius.available ? blastRadius.block : undefined,
+          blastRadiusBlock: blastRadius.available
+            ? `${BLAST_RADIUS_FRAMING}\n\n${blastRadius.block}`
+            : undefined,
           extensionPath: resolveExtensionPath(),
           includeContextFiles: cfg.includeContextFiles,
           timeoutSeconds,
@@ -901,6 +908,11 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       overrides: { allowCorrelated, includeContextFiles: cfg.includeContextFiles, noSuppress },
       hostVersion: null,
       codegraph: activeSnapshot.codegraph,
+      blastRadius: {
+        available: blastRadius.available,
+        ...(blastRadius.reason !== undefined ? { reason: blastRadius.reason } : {}),
+        stats: blastRadius.stats,
+      },
     };
     writeManifest(manifestInput);
     const reportPath = writeReport(run, manifestInput, mergeOutcome.findings, resolution);

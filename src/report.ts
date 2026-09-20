@@ -318,6 +318,8 @@ export function writeManifest(i: ManifestInput): string {
         filesOpenedCount: r.depth.filesOpened.length,
         filesOpened: r.depth.filesOpened,
         searches: r.depth.searches,
+        grepCalls: r.depth.grepCalls,
+        codegraphCalls: r.depth.codegraphCalls,
       },
       ...(r.error !== undefined ? { error: r.error } : {}),
     })),
@@ -357,9 +359,13 @@ function formatCost(cost: number | null): string {
   return cost === null ? 'unknown' : `$${cost.toFixed(4)}`;
 }
 
-function formatDepth(d: { filesOpened: string[]; searches: number }): string {
+function formatDepth(d: ReviewerResult['depth']): string {
   const files = d.filesOpened.length;
-  return `${files} file${files === 1 ? '' : 's'} opened, ${d.searches} search${d.searches === 1 ? '' : 'es'}`;
+  return (
+    `${files} file${files === 1 ? '' : 's'} opened, ` +
+    `${d.searches} search${d.searches === 1 ? '' : 'es'} ` +
+    `(grep: ${d.grepCalls}, codegraph: ${d.codegraphCalls})`
+  );
 }
 
 function formatBlastRadius(b: BlastRadiusStatus): string {
