@@ -18,6 +18,7 @@ import { isThinkingLevel, type ThinkingLevel } from './levels.js';
 import {
   ConfigError,
   CONFIG_DEFAULTS,
+  BLAST_RADIUS_DEFAULTS,
   CODEGRAPH_DEFAULTS,
   configPath,
   ignorePath,
@@ -39,6 +40,7 @@ import {
 import { pickPanel, type PickerIO } from './picker.js';
 import { findRepoRoot, resolveScope, checkScopeSelectors, type ScopeSelectors } from './scope.js';
 import { buildSnapshot, writePatch, sweepOrphans, type Snapshot } from './snapshot.js';
+import { computeBlastRadius } from './blast-radius.js';
 import { runPanel, type RunPanelOutcome } from './runner.js';
 import type { Severity } from './schema.js';
 import { mergeFindings, type ReviewerFindings, type MergedFinding } from './merge.js';
@@ -388,6 +390,9 @@ Start with council_codegraph before plain-text search: explore the symbols the p
 then trace their callers, callees, and transitive impact to find affected code that shares no
 text with the diff. Use council_grep and council_read for what the index cannot answer, or for
 everything when council_codegraph reports its index is unavailable for this run.
+
+The prompt includes a deterministic blast-radius map of the changed code below: treat it as a
+starting map to verify with your own tools, not as ground truth.
 
 Review the patch for correctness bugs, security issues, and other defects a careful senior
 engineer would flag before merging: logic errors, unhandled edge cases, resource leaks, race
@@ -819,6 +824,20 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
         : cfg.maxOutputTokens;
 
     const activeSnapshot = snapshot;
+
+    // Deterministic blast-radius step, computed once per run after the snapshot index is
+    // available and before any reviewer launches: the resulting block is embedded verbatim in
+    // the shared initial prompt, so every reviewer receives the identical map. Best-effort
+    // like indexing -- any failure degrades to "no block" with a reason, never fails the run.
+    const blastRadiusConfig = cfg.codegraph.blastRadius ?? BLAST_RADIUS_DEFAULTS;
+    const blastRadius = await computeBlastRadius(activeSnapshot.root, scope, {
+      enabled: blastRadiusConfig.enabled,
+      indexAvailable: activeSnapshot.codegraph.available,
+      depth: blastRadiusConfig.depth,
+      maxSymbols: blastRadiusConfig.maxSymbols,
+      maxBlockChars: blastRadiusConfig.maxBlockChars,
+    });
+
     let outcome: RunPanelOutcome;
     try {
       outcome = await withStdoutRedirectedToStderr(jsonMode, () =>
@@ -828,6 +847,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
           repoRoot,
           patchPath,
           prompt: TASK_PROMPT,
+          blastRadiusBlock: blastRadius.available ? blastRadius.block : undefined,
           extensionPath: resolveExtensionPath(),
           includeContextFiles: cfg.includeContextFiles,
           timeoutSeconds,

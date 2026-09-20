@@ -89,7 +89,7 @@ function makeReviewerResult(
     repairText: null,
     usage: { inputTokens: 100, outputTokens: 50 },
     cost: 0.01,
-    depth: { filesOpened: ['src/a.ts'], searches: 2 },
+    depth: { filesOpened: ['src/a.ts'], searches: 2, grepCalls: 1, codegraphCalls: 1 },
     toolCalls: [],
     rawTrace: ['{"type":"message_start"}', '{"type":"message_end"}'],
     startedAt: 1_000,
@@ -147,7 +147,7 @@ function makeManifestInput(run: RunDir, over: Partial<ManifestInput> = {}): Mani
     makeReviewerResult({
       reviewer: reviewerB,
       cost: 0.02,
-      depth: { filesOpened: [], searches: 0 },
+      depth: { filesOpened: [], searches: 0, grepCalls: 0, codegraphCalls: 0 },
     }),
   ];
   return {
@@ -511,6 +511,51 @@ describe('writeManifest', () => {
     expect(manifest.codegraph).toEqual({ available: false, reason: 'binary-missing' });
   });
 
+  it('records a successful blast-radius step with block statistics and no reason', () => {
+    const run = createRunDir(projectRoot);
+    const input = makeManifestInput(run, {
+      blastRadius: { available: true, stats: { symbols: 2, callers: 3, tests: 1 } },
+    });
+
+    const manifest = JSON.parse(readFileSync(writeManifest(input), 'utf8'));
+
+    expect(manifest.blastRadius).toEqual({
+      available: true,
+      stats: { symbols: 2, callers: 3, tests: 1 },
+    });
+    expect(manifest.blastRadius.reason).toBeUndefined();
+    expect(manifest.blastRadius.block).toBeUndefined(); // block text is not duplicated here
+  });
+
+  it('records a degraded blast-radius step with its reason', () => {
+    const run = createRunDir(projectRoot);
+    const input = makeManifestInput(run, {
+      blastRadius: {
+        available: false,
+        reason: 'query-failed',
+        stats: { symbols: 0, callers: 0, tests: 0 },
+      },
+    });
+
+    const manifest = JSON.parse(readFileSync(writeManifest(input), 'utf8'));
+
+    expect(manifest.blastRadius).toEqual({
+      available: false,
+      reason: 'query-failed',
+      stats: { symbols: 0, callers: 0, tests: 0 },
+    });
+  });
+
+  it('omits the blastRadius key when the input carries no outcome (additive only)', () => {
+    const run = createRunDir(projectRoot);
+    const input = makeManifestInput(run);
+    expect(input.blastRadius).toBeUndefined();
+
+    const manifest = JSON.parse(readFileSync(writeManifest(input), 'utf8'));
+
+    expect('blastRadius' in manifest).toBe(false);
+  });
+
   it('never carries credential-shaped content, even when the environment holds a live-looking secret', () => {
     const fakeSecret = 'sk-live-abcdefghijklmnopqrstuvwxyz0123456789';
     const previous = process.env.OPENROUTER_API_KEY;
@@ -618,6 +663,48 @@ describe('writeReport', () => {
       'utf8',
     );
     expect(unavailableText).toContain('- CodeGraph index: unavailable (disabled)');
+  });
+
+  it('summarizes the blast-radius outcome in one footer line for success and degraded runs', () => {
+    const run = createRunDir(projectRoot);
+
+    const successText = readFileSync(
+      writeReport(
+        run,
+        makeManifestInput(run, {
+          blastRadius: { available: true, stats: { symbols: 2, callers: 3, tests: 1 } },
+        }),
+        [],
+        null,
+      ),
+      'utf8',
+    );
+    expect(successText).toContain('- Blast radius: available (2 symbols, 3 callers, 1 test)');
+
+    const degradedText = readFileSync(
+      writeReport(
+        run,
+        makeManifestInput(run, {
+          blastRadius: {
+            available: false,
+            reason: 'query-failed',
+            stats: { symbols: 0, callers: 0, tests: 0 },
+          },
+        }),
+        [],
+        null,
+      ),
+      'utf8',
+    );
+    expect(degradedText).toContain('- Blast radius: unavailable (query-failed)');
+  });
+
+  it('omits the blast-radius line when the input carries no outcome', () => {
+    const run = createRunDir(projectRoot);
+
+    const text = readFileSync(writeReport(run, makeManifestInput(run), [], null), 'utf8');
+
+    expect(text).not.toContain('Blast radius');
   });
 
   it('renders the no-baseline case distinctly, never as "N new findings"', () => {

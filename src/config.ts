@@ -42,6 +42,22 @@ export interface CouncilConfig {
 export interface CodegraphConfig {
   enabled: boolean;
   indexTimeoutSeconds: number;
+  /**
+   * Deterministic per-run blast-radius step. Optional on the interface so existing literals
+   * keep typechecking (same pattern as `retain`); `loadConfig` always fills it, so a loaded
+   * config never leaves it undefined.
+   */
+  blastRadius?: BlastRadiusConfig;
+}
+
+export interface BlastRadiusConfig {
+  enabled: boolean;
+  /** Transitive-impact traversal depth passed to `codegraph impact --depth`. */
+  depth: number;
+  /** Maximum changed symbols traced per run; overflow is disclosed in-block. */
+  maxSymbols: number;
+  /** Maximum rendered block size in characters; overflow truncates with a note. */
+  maxBlockChars: number;
 }
 
 export interface IgnoreEntry {
@@ -86,9 +102,17 @@ export const CONFIG_DEFAULTS: Readonly<Partial<CouncilConfig>> = Object.freeze({
   retain: 20,
 });
 
+export const BLAST_RADIUS_DEFAULTS: Readonly<BlastRadiusConfig> = Object.freeze({
+  enabled: true,
+  depth: 2,
+  maxSymbols: 25,
+  maxBlockChars: 6000,
+});
+
 export const CODEGRAPH_DEFAULTS: Readonly<CodegraphConfig> = Object.freeze({
   enabled: true,
   indexTimeoutSeconds: 300,
+  blastRadius: { ...BLAST_RADIUS_DEFAULTS },
 });
 
 export function configPath(projectRoot: string): string {
@@ -145,6 +169,14 @@ const ConfigSchema = Type.Object({
     Type.Object({
       enabled: Type.Optional(Type.Boolean()),
       indexTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 1 })),
+      blastRadius: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          depth: Type.Optional(Type.Integer({ minimum: 1 })),
+          maxSymbols: Type.Optional(Type.Integer({ minimum: 1 })),
+          maxBlockChars: Type.Optional(Type.Integer({ minimum: 1 })),
+        }),
+      ),
     }),
   ),
 });
@@ -257,6 +289,13 @@ function applyDefaults(raw: RawConfig): CouncilConfig {
       enabled: raw.codegraph?.enabled ?? CODEGRAPH_DEFAULTS.enabled,
       indexTimeoutSeconds:
         raw.codegraph?.indexTimeoutSeconds ?? CODEGRAPH_DEFAULTS.indexTimeoutSeconds,
+      blastRadius: {
+        enabled: raw.codegraph?.blastRadius?.enabled ?? BLAST_RADIUS_DEFAULTS.enabled,
+        depth: raw.codegraph?.blastRadius?.depth ?? BLAST_RADIUS_DEFAULTS.depth,
+        maxSymbols: raw.codegraph?.blastRadius?.maxSymbols ?? BLAST_RADIUS_DEFAULTS.maxSymbols,
+        maxBlockChars:
+          raw.codegraph?.blastRadius?.maxBlockChars ?? BLAST_RADIUS_DEFAULTS.maxBlockChars,
+      },
     },
   };
 }

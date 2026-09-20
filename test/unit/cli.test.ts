@@ -1005,6 +1005,185 @@ describe('codegraph indexing end to end', () => {
       else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
     }
   });
+
+  it('embeds one deterministic blast-radius block in the shared prompt on an enabled run', async () => {
+    const stubPath = path.join(toolDir, 'codegraph');
+    // Dispatches on subcommand: `init` builds the index artifact; `node` maps the changed
+    // file's hunks to `foo`; `callers`/`impact` trace it; `affected` names its tests.
+    const symbolsMap = [
+      '**src/foo.ts** — 1 symbol, used by 1 file: src/bar.ts',
+      '',
+      '**Symbols**',
+      '- `foo` (function) (buf, len) — :1',
+      '',
+      '> Drop `symbolsOnly` to read the source, like Read.',
+    ].join('\n');
+    const callersJson = JSON.stringify({
+      symbol: 'foo',
+      callers: [{ name: 'bar', kind: 'function', filePath: 'src/bar.ts', startLine: 9 }],
+    });
+    const impactJson = JSON.stringify({
+      symbol: 'foo',
+      depth: 2,
+      nodeCount: 2,
+      edgeCount: 1,
+      affected: [
+        { name: 'foo', kind: 'function', filePath: 'src/foo.ts', startLine: 1 },
+        { name: 'top', kind: 'function', filePath: 'src/top.ts', startLine: 5 },
+      ],
+    });
+    const affectedJson = JSON.stringify({
+      changedFiles: ['src/foo.ts'],
+      affectedTests: ['test/foo.test.ts'],
+    });
+    fs.writeFileSync(
+      stubPath,
+      [
+        '#!/bin/sh',
+        'case "$1" in',
+        '  init) mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db" ;;',
+        `  node) printf '%s' '${symbolsMap}' ;;`,
+        `  callers) printf '%s' '${callersJson}' ;;`,
+        `  impact) printf '%s' '${impactJson}' ;;`,
+        `  affected) printf '%s' '${affectedJson}' ;;`,
+        'esac',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    fs.chmodSync(stubPath, 0o755);
+    const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    process.env.COUNCIL_CODEGRAPH_BIN = stubPath;
+    try {
+      writeConfigFile({ codegraph: { enabled: true, indexTimeoutSeconds: 60 } });
+      expect(await runReview()).toBe(1);
+
+      const prompt = fs.readFileSync(
+        path.join(onlyRunDir(), 'prompts', 'initial-prompt.txt'),
+        'utf8',
+      );
+      // The one shared prompt carries the computed block: changed symbol, caller anchor,
+      // transitive impact, and affected tests.
+      expect(prompt).toContain('## Deterministic blast-radius map');
+      expect(prompt).toContain('`foo` (function) src/foo.ts:1');
+      expect(prompt).toContain('`bar` (function) src/bar.ts:9');
+      expect(prompt).toContain('`top` (function) src/top.ts:5');
+      expect(prompt).toContain('test/foo.test.ts');
+      // Framed as a starting map, not ground truth, and embedded exactly once.
+      expect(prompt).toContain('starting map to verify with your own tools, not as ground truth');
+      expect(prompt.split('## Deterministic blast-radius map').length - 1).toBe(1);
+      // Placement: between the patch and the findings instructions.
+      const patchIndex = prompt.indexOf('The patch under review (unified diff):');
+      const blockIndex = prompt.indexOf('## Deterministic blast-radius map');
+      const findingsIndex = prompt.indexOf('When you have finished reviewing');
+      expect(patchIndex).toBeGreaterThanOrEqual(0);
+      expect(blockIndex).toBeGreaterThan(patchIndex);
+      expect(findingsIndex).toBeGreaterThan(blockIndex);
+    } finally {
+      if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
+      else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    }
+  });
+
+  it('embeds no block when the index is unavailable and the run continues as before', async () => {
+    writeConfigFile(); // codegraph disabled; the step has no index to query
+    expect(await runReview()).toBe(1); // same exit as the enabled run: nothing failed, nothing skipped
+
+    const prompt = fs.readFileSync(
+      path.join(onlyRunDir(), 'prompts', 'initial-prompt.txt'),
+      'utf8',
+    );
+    expect(prompt).not.toContain('## Deterministic blast-radius map');
+    expect(prompt).toContain('When you have finished reviewing');
+  });
+
+  it('embeds no block and issues no blast query when the step is disabled', async () => {
+    const stubPath = path.join(toolDir, 'codegraph');
+    const invocationsPath = path.join(toolDir, 'codegraph-invocations.log');
+    // Logs every subcommand: `init` still builds the index artifact, and the log proves the
+    // disabled step issued no query afterwards (a merely-degraded step would show them).
+    fs.writeFileSync(
+      stubPath,
+      [
+        '#!/bin/sh',
+        `echo "$1" >> '${invocationsPath}'`,
+        'case "$1" in',
+        '  init) mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db" ;;',
+        'esac',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    fs.chmodSync(stubPath, 0o755);
+    const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    process.env.COUNCIL_CODEGRAPH_BIN = stubPath;
+    try {
+      writeConfigFile({
+        codegraph: {
+          enabled: true,
+          indexTimeoutSeconds: 60,
+          blastRadius: { enabled: false, depth: 2, maxSymbols: 25, maxBlockChars: 6000 },
+        },
+      });
+      expect(await runReview()).toBe(1);
+
+      const runDir = onlyRunDir();
+      const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'manifest.json'), 'utf8'));
+      expect(manifest.codegraph).toEqual({ available: true }); // index built; only the step is off
+
+      const invocations = fs
+        .readFileSync(invocationsPath, 'utf8')
+        .split('\n')
+        .filter((line) => line.length > 0);
+      expect(invocations).toContain('init');
+      expect(invocations).not.toContain('node');
+      expect(invocations).not.toContain('callers');
+      expect(invocations).not.toContain('impact');
+      expect(invocations).not.toContain('affected');
+
+      const prompt = fs.readFileSync(path.join(runDir, 'prompts', 'initial-prompt.txt'), 'utf8');
+      expect(prompt).not.toContain('## Deterministic blast-radius map');
+      expect(prompt).toContain('When you have finished reviewing');
+    } finally {
+      if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
+      else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    }
+  });
+
+  it('embeds no block when every blast query fails and the exit code is unaffected', async () => {
+    const stubPath = path.join(toolDir, 'codegraph');
+    // `init` builds the index artifact so the step runs; every query subcommand fails, so
+    // the step degrades to no block instead of failing the run.
+    fs.writeFileSync(
+      stubPath,
+      [
+        '#!/bin/sh',
+        'case "$1" in',
+        '  init) mkdir -p "$2/.codegraph" && touch "$2/.codegraph/codegraph.db" ;;',
+        '  *) exit 1 ;;',
+        'esac',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    fs.chmodSync(stubPath, 0o755);
+    const prevBin = process.env.COUNCIL_CODEGRAPH_BIN;
+    process.env.COUNCIL_CODEGRAPH_BIN = stubPath;
+    try {
+      writeConfigFile({ codegraph: { enabled: true, indexTimeoutSeconds: 60 } });
+      expect(await runReview()).toBe(1); // the "high" finding still breaches: run continued
+
+      const prompt = fs.readFileSync(
+        path.join(onlyRunDir(), 'prompts', 'initial-prompt.txt'),
+        'utf8',
+      );
+      expect(prompt).not.toContain('## Deterministic blast-radius map');
+      expect(prompt).toContain('When you have finished reviewing');
+    } finally {
+      if (prevBin === undefined) delete process.env.COUNCIL_CODEGRAPH_BIN;
+      else process.env.COUNCIL_CODEGRAPH_BIN = prevBin;
+    }
+  });
 });
 
 // -------------------------------------------------------------------------------------------

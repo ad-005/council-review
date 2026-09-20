@@ -143,6 +143,29 @@ Cleanup restores write bits and removes the directory on exit; `council-review
 gc` sweeps orphans. For a monorepo where copying the whole tracked tree is too
 slow, `--paths` and config `snapshot.include` narrow the copy.
 
+### Blast-radius map
+
+After the snapshot index is built and before any reviewer launches, the CLI
+computes a deterministic blast-radius block once per run: the patch's changed
+symbols mapped to their direct callers, transitive impact, and the affected
+tests for the changed files, rendered as compact text with `file:line` anchors.
+The identical block is embedded in every reviewer's shared initial prompt and
+framed as a starting map to verify with tools, not ground truth — the static
+graph over-approximates. The step is model-free and deterministic: same patch
+against the same index always yields the same block.
+
+Best-effort contract, identical to indexing: the step never fails a run. A
+missing binary, query timeout, parse failure, or unavailable index degrades to
+no block (or a partial block) with a machine-readable reason recorded in the
+manifest and a one-line summary in `REPORT.md`; exit codes are unchanged.
+Setting `codegraph.blastRadius.enabled` to false restores exactly the pre-step
+behavior.
+
+Limitation: the index depicts the end-state tree, so references of deleted
+symbols and files are not computable from it — removals are named explicitly in
+the block with that note rather than silently omitted. Indexing the base tree
+to resolve deletions is a deferred follow-up.
+
 ## Scope
 
 Default scope is the work in this worktree: `merge-base(HEAD, baseBranch)` to

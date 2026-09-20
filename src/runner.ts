@@ -54,7 +54,7 @@ export interface ReviewerResult {
   repairText: string | null; // verbatim second attempt, when one was made
   usage: { inputTokens: number; outputTokens: number };
   cost: number | null; // null === unknown (no catalog rates)
-  depth: { filesOpened: string[]; searches: number };
+  depth: { filesOpened: string[]; searches: number; grepCalls: number; codegraphCalls: number };
   toolCalls: ToolCall[];
   rawTrace: string[]; // every stream line, including unparseable ones
   startedAt: number;
@@ -78,6 +78,11 @@ export interface RunPanelOptions {
   repoRoot: string;
   patchPath: string; // path in the RUN dir; never inside the snapshot
   prompt: string;
+  /** Deterministic blast-radius block computed once per run by the caller. When present and
+   *  non-empty it is embedded verbatim in the shared initial prompt between the patch and the
+   *  findings instructions, so every reviewer receives the identical block. Absent (or empty)
+   *  means the step was disabled or degraded, and the prompt keeps exactly its prior shape. */
+  blastRadiusBlock?: string;
   extensionPath: string;
   includeContextFiles: boolean;
   timeoutSeconds: number;
@@ -112,7 +117,11 @@ export interface RunPanelOutcome {
  * unchanged to every reviewer — this identical-input property is what "no cross-contamination"
  * rests on structurally, not on a runtime check.
  */
-function buildInitialPrompt(taskPrompt: string, patchContent: string): string {
+function buildInitialPrompt(
+  taskPrompt: string,
+  patchContent: string,
+  blastRadiusBlock?: string,
+): string {
   return [
     taskPrompt.trim(),
     '',
@@ -121,6 +130,11 @@ function buildInitialPrompt(taskPrompt: string, patchContent: string): string {
     patchContent,
     '```',
     '',
+    // The block carries its own `## Deterministic blast-radius map` heading (rendered by
+    // `renderBlastRadiusBlock`), so it is embedded verbatim here rather than re-wrapped.
+    ...(blastRadiusBlock !== undefined && blastRadiusBlock.length > 0
+      ? [blastRadiusBlock, '']
+      : []),
     FINDINGS_BLOCK_INSTRUCTIONS,
   ].join('\n');
 }
@@ -274,21 +288,34 @@ function computeCost(
 /**
  * Derives the depth signal from recorded tool calls: which files were opened (`council_read`,
  * `args.path`) and how many searches were run (`council_grep` and `council_codegraph` call
- * counts). Other tool calls (`council_list`, `council_git`) are still recorded in `toolCalls`
- * but do not contribute here — the spec names files-opened and searches-run as the minimum
- * signal.
+ * counts, reported both combined as `searches` and split per tool). Other tool calls
+ * (`council_list`, `council_git`) are still recorded in `toolCalls` but do not contribute here —
+ * the spec names files-opened and searches-run as the minimum signal.
  */
-function computeDepth(toolCalls: readonly ToolCall[]): { filesOpened: string[]; searches: number } {
+function computeDepth(toolCalls: readonly ToolCall[]): {
+  filesOpened: string[];
+  searches: number;
+  grepCalls: number;
+  codegraphCalls: number;
+} {
   const files = new Set<string>();
-  let searches = 0;
+  let grepCalls = 0;
+  let codegraphCalls = 0;
   for (const call of toolCalls) {
     if (call.name === 'council_read' && typeof call.args.path === 'string') {
       files.add(call.args.path);
-    } else if (call.name === 'council_grep' || call.name === 'council_codegraph') {
-      searches += 1;
+    } else if (call.name === 'council_grep') {
+      grepCalls += 1;
+    } else if (call.name === 'council_codegraph') {
+      codegraphCalls += 1;
     }
   }
-  return { filesOpened: [...files].sort(), searches };
+  return {
+    filesOpened: [...files].sort(),
+    searches: grepCalls + codegraphCalls,
+    grepCalls,
+    codegraphCalls,
+  };
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1050,7 +1077,7 @@ class ProgressReporter {
 export async function runPanel(o: RunPanelOptions): Promise<RunPanelOutcome> {
   const hostBin = resolveHostBin(process.env);
   const patchContent = readFileSync(o.patchPath, 'utf8');
-  const initialPrompt = buildInitialPrompt(o.prompt, patchContent);
+  const initialPrompt = buildInitialPrompt(o.prompt, patchContent, o.blastRadiusBlock);
 
   // `patchPath`'s own directory is the run directory (Section 15's `createRunDir` creates it,
   // `writePatch` writes `patch.diff` directly into it) -- reused here rather than threading a

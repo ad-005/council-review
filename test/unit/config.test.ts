@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  BLAST_RADIUS_DEFAULTS,
   CODEGRAPH_DEFAULTS,
   CONFIG_DEFAULTS,
   ConfigError,
@@ -63,7 +64,11 @@ describe('loadConfig: valid document round-trip', () => {
       snapshot: { include: ['dist/**'] },
       vendorOverrides: { 'openrouter/some-model': 'anthropic' },
       retain: 3,
-      codegraph: { enabled: false, indexTimeoutSeconds: 60 },
+      codegraph: {
+        enabled: false,
+        indexTimeoutSeconds: 60,
+        blastRadius: { enabled: false, depth: 3, maxSymbols: 10, maxBlockChars: 1000 },
+      },
     };
     writeRawConfig(full);
 
@@ -160,7 +165,86 @@ describe('loadConfig: codegraph defaults and partial fill-in', () => {
 
     const loaded = loadConfig(root);
 
-    expect(loaded.codegraph).toEqual({ enabled: false, indexTimeoutSeconds: 60 });
+    expect(loaded.codegraph).toEqual({
+      enabled: false,
+      indexTimeoutSeconds: 60,
+      blastRadius: { ...BLAST_RADIUS_DEFAULTS },
+    });
+  });
+});
+
+describe('loadConfig: blastRadius defaults and partial fill-in', () => {
+  it('applies enabled=true with default caps when the codegraph key is omitted', () => {
+    writeRawConfig({ version: 1, panel: validPanel });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.blastRadius).toEqual({ ...BLAST_RADIUS_DEFAULTS });
+    expect(loaded.codegraph.blastRadius?.enabled).toBe(true);
+  });
+
+  it('applies blastRadius defaults when codegraph is present but blastRadius is omitted', () => {
+    writeRawConfig({ version: 1, panel: validPanel, codegraph: { enabled: false } });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.enabled).toBe(false);
+    expect(loaded.codegraph.blastRadius).toEqual({ ...BLAST_RADIUS_DEFAULTS });
+  });
+
+  it('fills omitted blastRadius keys with defaults when only enabled is provided', () => {
+    writeRawConfig({
+      version: 1,
+      panel: validPanel,
+      codegraph: { blastRadius: { enabled: false } },
+    });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.blastRadius).toEqual({
+      enabled: false,
+      depth: BLAST_RADIUS_DEFAULTS.depth,
+      maxSymbols: BLAST_RADIUS_DEFAULTS.maxSymbols,
+      maxBlockChars: BLAST_RADIUS_DEFAULTS.maxBlockChars,
+    });
+  });
+
+  it('fills enabled with the default when only caps are provided', () => {
+    writeRawConfig({
+      version: 1,
+      panel: validPanel,
+      codegraph: { blastRadius: { depth: 1, maxSymbols: 5, maxBlockChars: 500 } },
+    });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.blastRadius).toEqual({
+      enabled: BLAST_RADIUS_DEFAULTS.enabled,
+      depth: 1,
+      maxSymbols: 5,
+      maxBlockChars: 500,
+    });
+  });
+
+  it('preserves explicit blastRadius values on a writeConfig/loadConfig round-trip', () => {
+    writeConfig(root, {
+      version: 1,
+      panel: validPanel,
+      codegraph: {
+        enabled: true,
+        indexTimeoutSeconds: 300,
+        blastRadius: { enabled: false, depth: 4, maxSymbols: 50, maxBlockChars: 8000 },
+      },
+    });
+
+    const loaded = loadConfig(root);
+
+    expect(loaded.codegraph.blastRadius).toEqual({
+      enabled: false,
+      depth: 4,
+      maxSymbols: 50,
+      maxBlockChars: 8000,
+    });
   });
 });
 
@@ -193,6 +277,61 @@ describe('loadConfig: codegraph rejection paths', () => {
       const e = err as ConfigError;
       expect(e.exitCode).toBe(2);
       expect(e.keyPath).toBe('/codegraph/enabled');
+    }
+  });
+
+  it.each(['depth', 'maxSymbols', 'maxBlockChars'] as const)(
+    'rejects an out-of-schema blastRadius.%s as a ConfigError',
+    (key) => {
+      for (const value of [0, -1, 1.5, '10']) {
+        writeRawConfig({
+          version: 1,
+          panel: validPanel,
+          codegraph: { blastRadius: { [key]: value } },
+        });
+
+        try {
+          loadConfig(root);
+          expect.unreachable();
+        } catch (err) {
+          expect(err).toBeInstanceOf(ConfigError);
+          const e = err as ConfigError;
+          expect(e.exitCode).toBe(2);
+          expect(e.keyPath).toBe(`/codegraph/blastRadius/${key}`);
+        }
+      }
+    },
+  );
+
+  it('rejects a non-boolean blastRadius.enabled as a ConfigError', () => {
+    writeRawConfig({
+      version: 1,
+      panel: validPanel,
+      codegraph: { blastRadius: { enabled: 'yes' } },
+    });
+
+    try {
+      loadConfig(root);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      const e = err as ConfigError;
+      expect(e.exitCode).toBe(2);
+      expect(e.keyPath).toBe('/codegraph/blastRadius/enabled');
+    }
+  });
+
+  it('rejects a non-object blastRadius as a ConfigError', () => {
+    writeRawConfig({ version: 1, panel: validPanel, codegraph: { blastRadius: false } });
+
+    try {
+      loadConfig(root);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      const e = err as ConfigError;
+      expect(e.exitCode).toBe(2);
+      expect(e.keyPath).toBe('/codegraph/blastRadius');
     }
   });
 });

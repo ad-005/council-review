@@ -25,6 +25,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
+import type { BlastRadiusReason, BlastRadiusStats } from './blast-radius.js';
 import type { CodegraphIndexStatus } from './codegraph.js';
 import type { MergedFinding } from './merge.js';
 import type { ResolutionOutcome, ResolutionState } from './resolve.js';
@@ -220,6 +221,18 @@ export function emitMachineReadableFindings(
 // Manifest (task 15.4)
 // -------------------------------------------------------------------------------------------
 
+/**
+ * Blast-radius outcome for one run: whether a block was embedded in the shared reviewer
+ * prompt, and if not, the machine-readable reason. `stats` counts what the embedded block
+ * lists (zeros when nothing was embedded). The block text itself is never recorded here —
+ * like `scope.patch`, it already exists where it is consumed (the reviewer prompts).
+ */
+export interface BlastRadiusStatus {
+  available: boolean;
+  reason?: BlastRadiusReason;
+  stats: BlastRadiusStats;
+}
+
 export interface ManifestInput {
   run: RunDir;
   identity: SnapshotIdentity;
@@ -229,6 +242,8 @@ export interface ManifestInput {
   overrides: { allowCorrelated: boolean; includeContextFiles: boolean; noSuppress: boolean };
   hostVersion: string | null;
   codegraph: CodegraphIndexStatus;
+  /** Optional so pre-step callers keep compiling; omitted from the manifest when absent. */
+  blastRadius?: BlastRadiusStatus;
 }
 
 /**
@@ -266,6 +281,19 @@ export function writeManifest(i: ManifestInput): string {
       available: i.codegraph.available,
       ...(i.codegraph.reason !== undefined ? { reason: i.codegraph.reason } : {}),
     },
+    ...(i.blastRadius !== undefined
+      ? {
+          blastRadius: {
+            available: i.blastRadius.available,
+            ...(i.blastRadius.reason !== undefined ? { reason: i.blastRadius.reason } : {}),
+            stats: {
+              symbols: i.blastRadius.stats.symbols,
+              callers: i.blastRadius.stats.callers,
+              tests: i.blastRadius.stats.tests,
+            },
+          },
+        }
+      : {}),
     panel: i.outcome.results.map((r) => ({
       provider: r.reviewer.provider,
       model: r.reviewer.model,
@@ -332,6 +360,14 @@ function formatCost(cost: number | null): string {
 function formatDepth(d: { filesOpened: string[]; searches: number }): string {
   const files = d.filesOpened.length;
   return `${files} file${files === 1 ? '' : 's'} opened, ${d.searches} search${d.searches === 1 ? '' : 'es'}`;
+}
+
+function formatBlastRadius(b: BlastRadiusStatus): string {
+  if (!b.available) return `- Blast radius: unavailable (${b.reason ?? 'unknown reason'})`;
+  const sym = `${b.stats.symbols} symbol${b.stats.symbols === 1 ? '' : 's'}`;
+  const callers = `${b.stats.callers} caller${b.stats.callers === 1 ? '' : 's'}`;
+  const tests = `${b.stats.tests} test${b.stats.tests === 1 ? '' : 's'}`;
+  return `- Blast radius: available (${sym}, ${callers}, ${tests})`;
 }
 
 function renderResolutionSection(resolution: ResolutionOutcome): string[] {
@@ -454,6 +490,9 @@ export function writeReport(
       ? '- CodeGraph index: available'
       : `- CodeGraph index: unavailable (${i.codegraph.reason ?? 'unknown reason'})`,
   );
+  if (i.blastRadius !== undefined) {
+    lines.push(formatBlastRadius(i.blastRadius));
+  }
 
   const degradedReviewers = i.outcome.results.filter((r) => r.state !== 'ok');
   if (degradedReviewers.length > 0) {

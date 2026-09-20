@@ -339,7 +339,12 @@ describe('review depth', () => {
     const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
     const result = outcome.results[0]!;
 
-    expect(result.depth).toEqual({ filesOpened: ['src/foo.ts'], searches: 1 });
+    expect(result.depth).toEqual({
+      filesOpened: ['src/foo.ts'],
+      searches: 1,
+      grepCalls: 1,
+      codegraphCalls: 0,
+    });
   });
 
   it('counts both council_grep and council_codegraph calls as searches', async () => {
@@ -349,7 +354,7 @@ describe('review depth', () => {
     const outcome = await runPanel(baseOptions({ reviewers: [reviewer] }));
     const result = outcome.results[0]!;
 
-    expect(result.depth).toEqual({ filesOpened: [], searches: 5 });
+    expect(result.depth).toEqual({ filesOpened: [], searches: 5, grepCalls: 2, codegraphCalls: 3 });
   });
 
   it('makes a shallow reviewer visibly different from a thorough one', async () => {
@@ -365,7 +370,12 @@ describe('review depth', () => {
     const outcome = await runPanel(baseOptions({ reviewers: [shallow, thorough] }));
     const byModel = new Map(outcome.results.map((r) => [r.reviewer.model, r]));
 
-    expect(byModel.get('shallow')!.depth).toEqual({ filesOpened: [], searches: 0 });
+    expect(byModel.get('shallow')!.depth).toEqual({
+      filesOpened: [],
+      searches: 0,
+      grepCalls: 0,
+      codegraphCalls: 0,
+    });
     expect(byModel.get('thorough')!.depth.filesOpened.length).toBeGreaterThan(0);
   });
 });
@@ -940,4 +950,152 @@ describe('interruption', () => {
 
     expect(snapshot.cleanup).toHaveBeenCalledTimes(1);
   }, 15_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Blast-radius prompt section: a caller-computed block is embedded verbatim between the patch
+// and the findings instructions, identically for every reviewer.
+// ---------------------------------------------------------------------------------------------
+
+describe('blast-radius prompt section', () => {
+  const BLOCK = [
+    '## Deterministic blast-radius map',
+    'Changed symbols (1):',
+    '- `foo` (function) src/foo.ts:1',
+    '  callers (1): `bar` (function) src/bar.ts:9',
+    'Affected tests (1): test/foo.test.ts',
+  ].join('\n');
+
+  function promptFileContent(spawnSpy: { mock: { calls: unknown[][] } }, callIndex = 0): string {
+    const argv = spawnSpy.mock.calls[callIndex]![1] as string[];
+    const trailingArg = argv[argv.length - 1]!;
+    expect(trailingArg).toMatch(/^@\//);
+    return readFileSync(trailingArg.slice(1), 'utf8');
+  }
+
+  it('embeds the provided block between the patch and the findings instructions', async () => {
+    setFixture('clean-with-tools');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const patchPath = makePatch();
+    const patchContent = readFileSync(patchPath, 'utf8');
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(
+      baseOptions({ reviewers: [reviewer], patchPath, blastRadiusBlock: BLOCK }),
+    );
+    expect(outcome.results[0]!.state).toBe('ok');
+
+    const content = promptFileContent(spawnSpy);
+    expect(content).toContain(BLOCK);
+
+    // Placement: after the patch fence closes, before the findings instructions begin.
+    const patchClose = content.indexOf('```', content.indexOf(patchContent) + patchContent.length);
+    const blockIndex = content.indexOf(BLOCK);
+    const findingsIndex = content.indexOf('When you have finished reviewing');
+    expect(patchClose).toBeGreaterThanOrEqual(0);
+    expect(blockIndex).toBeGreaterThan(patchClose);
+    expect(findingsIndex).toBeGreaterThan(blockIndex);
+
+    // Exactly one copy: the block is embedded, not duplicated per reviewer or section.
+    expect(content.split('## Deterministic blast-radius map').length - 1).toBe(1);
+  });
+
+  it('hands every reviewer the byte-identical block via the shared initial prompt', async () => {
+    setFixture('clean-with-tools');
+    const reviewers = [
+      makeReviewer({ id: 'model-a', provider: 'prov-a' }),
+      makeReviewer({ id: 'model-b', provider: 'prov-b' }),
+    ];
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(baseOptions({ reviewers, blastRadiusBlock: BLOCK }));
+    expect(outcome.results).toHaveLength(2);
+
+    expect(spawnSpy).toHaveBeenCalledTimes(2);
+    const argvA = spawnSpy.mock.calls[0]![1] as string[];
+    const argvB = spawnSpy.mock.calls[1]![1] as string[];
+    // Same shared prompt file for both reviewers (the identical-input property is structural).
+    expect(argvA[argvA.length - 1]).toBe(argvB[argvB.length - 1]);
+
+    const contentA = promptFileContent(spawnSpy, 0);
+    const contentB = promptFileContent(spawnSpy, 1);
+    expect(contentB).toBe(contentA);
+    expect(contentA).toContain(BLOCK);
+  });
+
+  it('keeps exactly the prior prompt shape when no block is provided', async () => {
+    setFixture('clean-with-tools');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    await runPanel(baseOptions({ reviewers: [reviewer] }));
+
+    const content = promptFileContent(spawnSpy);
+    expect(content).not.toContain('## Deterministic blast-radius map');
+  });
+
+  it('treats an undefined or empty block exactly like omitting the option', async () => {
+    // The degraded paths (disabled step, failed queries, unavailable index) all reach the
+    // runner as "no block": the CLI maps them to `undefined`, and `computeBlastRadius`
+    // itself reports them with an empty `block` string. Every spelling must produce the
+    // same prompt with no section and no residue where the section would sit.
+    setFixture('clean-with-tools');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    // One patch dir per run: each runPanel writes its prompt next to its patch, so the
+    // runs must not share a path. Defaults are deterministic, so all patches agree.
+    const patchPaths = [makePatch(), makePatch(), makePatch()];
+    const patchContent = readFileSync(patchPaths[0]!, 'utf8');
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    await runPanel(baseOptions({ reviewers: [reviewer], patchPath: patchPaths[0]! }));
+    await runPanel(
+      baseOptions({
+        reviewers: [reviewer],
+        patchPath: patchPaths[1]!,
+        blastRadiusBlock: undefined,
+      }),
+    );
+    await runPanel(
+      baseOptions({ reviewers: [reviewer], patchPath: patchPaths[2]!, blastRadiusBlock: '' }),
+    );
+    expect(spawnSpy).toHaveBeenCalledTimes(3);
+
+    const omitted = promptFileContent(spawnSpy, 0);
+    expect(promptFileContent(spawnSpy, 1)).toBe(omitted);
+    expect(promptFileContent(spawnSpy, 2)).toBe(omitted);
+    expect(omitted).not.toContain('## Deterministic blast-radius map');
+
+    // No residue: the patch fence closes straight into the findings instructions.
+    const patchClose =
+      omitted.indexOf('```', omitted.indexOf(patchContent) + patchContent.length) + '```'.length;
+    const findingsIndex = omitted.indexOf('When you have finished reviewing');
+    expect(findingsIndex).toBeGreaterThan(patchClose);
+    expect(omitted.slice(patchClose, findingsIndex)).toBe('\n\n');
+  });
+
+  it('keeps the degraded prompt byte-identical to the enabled prompt minus the block', async () => {
+    // The block adds exactly one section: strip it from an enabled prompt and the result
+    // must collapse to the degraded (pre-step) shape with no whitespace shift, proving a
+    // degraded run hands reviewers precisely what they received before the step existed.
+    setFixture('clean-with-tools');
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+    // Separate patch dirs per run: each runPanel writes its prompt next to its patch, so
+    // sharing one path would let the second run overwrite the first run's prompt file.
+    // `makePatch()` defaults are deterministic, so both patches are byte-identical.
+    const enabledPatchPath = makePatch();
+    const degradedPatchPath = makePatch();
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    await runPanel(
+      baseOptions({ reviewers: [reviewer], patchPath: enabledPatchPath, blastRadiusBlock: BLOCK }),
+    );
+    await runPanel(baseOptions({ reviewers: [reviewer], patchPath: degradedPatchPath }));
+    expect(spawnSpy).toHaveBeenCalledTimes(2);
+
+    const enabled = promptFileContent(spawnSpy, 0);
+    const degraded = promptFileContent(spawnSpy, 1);
+    expect(enabled).toContain(BLOCK);
+    expect(degraded).not.toContain('## Deterministic blast-radius map');
+    expect(enabled.replace(`${BLOCK}\n\n`, '')).toBe(degraded);
+  });
 });
