@@ -5,4 +5,5 @@ codegraph
 *.log
 openspec/
 .claude/
+.agents/
 .council/reviews/
