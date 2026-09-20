@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "panel": [
+    {
+      "provider": "opencode-go",
+      "model": "deepseek-flash"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "hy3"
+    },
+    {
+      "provider": "opencode-go",
+      "model": "qwen3.8-flash"
+    }
+  ],
+  "modelThinkingLevels": {
+    "opencode-go/deepseek-flash": "high",
+    "opencode-go/hy3": "high",
+    "opencode-go/qwen3.8-flash": "high"
+  }
+}
