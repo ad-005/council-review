@@ -292,3 +292,18 @@ thinkingLevel},...})`), so the resolved state the extension reads is already the
 Nothing in `council-review` pins an exact `pi` version at runtime — there is no version check
 against this file. This document is a maintainer's re-verification checklist, not an enforced
 gate.
+
+## Start-of-run self-update
+
+Each review run ensures the host is current before launching any reviewer: `src/cli.ts` calls
+`ensurePiCurrent` (`src/pi-update.ts`) exactly once, in the CLI process — never in a reviewer —
+which runs `pi update --self` (self only, never extensions) and compares `pi --version` before
+and after to decide whether an update happened. The check is best-effort: any failure degrades
+to a warning and the run proceeds with the host as-is. It is skipped silently when
+`COUNCIL_NO_PI_UPDATE=1` is set, or when `PI_OFFLINE=1` is set (an update check is a network
+operation), and runs that launch no reviewers (empty scope, `--pane` delegation parents) perform
+no update. The version in effect is recorded as `hostVersion` in each run's `manifest.json`.
+
+This makes the re-verification duty above recurring rather than one-off: the host can move
+under this tool on any run. After an update lands, re-verify the new version with the
+procedure above before trusting the isolation guarantee against it.
