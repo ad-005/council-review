@@ -42,6 +42,7 @@ import { findRepoRoot, resolveScope, checkScopeSelectors, type ScopeSelectors } 
 import { buildSnapshot, writePatch, sweepOrphans, type Snapshot } from './snapshot.js';
 import { computeBlastRadius } from './blast-radius.js';
 import { runPanel, type RunPanelOutcome } from './runner.js';
+import { ensurePiCurrent } from './pi-update.js';
 import type { Severity } from './schema.js';
 import { mergeFindings, type ReviewerFindings, type MergedFinding } from './merge.js';
 import { loadPreviousFindings, diffAgainstBaseline, type ResolutionOutcome } from './resolve.js';
@@ -793,6 +794,30 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
     // and run the review in this process.
   }
 
+  // Centralized host self-update: exactly once per review run, in this process -- never
+  // in a reviewer -- and before any reviewer launches, so every reviewer in the panel
+  // spawns from the same, current host binary. Best-effort by contract (`ensurePiCurrent`
+  // never rejects): any failure degrades to a warning and the run proceeds with the host
+  // as-is. Deliberately placed after the `--pane` delegation above, so a delegating parent
+  // does not update before handing off (the delegated child runs this same check), and
+  // after the empty-scope return, so a run that launches no reviewers performs no update.
+  const piUpdate = await ensurePiCurrent();
+  if (piUpdate.status === 'updated') {
+    out(
+      jsonMode,
+      `council-review: updated pi ${piUpdate.previousVersion} -> ${piUpdate.currentVersion}\n`,
+    );
+  } else if (piUpdate.status === 'already-latest') {
+    out(jsonMode, `council-review: pi is up to date (${piUpdate.currentVersion})\n`);
+  } else if (piUpdate.status === 'failed') {
+    out(
+      jsonMode,
+      `council-review: warning: pi update check failed (${piUpdate.reason}); continuing with the installed pi\n`,
+    );
+  }
+  // 'skipped' (explicit opt-out or offline) stays silent: nothing was attempted, so there
+  // is nothing to report.
+
   // Guard #2: immediately before launch, so a hand-edited config panel is checked too.
   enforceIndependence(reviewers, allowCorrelated);
 
@@ -906,7 +931,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       outcome,
       suppressed: mergeOutcome.suppressed,
       overrides: { allowCorrelated, includeContextFiles: cfg.includeContextFiles, noSuppress },
-      hostVersion: null,
+      hostVersion: piUpdate.currentVersion ?? piUpdate.previousVersion ?? null,
       codegraph: activeSnapshot.codegraph,
       blastRadius: {
         available: blastRadius.available,

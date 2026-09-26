@@ -73,7 +73,10 @@ let fakePiCounter = 0;
 /**
  * Writes a combined fake `pi` binary: `auth check` always reports ready (no test here exercises
  * unready-provider handling — that is `providers.test.ts`'s surface), `--list-models` fails (the
- * store fixture is always present, so the fallback is never needed), and any other invocation is
+ * store fixture is always present, so the fallback is never needed), `--version` reports a
+ * fixed fake version and `update` exits 0 (the start-of-run self-update check's surface, so
+ * that check resolves deterministically instead of replaying a reviewer fixture), and any
+ * other invocation is
  * a reviewer spawn, delegated to the shared fake host with the fixture selected per
  * `provider/model` from `modelFixtures`, falling back to `defaultFixture`.
  *
@@ -110,6 +113,15 @@ if (args[0] === 'auth' && args[1] === 'check') {
 
 if (args[0] === '--list-models') {
   process.exit(1);
+}
+
+if (args[0] === '--version' || args[0] === '-v') {
+  process.stdout.write('0.0.0-fake-pi\\n');
+  process.exit(0);
+}
+
+if (args[0] === 'update') {
+  process.exit(0);
 }
 
 const mi = args.indexOf('--model');
@@ -934,6 +946,57 @@ describe('review run exit codes', () => {
 });
 
 // -------------------------------------------------------------------------------------------
+// Pi self-update end to end: the centralized check runs once per review run (before any
+// reviewer launches) and its version lands in the manifest; a run that launches no
+// reviewers performs no update.
+// -------------------------------------------------------------------------------------------
+
+describe('pi self-update end to end', () => {
+  function onlyRunDir(): string {
+    const reviewsDir = path.join(repo.root, '.council', 'reviews');
+    const runId = fs.readdirSync(reviewsDir).find((e) => e !== 'last')!;
+    return path.join(reviewsDir, runId);
+  }
+
+  it('a review run checks pi once and records its version in the manifest', async () => {
+    useFixtures({ defaultFixture: 'unparseable-lines' }); // empty findings, fast
+    writeConfigFile();
+    makeWorkingChange();
+
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli([]);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    // The fake pi reports a fixed version and its `update` is a no-op exit 0, so the
+    // check deterministically resolves to already-latest.
+    expect(stdout.text()).toContain('pi is up to date (0.0.0-fake-pi)');
+    const manifest = JSON.parse(fs.readFileSync(path.join(onlyRunDir(), 'manifest.json'), 'utf8'));
+    expect(manifest.hostVersion).toBe('0.0.0-fake-pi');
+  });
+
+  it('an empty scope performs no update check', async () => {
+    useFixtures({ defaultFixture: 'unparseable-lines' });
+    writeConfigFile();
+    // No working-tree change: the scope resolves empty before any reviewer would launch.
+
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli([]);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    expect(stdout.text()).not.toContain('pi is up to date');
+    expect(stdout.text()).not.toContain('updated pi');
+    expect(stdout.text()).not.toContain('update check failed');
+  });
+});
+
 // CodeGraph indexing end to end: config opt-out/in, manifest + report recording, and the
 // CodeGraph-first reviewer instruction -- all through a real `runCli` review with a stub binary.
 // -------------------------------------------------------------------------------------------

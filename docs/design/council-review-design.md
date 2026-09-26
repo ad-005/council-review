@@ -58,6 +58,7 @@ Each unit has one purpose and is testable alone.
 | `resolve.ts` | `--since` diffing against a previous run |
 | `report.ts` | Write manifest, raw, findings, REPORT.md, HANDOFF.md |
 | `herdr.ts` | Pane split/run, title, notification, agent handoff |
+| `pi-update.ts` | Ensure the `pi` host is current (`pi update --self`, never extensions) once per review run, before any reviewer launches. Best-effort; never fails a run. |
 | `reviewer-tools.ts` | The Pi extension loaded into each reviewer. Security-critical. |
 
 `reviewer-tools.ts` ships built to `dist/reviewer-tools.js` and is never

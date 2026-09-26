@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Start-of-run Pi self-update: each review run now runs `pi update --self` (self only,
+  never extensions) exactly once, in the CLI process before any reviewer launches, and
+  applies the update when one is available. Best-effort like indexing — any failure
+  degrades to a warning and the run proceeds with the host as-is. Skipped silently when
+  `COUNCIL_NO_PI_UPDATE=1` or `PI_OFFLINE=1` is set. The host version in effect is now
+  recorded as `hostVersion` in each run's `manifest.json` (previously always null).
+
 ## [0.2.0] - 2026-09-20
 
 ### Added

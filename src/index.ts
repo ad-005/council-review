@@ -30,3 +30,4 @@ export * from './resolve.js';
 export * from './report.js';
 export * from './herdr.js';
 export * from './reviewer-spawn.js';
+export * from './pi-update.js';
