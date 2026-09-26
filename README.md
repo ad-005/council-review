@@ -1,5 +1,33 @@
 # council-review
 
+## Requirements
+
+Install these yourself — `npm install -g council-review` does not provide them:
+
+- **Node.js >= 22.19.0** — required by both `council-review` and `pi`.
+- **git** on `PATH` — reviews run inside a git repository; scope resolution, the
+  snapshot, and the history tools all shell out to `git`.
+- **The `pi` coding-agent CLI** on `PATH` (npm package
+  `@earendil-works/pi-coding-agent`, verified against `pi 0.85.1` — see
+  [`HOST-VERSION.md`](./HOST-VERSION.md)):
+
+  ```
+  npm install -g @earendil-works/pi-coding-agent
+  ```
+
+- **Authenticated providers in `pi`'s own credential store** (`~/.pi/agent/`) —
+  check with `pi auth check --provider <name> --json`. A default panel needs at
+  least three models from three distinct vendors. A key that exists only as a
+  shell variable never reaches a reviewer, because reviewer processes get a
+  tight environment allowlist.
+
+Optional:
+
+- **`codegraph`** on `PATH` — builds the snapshot symbol index behind the
+  blast-radius map and the reviewer's `council_codegraph` tool. A missing,
+  slow, or broken binary degrades to grep/read; the run still works and the
+  manifest records why.
+
 A read-only, multi-vendor code review panel over local git state.
 
 `council-review` sends the work in your git worktree to several models from **different vendors**
@@ -36,10 +64,7 @@ dependencies into its temporary clone and the `prepare` build cannot run; npm 12
 disables git fetching by default, so it needs `--allow-git=all`. `npx github:ad-005/council-review`
 works on npm 10, and needs `--allow-git=all` on npm 12.
 
-Requires the `pi` coding-agent CLI (`@earendil-works/pi-coding-agent`) on `PATH`, authenticated
-for at least one provider through `pi`'s own credential store — a key that exists only as a shell
-variable never reaches a reviewer, because reviewer processes get a tight environment allowlist.
-Both `council-review` and `pi` need Node **>= 22.19.0**.
+See Requirements above for what else must be installed first.
 
 ## Use
 
