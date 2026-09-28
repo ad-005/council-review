@@ -26,7 +26,7 @@ import {
 } from './config.js';
 import { checkIndependence } from './panel.js';
 import { deriveVendor, findModel, loadCatalog } from './providers.js';
-import { listRuns, reviewsDirPath } from './report.js';
+import { listRuns, resolveLastRunId, reviewsDirPath } from './report.js';
 import { findRepoRoot, ScopeError } from './scope.js';
 import { isHerdrEnv } from './herdr.js';
 import { resolveThinking } from './thinking.js';
@@ -109,15 +109,6 @@ export function readPackageVersion(): string {
     return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
   } catch {
     return '0.0.0';
-  }
-}
-
-/** Mirrors `report.ts`'s own (unexported) `resolveLastRunId`. */
-function resolveLastRunId(reviewsDir: string): string | null {
-  try {
-    return path.basename(fs.realpathSync(path.join(reviewsDir, 'last')));
-  } catch {
-    return null;
   }
 }
 

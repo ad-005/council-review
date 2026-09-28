@@ -379,8 +379,10 @@ Suppression: a cluster is dropped if its fingerprint, or any member's, matches
 
 ## Resolution tracking
 
-`--since last|<run-id>` loads the prior `findings.json` and matches by
-fingerprint:
+`--since last|<run-id>` loads the prior `findings.json` before any reviewer
+launches, and matches two findings when their fingerprints or any of their
+member fingerprints coincide (so a change of which reviewer's wording
+represents a cluster is not a resolve plus a new finding):
 
 - present before, absent now → `resolved`
 - present before and now → `still-present`

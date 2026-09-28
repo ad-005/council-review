@@ -849,7 +849,7 @@ describe('review run exit codes', () => {
     expect(code).toBe(1);
   });
 
-  it('rejects a bad --fail-on, --timeout or --max-tokens before any run directory or reviewer', async () => {
+  it('rejects a bad --fail-on, --timeout, --max-tokens or --since before any run directory or reviewer', async () => {
     useFixtures({ defaultFixture: 'valid-findings' });
     writeConfigFile();
     makeWorkingChange();
@@ -858,6 +858,8 @@ describe('review run exit codes', () => {
       ['--fail-on', 'bogus'],
       ['--timeout', 'abc'],
       ['--max-tokens', ''],
+      ['--since', 'no-such-run'],
+      ['--since', '..'],
     ]) {
       const stderr = captureStream(process.stderr);
       let code: number;

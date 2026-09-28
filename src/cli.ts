@@ -46,12 +46,19 @@ import { runPanel, type RunPanelOutcome } from './runner.js';
 import { ensurePiCurrent } from './pi-update.js';
 import type { Severity } from './schema.js';
 import { mergeFindings, type ReviewerFindings, type MergedFinding } from './merge.js';
-import { loadPreviousFindings, diffAgainstBaseline, type ResolutionOutcome } from './resolve.js';
+import {
+  loadPreviousFindings,
+  diffAgainstBaseline,
+  findingsWithResolution,
+  type ResolutionOutcome,
+} from './resolve.js';
 import {
   createRunDir,
   updateLastPointer,
   reviewsDirPath,
-  listRuns,
+  listRunIds,
+  resolveLastRunId,
+  readRunFindings,
   gcRuns,
   writeManifest,
   writeReviewerArtifacts,
@@ -245,14 +252,6 @@ function tryLoadConfig(repoRoot: string): CouncilConfig | null {
   }
 }
 
-function resolveLastRunId(reviewsDir: string): string | null {
-  try {
-    return path.basename(fs.realpathSync(path.join(reviewsDir, 'last')));
-  } catch {
-    return null;
-  }
-}
-
 /** A stored run named on the command line: an id `listRuns` knows, or `last` / nothing for the
  *  run the `last` pointer resolves to. */
 function resolveRunArg(command: string, repoRoot: string, raw: string | undefined): string {
@@ -261,7 +260,7 @@ function resolveRunArg(command: string, repoRoot: string, raw: string | undefine
     if (lastId === null) throw new UsageError(`${command}: no runs found; run a review first`);
     return lastId;
   }
-  if (!listRuns(repoRoot).some((r) => r.id === raw)) {
+  if (!listRunIds(reviewsDirPath(repoRoot)).includes(raw)) {
     throw new UsageError(`${command}: unknown run "${raw}"`);
   }
   return raw;
@@ -530,11 +529,8 @@ async function cmdIgnore(args: readonly string[]): Promise<number> {
   const reviewsDir = reviewsDirPath(repoRoot);
   const runId = resolveRunArg('ignore', repoRoot, values.run);
 
-  const findingsFile = path.join(reviewsDir, runId, 'findings.json');
-  let findings: MergedFinding[];
-  try {
-    findings = JSON.parse(fs.readFileSync(findingsFile, 'utf8')) as MergedFinding[];
-  } catch {
+  const findings = readRunFindings(reviewsDir, runId);
+  if (findings === null) {
     throw new UsageError(`ignore: could not read the merged findings for run "${runId}"`);
   }
 
@@ -720,6 +716,11 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
   const failOn = values['fail-on'] !== undefined ? validateFailOn(values['fail-on']) : cfg.failOn;
   // --no-suppress never reads the ignore file, so a broken one cannot block that run.
   const ignoreFile: IgnoreFile = noSuppress ? { version: 1, entries: [] } : loadIgnore(repoRoot);
+  // Only reads a previous run, and rejects anything but `last` or a stored run id.
+  const baseline =
+    values.since !== undefined
+      ? loadPreviousFindings(reviewsDirPath(repoRoot), values.since)
+      : null;
 
   const catalog = await loadCatalog({ vendorOverrides: cfg.vendorOverrides ?? {} });
 
@@ -876,14 +877,13 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       suppress: !noSuppress,
     });
 
-    let resolution: ResolutionOutcome | null = null;
-    if (values.since !== undefined) {
-      const baseline = loadPreviousFindings(run.reviewsDir, values.since);
-      resolution = diffAgainstBaseline(mergeOutcome.findings, baseline);
-    }
+    const resolution: ResolutionOutcome | null =
+      values.since !== undefined ? diffAgainstBaseline(mergeOutcome.findings, baseline) : null;
+    // findings.json and --json carry each finding's `resolution` when --since was given.
+    const outputFindings = findingsWithResolution(mergeOutcome.findings, resolution);
 
     for (const r of outcome.results) writeReviewerArtifacts(run, r);
-    const findingsPath = writeFindings(run, mergeOutcome.findings);
+    const findingsPath = writeFindings(run, outputFindings);
 
     const manifestInput: ManifestInput = {
       run,
@@ -899,6 +899,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
         ...(blastRadius.reason !== undefined ? { reason: blastRadius.reason } : {}),
         stats: blastRadius.stats,
       },
+      resolution,
     };
     writeManifest(manifestInput);
     const reportPath = writeReport(run, manifestInput, mergeOutcome.findings, resolution);
@@ -914,7 +915,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
     }
 
     if (jsonMode) {
-      emitMachineReadableFindings(mergeOutcome.findings);
+      emitMachineReadableFindings(outputFindings);
     } else {
       process.stdout.write(`council-review: report written to ${reportPath}\n`);
     }
