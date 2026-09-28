@@ -27,6 +27,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   anything else, including `.` and `..`, is rejected.
 - Findings reporting `endLine` before `line`, or a whitespace-only `file`, `category`, `claim` or
   `impact`, now fail validation and go through the repair retry.
+- `--timeout` and `--max-tokens` bound each reviewer as a whole: a repair attempt gets what the
+  first attempt left, not a fresh allowance.
+- A reviewer whose final turn the host ends with `stopReason` `error`/`aborted` (e.g. a provider
+  auth failure) fails with the host's error message instead of spending a repair attempt.
+- `--timeout`, `--max-tokens`, `--fail-on`, `--since` and the ignore file are validated before
+  model discovery, the snapshot or any reviewer; `--no-suppress` no longer reads the ignore file.
+- `findings.json`, `--json` output and the manifest carry each finding's `resolution` when
+  `--since` is given.
+- `status` reports only the `last` pointer's run as the last run, like `show` and `--since`.
+- Vendor names are canonicalised (lower-cased, aliases such as `x-ai`→`xai`, `z-ai`→`zhipu`,
+  `meta-llama`→`meta`), so the same vendor under two spellings no longer passes the
+  independence guard as two vendors.
+- `--models` entries and globs are held to the same provider-readiness check as the configured
+  panel; an empty `--models` is a usage error (exit 2), and an empty panel is refused even with
+  `--allow-correlated`.
+- A `:suffix` on a `--models` entry is a thinking pin only when it is a thinking level, so model
+  ids containing `:` (`...:free`, `...-v1:0`) can be given.
+- Ctrl-C in the interactive picker exits 130, like any other interrupt.
+- `council_git` refuses stash, reflog (`@{...}`), `:/` and non-HEAD pseudo-ref revisions, and runs
+  with `--no-ext-diff --no-textconv`; `log` defaults to 50 commits.
+- Reviewer tool output is capped at 100,000 characters with an explicit truncation marker, grep
+  match text at 300 characters per line, and `council_grep` reports when its 5,000-file limit
+  was reached.
 
 ### Fixed
 
@@ -44,6 +67,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `REPORT.md` escapes reviewer-supplied text: newlines in one-line fields are collapsed, code
   spans and fences are longer than any backtick run inside them, and a finding's metadata lines
   render as a list.
+- Ctrl-C before reviewers launch (during the snapshot, indexing or blast-radius step) no longer
+  launches the whole panel anyway; a host that ignores SIGTERM is SIGKILLed after a grace period,
+  so the timeout and Ctrl-C are real upper bounds; a huge `--timeout` no longer overflows into an
+  immediate timeout.
+- The default scope handles non-ASCII and space-padded file names, renames (both paths are
+  listed; the old path's deletion is no longer lost), file names with pathspec magic, and very
+  large untracked sets (no more `E2BIG`); user git config (`color.ui`, `diff.noprefix`,
+  `diff.external`, textconv) no longer leaks into the patch; git no longer rewrites
+  `.git/index` or writes objects into the repository while resolving scope; untracked embedded
+  repositories are left out; missing-HEAD and unrelated-history errors are descriptive.
+- The snapshot build survives unstaged deletions, submodules and embedded repositories, never
+  copies a file through a symlinked parent directory (which could reach outside the
+  repository), and reads `--staged`/`--range` content through one `git cat-file --batch`
+  process instead of one `git show` per file.
+- Blast-radius maps each hunk to the symbols its changed lines touch, not the symbol its
+  leading context starts in, and parses unquoted paths with spaces, C-quoted paths, and
+  rename/copy headers correctly.
+- `council_grep` evaluates patterns under a time limit, so a catastrophic regex can no longer
+  hang a reviewer; line numbers in `council_read`/`council_grep` now match git's.
+- `--pane` falls back to a local run when herdr cannot split or run the pane, instead of exiting
+  0 with nothing reviewed; the delegated run no longer re-opens `--pick`, and the user's own
+  pane is no longer retitled. herdr commands time out, and `--handoff` no longer holds the CLI
+  open until the agent finishes.
+- `--pick --json` renders the picker on stderr; the picker exits 2 with a clear message when no
+  provider is ready, instead of an internal error.
+- A `null` entry in the model catalog is skipped instead of crashing the run; provider auth
+  checks run at most four at a time.
+- `pi update --self` that times out is killed and reaped before any reviewer launches.
+- `gc --keep=` (empty) is rejected instead of pruning every run; `show last` and
+  `ignore --run last` work; `status --verify` reports a discovery failure per panel entry.
+- Credential-shaped `PI_*` variables (`PI_*_API_KEY`, `*_TOKEN`, `*_SECRET`) no longer reach a
+  reviewer through the `PI_` environment prefix.
+- The Node version guard runs before the rest of the CLI is loaded, so an old Node gets the
+  guard's message rather than a `SyntaxError`.
 
 ## [0.2.0] - 2026-09-20
 

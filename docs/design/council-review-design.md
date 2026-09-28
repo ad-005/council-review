@@ -446,12 +446,15 @@ Exit codes:
 Active only when `HERDR_ENV=1`; otherwise every call below is a no-op with one
 printed notice, and the tool works normally in a plain shell and in CI.
 
-- `--pane [right|down]` reads `$HERDR_PANE_ID`, runs
+- `--pane` reads `$HERDR_PANE_ID`, runs
   `herdr pane split --current --direction <dir> --cwd "$PWD" --no-focus`, takes
   the new id from `.result.pane.pane_id`, then
   `herdr pane run <id> council-review --no-pane …`, and titles it with
   `herdr pane report-metadata --title "council · N models"`. Focus stays where
-  the user left it.
+  the user left it. `--direction horizontal|vertical` maps to `right|down`. If
+  the split or the run fails, the review runs in the invoking process instead;
+  the delegated run never re-opens `--pick`. Every herdr command is bounded by
+  a short timeout.
 - On completion, `herdr notification show` unless `--no-notify`.
 - `--handoff <agent>` writes HANDOFF.md, then `herdr agent prompt <agent>` with
   a prompt naming `findings.json` and instructing the agent to reproduce each
