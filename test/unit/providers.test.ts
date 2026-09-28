@@ -17,6 +17,7 @@ import {
   readyModels,
   findModel,
   deriveVendor,
+  canonicalVendor,
   collapsedVendorGroups,
   parseListModelsOutput,
   DiscoveryError,
@@ -345,7 +346,102 @@ describe('loadCatalog — models.json layered over the store', () => {
   });
 });
 
+describe('loadCatalog — null and non-object entries', () => {
+  // Every one of these used to crash discovery with a TypeError (exit 70) instead of being
+  // skipped or ignored like any other malformed part of the catalog.
+  const GOOD = {
+    id: 'good-model',
+    name: 'Good',
+    provider: 'p',
+    contextWindow: 1000,
+    maxTokens: 100,
+  };
+
+  function installJson(name: string, value: unknown): void {
+    const dir = join(workDir, '.pi', 'agent');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, name), JSON.stringify(value));
+  }
+
+  it('counts a null models-store.json entry as skipped', async () => {
+    installJson('models-store.json', { p: { models: [null, 42, GOOD] } });
+    writeAuthMap({ p: { status: 'ready' } });
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    const catalog = await loadCatalog({ homeDir: workDir, piBin: piBinPath });
+
+    expect(catalog.skipped).toBe(2);
+    expect(catalog.models.map((m) => m.id)).toEqual(['good-model']);
+  });
+
+  it.each([
+    ['a null provider config', { providers: { p: null } }],
+    ['a null models[] definition', { providers: { p: { models: [null] } } }],
+    [
+      'a null modelOverrides entry',
+      { providers: { p: { modelOverrides: { 'good-model': null } } } },
+    ],
+    ['a non-object modelOverrides map', { providers: { p: { modelOverrides: 'x' } } }],
+  ])('ignores %s in models.json', async (_label, modelsJson) => {
+    installJson('models-store.json', { p: { models: [GOOD] } });
+    installJson('models.json', modelsJson);
+    writeAuthMap({ p: { status: 'ready' } });
+
+    const catalog = await loadCatalog({ homeDir: workDir, piBin: piBinPath });
+
+    expect(catalog.skipped).toBe(0);
+    expect(findModel(catalog, 'p', 'good-model')?.contextWindow).toBe(1000);
+  });
+});
+
 describe('loadCatalog — provider readiness', () => {
+  it('runs at most four auth checks at once, keeping each result with its provider', async () => {
+    // A probe host: each `auth check` registers itself in a directory, records how many checks
+    // are running at that moment, lingers, then deregisters.
+    const runningDir = join(workDir, 'running');
+    mkdirSync(runningDir);
+    const peakLog = join(workDir, 'peak.log');
+    const probe = join(workDir, 'probe-pi.cjs');
+    writeFileSync(
+      probe,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const args = process.argv.slice(2);
+const provider = args[args.indexOf('--provider') + 1];
+const mine = path.join(${JSON.stringify(runningDir)}, String(process.pid));
+fs.writeFileSync(mine, '');
+fs.appendFileSync(${JSON.stringify(peakLog)}, fs.readdirSync(${JSON.stringify(runningDir)}).length + '\\n');
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+fs.unlinkSync(mine);
+const ready = Number(provider.slice(1)) % 2 === 0;
+process.stdout.write(JSON.stringify(ready ? { status: 'ready', authType: 'api_key' } : { status: 'not_ready', reason: 'r-' + provider }));
+process.exit(ready ? 0 : 1);
+`,
+    );
+    chmodSync(probe, 0o755);
+
+    const store: Record<string, unknown> = {};
+    for (let i = 0; i < 10; i++) {
+      const id = `p${i}`;
+      store[id] = { models: [{ id: 'm', name: 'm', provider: id }] };
+    }
+    const dir = join(workDir, '.pi', 'agent');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'models-store.json'), JSON.stringify(store));
+
+    const catalog = await loadCatalog({ homeDir: workDir, piBin: probe });
+
+    const peaks = readFileSync(peakLog, 'utf8').trim().split('\n').map(Number);
+    expect(peaks).toHaveLength(10);
+    expect(Math.max(...peaks)).toBeLessThanOrEqual(4);
+    for (const p of catalog.providers) {
+      const even = Number(p.id.slice(1)) % 2 === 0;
+      expect(p.ready).toBe(even);
+      expect(p.reason).toBe(even ? null : `r-${p.id}`);
+    }
+  });
+
   it('offers ready providers, annotated with authType and model count', async () => {
     installStoreFixture(workDir);
     writeAuthMap(ALL_PROVIDERS_READY);
@@ -479,6 +575,30 @@ describe('deriveVendor', () => {
     expect(deriveVendor('opencode-go', 'deepseek-v4-flash', {})).toBe('deepseek');
     expect(deriveVendor('minimax', 'MiniMax-M2.7', {})).toBe('minimax');
     expect(deriveVendor('openai-codex', 'gpt-5.4', {})).toBe('openai');
+  });
+
+  // The guard counts distinct vendor STRINGS, so every spelling of one vendor must resolve to
+  // the same canonical name — otherwise the same vendor routed through two gateways is counted
+  // as two, and a correlated panel passes as independent.
+  it.each([
+    ['openrouter', 'x-ai/grok-4', 'opencode-go', 'grok-4', 'xai'],
+    ['openrouter', 'z-ai/glm-4.6', 'opencode-go', 'glm-5.2', 'zhipu'],
+    ['openrouter', 'meta-llama/llama-4-maverick', 'groq', 'llama-4-scout', 'meta'],
+    ['openrouter', 'mistralai/mistral-large', 'mistral', 'mistral-large-latest', 'mistral'],
+    ['openrouter', 'moonshotai/kimi-k2', 'opencode-go', 'kimi-k2.6', 'moonshot'],
+    ['openrouter', 'deepseek-ai/deepseek-v3', 'opencode-go', 'deepseek-v4-flash', 'deepseek'],
+    ['hf', 'Qwen/Qwen3-235B', 'opencode-go', 'qwen3.6-plus', 'qwen'],
+    ['openrouter', 'openai/o4-mini', 'openai', 'o4-mini', 'openai'],
+    ['openrouter', 'openai/chatgpt-4o-latest', 'openai', 'chatgpt-4o-latest', 'openai'],
+  ])('maps %s/%s and %s/%s to the same vendor (%s)', (gatewayA, idA, gatewayB, idB, vendor) => {
+    expect(deriveVendor(gatewayA, idA, {})).toBe(vendor);
+    expect(deriveVendor(gatewayB, idB, {})).toBe(vendor);
+  });
+
+  it('canonicalizes a vendorOverrides value the same way', () => {
+    expect(deriveVendor('openrouter', 'auto', { 'openrouter/auto': 'X-AI' })).toBe('xai');
+    expect(canonicalVendor('Anthropic')).toBe('anthropic');
+    expect(canonicalVendor('aion-labs')).toBe('aion-labs');
   });
 
   it('falls back to unknown for an unrecognised flat id', () => {

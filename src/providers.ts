@@ -7,7 +7,6 @@
  * council-review/model-discovery/spec.md` for the requirements this module satisfies.
  */
 
-import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +14,8 @@ import process from 'node:process';
 
 import type { ThinkingLevel } from './levels.js';
 import { isThinkingLevel } from './levels.js';
+import { resolveHostBin } from './reviewer-spawn.js';
+import { runCommand } from './run-command.js';
 
 export interface CatalogModel {
   id: string; // host model id; may contain '/' and a leading prefix marker
@@ -69,6 +70,9 @@ export class DiscoveryError extends Error {
  * this is a list of (prefix, vendor) pairs rather than a 1:1 map. Matching is longest-prefix-
  * first, case-insensitive, against the whole flat id (not a token match), because ids like
  * `qwen3.6-plus` and `glm-5.2` glue a version straight onto the family name with no separator.
+ *
+ * Every vendor on the right-hand side is a canonical name (see `VENDOR_ALIASES`): the guard
+ * counts distinct vendor strings, so two spellings of one vendor would be counted twice.
  */
 type VendorPrefixEntry = readonly [prefix: string, vendor: string];
 
@@ -77,15 +81,24 @@ const VENDOR_PREFIX_TABLE: readonly VendorPrefixEntry[] = (
     ['anthropic', 'anthropic'],
     ['claude', 'anthropic'],
     ['openai', 'openai'],
+    ['chatgpt', 'openai'],
     ['gpt', 'openai'],
     ['codex', 'openai'],
     ['o1', 'openai'],
     ['o3', 'openai'],
+    ['o4', 'openai'],
     ['google', 'google'],
     ['gemini', 'google'],
+    ['gemma', 'google'],
     ['meta', 'meta'],
     ['llama', 'meta'],
     ['mistral', 'mistral'],
+    ['mixtral', 'mistral'],
+    ['codestral', 'mistral'],
+    ['devstral', 'mistral'],
+    ['magistral', 'mistral'],
+    ['ministral', 'mistral'],
+    ['pixtral', 'mistral'],
     ['deepseek', 'deepseek'],
     ['qwen', 'qwen'],
     ['minimax', 'minimax'],
@@ -102,6 +115,36 @@ const VENDOR_PREFIX_TABLE: readonly VendorPrefixEntry[] = (
 )
   .slice()
   .sort((a, b) => b[0].length - a[0].length);
+
+/**
+ * Alternate spellings of a vendor name, mapped to the canonical name the prefix table uses.
+ * Applied (after lowercasing) to the leading segment of a `vendor/model` gateway id and to a
+ * `vendorOverrides` value, so `openrouter/x-ai/grok-4` and `opencode-go/grok-4` both resolve to
+ * `xai` rather than counting as two vendors. Keys are the organisation slugs gateways actually
+ * use (OpenRouter, Hugging Face-style ids).
+ */
+const VENDOR_ALIASES: Readonly<Record<string, string>> = {
+  'x-ai': 'xai',
+  'z-ai': 'zhipu',
+  zai: 'zhipu',
+  'zai-org': 'zhipu',
+  zhipuai: 'zhipu',
+  thudm: 'zhipu',
+  'meta-llama': 'meta',
+  mistralai: 'mistral',
+  moonshotai: 'moonshot',
+  'deepseek-ai': 'deepseek',
+  alibaba: 'qwen',
+  minimaxai: 'minimax',
+};
+
+/** Lowercases `vendor` and folds a known alternate spelling onto its canonical name. */
+export function canonicalVendor(vendor: string): string {
+  const lower = vendor.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(VENDOR_ALIASES, lower)
+    ? (VENDOR_ALIASES[lower] as string)
+    : lower;
+}
 
 /** Strips a leading run of punctuation/sigil characters some gateways prepend to an id. */
 function stripPrefixMarker(segment: string): string {
@@ -123,13 +166,13 @@ export function deriveVendor(
 ): string {
   const overrideKey = `${provider}/${modelId}`;
   if (Object.prototype.hasOwnProperty.call(overrides, overrideKey)) {
-    return overrides[overrideKey] as string;
+    return canonicalVendor(overrides[overrideKey] as string);
   }
 
   const slashIdx = modelId.indexOf('/');
   if (slashIdx > 0) {
     const leading = stripPrefixMarker(modelId.slice(0, slashIdx));
-    if (leading.length > 0) return leading;
+    if (leading.length > 0) return canonicalVendor(leading);
   }
 
   const flatVendor = matchPrefixTable(modelId);
@@ -138,8 +181,14 @@ export function deriveVendor(
   return 'unknown';
 }
 
-/** vendor -> ['provider/modelId', ...]; only groups with >1 member matter to callers, but return all. */
-export function collapsedVendorGroups(models: readonly CatalogModel[]): Map<string, string[]> {
+/**
+ * vendor -> ['provider/modelId', ...], in first-appearance order; only groups with >1 member
+ * matter to callers, but return all. Typed structurally (only the fields it reads) so the
+ * independence guard in `panel.ts` can group reviewers with it as well as catalog models.
+ */
+export function collapsedVendorGroups(
+  models: readonly { provider: string; id: string; vendor: string }[],
+): Map<string, string[]> {
   const groups = new Map<string, string[]>();
   for (const model of models) {
     const key = `${model.provider}/${model.id}`;
@@ -170,6 +219,11 @@ interface RawStoreModel {
 
 interface RawStoreFile {
   [provider: string]: { models?: unknown } | unknown;
+}
+
+/** True for a plain JSON object (not null, not an array) — the only shape a catalog record may take. */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 function toNumberOrNull(v: unknown): number | null {
@@ -299,6 +353,7 @@ function rawModelFromDefinition(
   providerId: string,
   definitionUnknown: unknown,
 ): RawStoreModel | null {
+  if (!isRecord(definitionUnknown)) return null;
   const definition = definitionUnknown as RawModelDefinition;
   if (typeof definition.id !== 'string' || definition.id.length === 0) return null;
 
@@ -321,16 +376,17 @@ function rawModelFromDefinition(
 function mergeProviderModelsJson(
   providerId: string,
   baseModelsUnknown: readonly unknown[],
-  configUnknown: unknown,
-): RawStoreModel[] {
-  let models: RawStoreModel[] = baseModelsUnknown.map((m) => ({ ...(m as RawStoreModel) }));
-  const config = configUnknown as RawProviderModelsConfig;
+  config: RawProviderModelsConfig,
+): unknown[] {
+  // Non-object base entries are passed through untouched so `catalogFromStore` counts them as
+  // skipped, exactly as it would without a models.json.
+  let models: unknown[] = baseModelsUnknown.map((m) => (isRecord(m) ? { ...m } : m));
 
   const definitions = Array.isArray(config.models) ? config.models : [];
   for (const rawDefinition of definitions) {
     const built = rawModelFromDefinition(providerId, rawDefinition);
     if (built === null) continue; // malformed models.json definition (no id) — dropped
-    const existingIndex = models.findIndex((m) => m.id === built.id);
+    const existingIndex = models.findIndex((m) => isRecord(m) && m.id === built.id);
     if (existingIndex >= 0) {
       models[existingIndex] = built;
     } else {
@@ -339,11 +395,13 @@ function mergeProviderModelsJson(
   }
 
   const overrides = config.modelOverrides;
-  if (overrides && typeof overrides === 'object') {
+  if (isRecord(overrides)) {
     models = models.map((m) => {
-      if (typeof m.id !== 'string') return m;
+      if (!isRecord(m) || typeof m.id !== 'string') return m;
       const override = (overrides as Record<string, unknown>)[m.id];
-      return override !== undefined ? applyRawModelOverride(m, override) : m;
+      // A non-object override (`null`, a string, ...) is malformed and ignored, like any other
+      // unusable part of models.json.
+      return isRecord(override) ? applyRawModelOverride(m, override) : m;
     });
   }
 
@@ -357,14 +415,15 @@ function mergeProviderModelsJson(
  */
 function mergeModelsJson(store: RawStoreFile, modelsJson: RawModelsJsonFile | null): RawStoreFile {
   const providerConfigs = modelsJson?.providers;
-  if (!providerConfigs || typeof providerConfigs !== 'object') return store;
+  if (!isRecord(providerConfigs)) return store;
 
   const merged: RawStoreFile = { ...store };
   const providerIds = new Set<string>([...Object.keys(store), ...Object.keys(providerConfigs)]);
 
   for (const providerId of providerIds) {
     const config = providerConfigs[providerId];
-    if (config === undefined) continue; // no models.json entry for this provider — store stands as-is
+    // No models.json entry for this provider (or a malformed, non-object one) — store stands as-is.
+    if (!isRecord(config)) continue;
 
     const storeBlock = store[providerId] as { models?: unknown } | undefined;
     const baseModels = Array.isArray(storeBlock?.models) ? storeBlock.models : [];
@@ -374,22 +433,28 @@ function mergeModelsJson(store: RawStoreFile, modelsJson: RawModelsJsonFile | nu
   return merged;
 }
 
-async function loadModelsJson(homeDir: string): Promise<RawModelsJsonFile | null> {
-  const modelsJsonPath = join(homeDir, '.pi', 'agent', 'models.json');
+/**
+ * Reads and parses a JSON file that must hold a top-level object. Returns `null` for a missing,
+ * unreadable, unparseable or non-object file — every caller treats all of those as "absent".
+ */
+async function readJsonObject(path: string): Promise<Record<string, unknown> | null> {
   let text: string;
   try {
-    text = await readFile(modelsJsonPath, 'utf8');
+    text = await readFile(path, 'utf8');
   } catch {
-    return null; // missing (or unreadable) — the store is used unmodified
+    return null;
   }
-
   try {
     const parsed: unknown = JSON.parse(text);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-    return parsed as RawModelsJsonFile;
+    return isRecord(parsed) ? parsed : null;
   } catch {
-    return null; // corrupt models.json — treated the same as "absent"
+    return null;
   }
+}
+
+/** Missing or malformed `models.json` → `null`, and the store is used unmodified. */
+async function loadModelsJson(homeDir: string): Promise<RawModelsJsonFile | null> {
+  return readJsonObject(join(homeDir, '.pi', 'agent', 'models.json'));
 }
 
 /**
@@ -409,6 +474,10 @@ function catalogFromStore(
     if (!Array.isArray(rawModels)) continue;
 
     for (const entryUnknown of rawModels) {
+      if (!isRecord(entryUnknown)) {
+        skipped += 1;
+        continue;
+      }
       const entry = entryUnknown as RawStoreModel;
       const id = entry.id;
       const name = entry.name;
@@ -544,70 +613,11 @@ function listedModelsToCatalogModels(
 
 const COMMAND_TIMEOUT_MS = 15_000;
 
-interface CommandResult {
-  stdout: string;
-  stderr: string;
-  code: number | null;
-}
-
-/**
- * Runs a host command to completion and always resolves with whatever it printed, regardless of
- * exit code — `pi auth check` exits non-zero for a not-ready provider while still printing a
- * valid JSON status object on stdout, and callers need that body. Only rejects when the process
- * itself could not be spawned or run, or when it hangs past the timeout.
- */
-function runCommand(bin: string, args: string[]): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    let child;
-    try {
-      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (err) {
-      reject(err instanceof Error ? err : new Error(String(err)));
-      return;
-    }
-
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill();
-      reject(
-        new Error(`command timed out after ${COMMAND_TIMEOUT_MS}ms: ${bin} ${args.join(' ')}`),
-      );
-    }, COMMAND_TIMEOUT_MS);
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
-    });
-
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ stdout, stderr, code });
-    });
-  });
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
+/** At most this many `pi auth check` processes run at once (see `buildProviderInfos`). */
+const READINESS_CONCURRENCY = 4;
 
 function resolvePiBin(opts: DiscoveryOptions | undefined): string {
-  return opts?.piBin ?? process.env.COUNCIL_PI_BIN ?? 'pi';
+  return opts?.piBin ?? resolveHostBin(process.env);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -627,61 +637,89 @@ interface ReadinessResult {
  * no flag or subcommand that would cause the host to print or copy a live token.
  */
 async function checkProviderReady(piBin: string, provider: string): Promise<ReadinessResult> {
-  try {
-    const { stdout } = await runCommand(piBin, ['auth', 'check', '--provider', provider, '--json']);
-    const trimmed = stdout.trim();
-    if (trimmed.length === 0) {
-      return { ready: false, authType: null, reason: 'auth check produced no output' };
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      return { ready: false, authType: null, reason: 'auth check produced unparseable output' };
-    }
-
-    if (typeof parsed !== 'object' || parsed === null) {
-      return { ready: false, authType: null, reason: 'auth check produced an unexpected shape' };
-    }
-
-    const status = (parsed as { status?: unknown }).status;
-    const authTypeRaw = (parsed as { authType?: unknown }).authType;
-    const reasonRaw = (parsed as { reason?: unknown }).reason;
-
-    if (status === 'ready') {
-      return {
-        ready: true,
-        authType: typeof authTypeRaw === 'string' ? authTypeRaw : null,
-        reason: null,
-      };
-    }
-
+  // `pi auth check` exits non-zero for a not-ready provider while still printing a valid JSON
+  // status object on stdout, so the body is read regardless of exit code.
+  const outcome = await runCommand(piBin, ['auth', 'check', '--provider', provider, '--json'], {
+    timeoutMs: COMMAND_TIMEOUT_MS,
+  });
+  if (outcome.kind === 'spawn-failed') {
+    return { ready: false, authType: null, reason: `auth check failed: ${outcome.message}` };
+  }
+  if (outcome.kind === 'timeout') {
     return {
       ready: false,
       authType: null,
-      reason:
-        typeof reasonRaw === 'string'
-          ? reasonRaw
-          : typeof status === 'string'
-            ? status
-            : 'not ready',
+      reason: `auth check failed: command timed out after ${COMMAND_TIMEOUT_MS}ms`,
     };
-  } catch (err) {
-    return { ready: false, authType: null, reason: `auth check failed: ${errorMessage(err)}` };
   }
+  const trimmed = outcome.stdout.trim();
+  if (trimmed.length === 0) {
+    return { ready: false, authType: null, reason: 'auth check produced no output' };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { ready: false, authType: null, reason: 'auth check produced unparseable output' };
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    return { ready: false, authType: null, reason: 'auth check produced an unexpected shape' };
+  }
+
+  const status = (parsed as { status?: unknown }).status;
+  const authTypeRaw = (parsed as { authType?: unknown }).authType;
+  const reasonRaw = (parsed as { reason?: unknown }).reason;
+
+  if (status === 'ready') {
+    return {
+      ready: true,
+      authType: typeof authTypeRaw === 'string' ? authTypeRaw : null,
+      reason: null,
+    };
+  }
+
+  return {
+    ready: false,
+    authType: null,
+    reason:
+      typeof reasonRaw === 'string' ? reasonRaw : typeof status === 'string' ? status : 'not ready',
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Catalog assembly
 // ---------------------------------------------------------------------------------------------
 
+/** `Promise.all(items.map(fn))`, but with at most `limit` calls in flight; results keep input order. */
+async function mapBounded<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 async function buildProviderInfos(
   piBin: string,
   models: readonly CatalogModel[],
 ): Promise<ProviderInfo[]> {
   const providerIds = Array.from(new Set(models.map((m) => m.provider))).sort();
-  const readiness = await Promise.all(providerIds.map((id) => checkProviderReady(piBin, id)));
+  // Bounded: one `pi auth check` process per provider all at once (20+ on a real catalog) can
+  // starve each other past the command timeout.
+  const readiness = await mapBounded(providerIds, READINESS_CONCURRENCY, (id) =>
+    checkProviderReady(piBin, id),
+  );
 
   return providerIds.map((id, i) => {
     const r = readiness[i] as ReadinessResult;
@@ -695,35 +733,19 @@ async function buildProviderInfos(
   });
 }
 
+/** Missing or corrupt `models-store.json` → `null`, and the caller falls back to the listing command. */
 async function loadFromStore(homeDir: string): Promise<RawStoreFile | null> {
-  const storePath = join(homeDir, '.pi', 'agent', 'models-store.json');
-  let text: string;
-  try {
-    text = await readFile(storePath, 'utf8');
-  } catch {
-    return null; // missing (or unreadable) — caller falls back to the listing command
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-    return parsed as RawStoreFile;
-  } catch {
-    return null; // corrupt store file — treated the same as "unavailable"
-  }
+  return readJsonObject(join(homeDir, '.pi', 'agent', 'models-store.json'));
 }
 
 async function loadFromListing(
   piBin: string,
   overrides: Record<string, string>,
 ): Promise<CatalogModel[] | null> {
-  let result: CommandResult;
-  try {
-    result = await runCommand(piBin, ['--list-models', '-ne']);
-  } catch {
-    return null;
-  }
-  if (result.code !== 0) return null;
+  const result = await runCommand(piBin, ['--list-models', '-ne'], {
+    timeoutMs: COMMAND_TIMEOUT_MS,
+  });
+  if (result.kind !== 'exited' || result.code !== 0) return null;
 
   const listed = parseListModelsOutput(result.stdout);
   if (listed.length === 0) return null;

@@ -47,19 +47,34 @@ interface HerdrCallResult {
   message?: string;
 }
 
+/**
+ * Upper bound on any one synchronous herdr control command. These are local socket round-trips
+ * that answer in milliseconds; a herdr that has stopped answering must not hang the review (or
+ * its exit) forever, so it is SIGKILLed past this and treated as a failed call.
+ */
+export const HERDR_COMMAND_TIMEOUT_MS = 5_000;
+
 /** Runs one herdr subcommand synchronously, swallowing every failure into a result flag. */
 function runHerdrSync(args: readonly string[]): HerdrCallResult {
   const bin = herdrBin();
   let result: SpawnSyncReturns<string>;
   try {
-    result = spawnSync(bin, args, { encoding: 'utf8' });
+    result = spawnSync(bin, args, {
+      encoding: 'utf8',
+      timeout: HERDR_COMMAND_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
   } catch (err) {
     return { ok: false, stdout: '', message: (err as Error).message };
   }
   if (result.error) {
     return { ok: false, stdout: '', message: result.error.message };
   }
-  if (typeof result.status === 'number' && result.status !== 0) {
+  if (result.signal !== null) {
+    // Killed (by the timeout above or by anything else): its output, if any, is incomplete.
+    return { ok: false, stdout: result.stdout ?? '', message: `killed by ${result.signal}` };
+  }
+  if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || `exit code ${result.status}`).trim();
     return { ok: false, stdout: result.stdout ?? '', message: detail };
   }
@@ -88,19 +103,29 @@ const DELEGATED_MARKER = 'COUNCIL_HERDR_DELEGATED';
  * Splits a new pane from the current one and runs `argv` inside it. The herdr CLI's own
  * `--direction` flag only accepts `right` / `down` (side-by-side vs. stacked), not
  * `horizontal` / `vertical`; `horizontal` maps to `right` and `vertical` maps to `down`.
+ *
+ * `delegated` is true only once `pane run` has succeeded — i.e. the review really is running
+ * elsewhere. Every other outcome (outside herdr, already delegated, a failed split, a split with
+ * no pane id, a failed run) returns `delegated: false`, and the caller must run the review
+ * itself: reporting "delegated" when nothing was launched would exit 0 having reviewed nothing.
+ * `attempted` says only whether any herdr command was issued.
+ *
+ * A failed `pane run` leaves the freshly split pane empty. No herdr command for closing a pane is
+ * used by (or verified for) this module, so the orphan is named in the warning for the user to
+ * close, rather than guessed at.
  */
 export function splitPaneAndRun(
   argv: readonly string[],
   direction: 'horizontal' | 'vertical' = 'horizontal',
-): { attempted: boolean } {
+): { attempted: boolean; delegated: boolean } {
   if (!isHerdrEnv()) {
     noticeOutsideHerdr();
-    return { attempted: false };
+    return { attempted: false, delegated: false };
   }
 
   if (process.env[DELEGATED_MARKER] === '1') {
     // Already running inside a pane created for a delegated review; never split again.
-    return { attempted: false };
+    return { attempted: false, delegated: false };
   }
 
   const herdrDirection = direction === 'vertical' ? 'down' : 'right';
@@ -116,24 +141,28 @@ export function splitPaneAndRun(
     '--no-focus',
   ]);
   if (!split.ok) {
-    warn(`could not split a pane for the review: ${split.message}`);
-    return { attempted: true };
+    warn(`could not split a pane for the review (running it here instead): ${split.message}`);
+    return { attempted: true, delegated: false };
   }
 
   const paneId = extractPaneId(split.stdout);
   if (!paneId) {
-    warn('herdr pane split did not return a pane id; review was not delegated to a new pane');
-    return { attempted: true };
+    warn('herdr pane split did not return a pane id; running the review here instead');
+    return { attempted: true, delegated: false };
   }
 
   // `env COUNCIL_HERDR_DELEGATED=1 <argv...>` guarantees the delegated process sees the marker
   // regardless of whether herdr's own environment propagation persists across `pane run` calls.
   const run = runHerdrSync(['pane', 'run', paneId, 'env', `${DELEGATED_MARKER}=1`, ...argv]);
   if (!run.ok) {
-    warn(`could not run the review in the split pane: ${run.message}`);
+    warn(
+      `could not run the review in the split pane ${paneId} (running it here instead; ` +
+        `that pane can be closed): ${run.message}`,
+    );
+    return { attempted: true, delegated: false };
   }
 
-  return { attempted: true };
+  return { attempted: true, delegated: true };
 }
 
 /** Renames the current pane. `herdr pane rename` needs the pane id; herdr injects it as `HERDR_PANE_ID`. */
@@ -180,12 +209,18 @@ export function notifyComplete(message: string, suppressed: boolean): { attempte
   return { attempted: true };
 }
 
+/** True when a failed `herdr agent get` reports that the agent does not exist, as opposed to
+ *  herdr itself being unreachable, killed, or failing for some other reason. */
+function isAgentNotFound(message: string | undefined): boolean {
+  return message !== undefined && /agent_not_found|not found/i.test(message);
+}
+
 /**
  * Delivers the handoff prompt (already written to `promptPath` by the report writer) to a named
  * herdr-managed agent. The existence check (`herdr agent get`) is synchronous so an unknown
  * agent can be warned about immediately; delivery itself (`herdr agent prompt`, without `--wait`)
- * is fired without being awaited, so the review's own completion never depends on the agent's
- * response.
+ * is spawned detached and unref'd, so neither the review's completion nor this process's exit
+ * waits for the agent's response.
  */
 export function handoffToAgent(agent: string, promptPath: string): { attempted: boolean } {
   if (!isHerdrEnv()) {
@@ -198,7 +233,9 @@ export function handoffToAgent(agent: string, promptPath: string): { attempted: 
   const check = runHerdrSync(['agent', 'get', agent]);
   if (!check.ok) {
     warn(
-      `herdr agent "${agent}" was not found; the handoff prompt remains written at ${promptPath} for manual use`,
+      isAgentNotFound(check.message)
+        ? `herdr agent "${agent}" was not found; the handoff prompt remains written at ${promptPath} for manual use`
+        : `could not look up herdr agent "${agent}" (${check.message}); the handoff prompt remains written at ${promptPath} for manual use`,
     );
     return { attempted: true };
   }
@@ -211,15 +248,23 @@ export function handoffToAgent(agent: string, promptPath: string): { attempted: 
     return { attempted: true };
   }
 
-  // Deliberately not awaited: `spawn`, not `spawnSync`, and no `--wait` flag, so a slow or
-  // non-responding agent never delays the review command's own exit.
+  // Deliberately not awaited: `spawn`, not `spawnSync`, and no `--wait` flag. Detached and
+  // unref'd as well, because a plain child keeps the event loop — and so the CLI's exit — alive
+  // until it finishes; a slow or non-responding agent must never delay the review's own exit.
+  // The listeners below therefore report only what happens while this process is still alive.
   try {
-    const child = spawn(bin, ['agent', 'prompt', agent, text], { stdio: 'ignore' });
+    const child = spawn(bin, ['agent', 'prompt', agent, text], {
+      stdio: 'ignore',
+      detached: true,
+    });
+    child.unref();
     child.on('error', (err) => {
       warn(`could not deliver the handoff prompt to "${agent}": ${err.message}`);
     });
-    child.on('exit', (code) => {
-      if (code !== 0) {
+    child.on('exit', (code, signal) => {
+      if (signal !== null) {
+        warn(`herdr agent prompt to "${agent}" was killed by ${signal}`);
+      } else if (code !== 0) {
         warn(`herdr agent prompt to "${agent}" exited with code ${code}`);
       }
     });

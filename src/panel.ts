@@ -11,7 +11,13 @@ import picomatch from 'picomatch';
 
 import type { CouncilConfig, PanelEntry } from './config.js';
 import { isThinkingLevel, type ThinkingLevel } from './levels.js';
-import { findModel, type Catalog, type CatalogModel } from './providers.js';
+import {
+  collapsedVendorGroups,
+  findModel,
+  readyModels,
+  type Catalog,
+  type CatalogModel,
+} from './providers.js';
 import { resolveThinking, type ResolvedThinking, type ThinkingSources } from './thinking.js';
 
 export interface Reviewer {
@@ -51,19 +57,17 @@ export class GuardRefusal extends Error {
 type ParsedEntry = { provider: string; model: string; pin?: ThinkingLevel };
 
 /**
- * Splits a trailing `:level` pin off `raw` on the LAST colon. A colon that is present but whose
- * suffix is not a recognised thinking level is a parse error (rather than being silently
- * ignored), because the last-colon rule is unconditional: any entry with a colon is asserting a
- * pin. `label` is what the thrown error names — the original, untrimmed entry text.
+ * Splits a trailing `:level` pin off `raw` on the LAST colon — but only when the suffix after it
+ * is a recognised thinking level. Host model ids may themselves contain a colon (`…:free`,
+ * `…-v1:0`), so a suffix that is not a level is part of the id, not a malformed pin: it is left
+ * in `rest`, and a genuine typo (`…:hgih`) then surfaces as an unknown model naming the entry.
  */
-function splitTrailingPin(raw: string, label: string): { rest: string; pin?: ThinkingLevel } {
+function splitTrailingPin(raw: string): { rest: string; pin?: ThinkingLevel } {
   const lastColon = raw.lastIndexOf(':');
   if (lastColon === -1) return { rest: raw };
 
   const candidate = raw.slice(lastColon + 1);
-  if (!isThinkingLevel(candidate)) {
-    throw new PanelError(`could not parse panel entry: ${JSON.stringify(label)}`);
-  }
+  if (!isThinkingLevel(candidate)) return { rest: raw };
   return { rest: raw.slice(0, lastColon), pin: candidate };
 }
 
@@ -80,7 +84,7 @@ export function parsePanelEntry(entry: string): ParsedEntry {
     throw new PanelError(`could not parse panel entry: ${JSON.stringify(entry)}`);
   }
 
-  const { rest, pin } = splitTrailingPin(trimmed, entry);
+  const { rest, pin } = splitTrailingPin(trimmed);
 
   const slashIdx = rest.indexOf('/');
   if (slashIdx <= 0 || slashIdx === rest.length - 1) {
@@ -97,24 +101,41 @@ export function parsePanelEntry(entry: string): ParsedEntry {
 // -------------------------------------------------------------------------------------------
 
 /** Characters that mark an entry's `provider/modelId` portion as a glob pattern rather than a
- * literal id. Plain ids never contain these (host ids are alphanumerics plus `.`, `-`, `_`, `/`,
- * `~`), so their presence is an unambiguous signal to expand rather than look up directly. */
+ * literal id. Host ids are alphanumerics plus `.`, `-`, `_`, `/`, `~` and `:` (e.g. `…:free`) —
+ * none of these — so their presence is an unambiguous signal to expand rather than look up
+ * directly. */
 const GLOB_CHAR_RE = /[*?[\]{}]/;
 
 /**
+ * Throws a `PanelError` naming `label` unless `provider` is present in the catalog and ready —
+ * the same check for a saved config entry and a `--models` entry, so neither path can launch a
+ * reviewer whose host process could only fail to authenticate.
+ */
+function assertProviderReady(catalog: Catalog, provider: string, label: string): void {
+  const providerInfo = catalog.providers.find((p) => p.id === provider);
+  if (!providerInfo || !providerInfo.ready) {
+    const reason = providerInfo?.reason ? ` (${providerInfo.reason})` : '';
+    throw new PanelError(`${label}: provider "${provider}" is not ready${reason}`);
+  }
+}
+
+/**
  * Expands one comma-separated `--models` spec against the catalog. A literal (non-glob) entry is
- * looked up directly and must name a real catalog model, or it errors naming the offending
- * entry. A glob entry is matched against every catalog model's `provider/id`, must match at
- * least one, and every match inherits the pattern's own pin.
+ * looked up directly and must name a real catalog model of a ready provider, or it errors naming
+ * the offending entry. A glob entry is matched against every READY catalog model's
+ * `provider/id` (an unready provider's models could only fail at launch), must match at least
+ * one, and every match inherits the pattern's own pin. A spec that names no models at all
+ * (`''`, `','`) is a usage error, never an empty panel.
  */
 export function expandPanelSpec(spec: string, catalog: Catalog): ParsedEntry[] {
   const results: ParsedEntry[] = [];
+  const ready = readyModels(catalog);
 
   for (const rawEntry of spec.split(',')) {
     const entry = rawEntry.trim();
     if (entry.length === 0) continue;
 
-    const { rest, pin } = splitTrailingPin(entry, entry);
+    const { rest, pin } = splitTrailingPin(entry);
 
     if (!GLOB_CHAR_RE.test(rest)) {
       const parsed = parsePanelEntry(entry);
@@ -124,14 +145,20 @@ export function expandPanelSpec(spec: string, catalog: Catalog): ParsedEntry[] {
           `panel entry names an unknown provider or model: ${JSON.stringify(entry)}`,
         );
       }
+      assertProviderReady(catalog, parsed.provider, `panel entry ${JSON.stringify(entry)}`);
       results.push(parsed);
       continue;
     }
 
     const isMatch = picomatch(rest, { dot: true });
-    const matches = catalog.models.filter((m) => isMatch(`${m.provider}/${m.id}`));
+    const matches = ready.filter((m) => isMatch(`${m.provider}/${m.id}`));
     if (matches.length === 0) {
-      throw new PanelError(`glob pattern matched no catalog model: ${JSON.stringify(rest)}`);
+      const unready = catalog.models.some((m) => isMatch(`${m.provider}/${m.id}`));
+      throw new PanelError(
+        unready
+          ? `glob pattern matched only models of providers that are not ready: ${JSON.stringify(rest)}`
+          : `glob pattern matched no catalog model: ${JSON.stringify(rest)}`,
+      );
     }
     for (const m of matches) {
       results.push(
@@ -142,6 +169,9 @@ export function expandPanelSpec(spec: string, catalog: Catalog): ParsedEntry[] {
     }
   }
 
+  if (results.length === 0) {
+    throw new PanelError(`panel spec names no models: ${JSON.stringify(spec)}`);
+  }
   return results;
 }
 
@@ -162,29 +192,48 @@ export function expandPanelSpec(spec: string, catalog: Catalog): ParsedEntry[] {
  * just reject literal repeats.
  *
  * "Last occurrence wins" for the entry's own value mirrors `resolveThinking`'s own precedence
- * rule elsewhere in this file: when a model is named more than once with conflicting per-entry
- * pins (`foo/bar:low,foo/bar:high`), the later one is treated as a correction of the earlier one
- * — the user's final word — not as a note to silently discard. `Map#set` gives us exactly this
+ * rule (in `thinking.ts`): when a model is named more than once with conflicting per-entry pins
+ * (`foo/bar:low,foo/bar:high`), the later one is treated as a correction of the earlier one —
+ * the user's final word — not as a note to silently discard. `Map#set` gives us exactly this
  * for free: re-setting an already-present key overwrites its value but leaves its original
- * iteration position untouched, so the loop below is the entire implementation.
+ * iteration position untouched.
+ *
+ * A later occurrence that states NO level, though, is not a correction of an earlier one that
+ * does: `x/b:high,x/*` names `x/b` twice only because the glob happens to match it again, so
+ * `merge` lets the caller carry the earlier level onto the later entry instead of dropping it.
  *
  * This must run BEFORE the independence guard (`enforceIndependence`) sees the result — both
  * `resolveSpecPanel` and `resolveConfiguredPanel` call this ahead of `buildReviewer` for exactly
  * that reason, so `--models 'a,a,a'` is correctly refused as one model, not admitted as three.
  */
-function collapseDuplicates<T>(entries: readonly T[], keyOf: (entry: T) => string): T[] {
+function collapseDuplicates<T>(
+  entries: readonly T[],
+  keyOf: (entry: T) => string,
+  merge: (earlier: T, later: T) => T,
+): T[] {
   const byKey = new Map<string, T>();
   for (const entry of entries) {
-    byKey.set(keyOf(entry), entry);
+    const key = keyOf(entry);
+    const earlier = byKey.get(key);
+    byKey.set(key, earlier === undefined ? entry : merge(earlier, entry));
   }
   return Array.from(byKey.values());
+}
+
+/** Later entry wins, except that a later entry with no level keeps the earlier one's level. */
+function keepEarlierLevel<T, K extends keyof T>(field: K): (earlier: T, later: T) => T {
+  return (earlier, later) =>
+    later[field] === undefined && earlier[field] !== undefined
+      ? { ...later, [field]: earlier[field] }
+      : later;
 }
 
 // -------------------------------------------------------------------------------------------
 // Reviewer assembly
 // -------------------------------------------------------------------------------------------
 
-function buildReviewer(model: CatalogModel, sources: ThinkingSources): Reviewer {
+/** Assembles one reviewer from its catalog model and the thinking-level sources that apply. */
+export function buildReviewer(model: CatalogModel, sources: ThinkingSources): Reviewer {
   return {
     provider: model.provider,
     model: model.id,
@@ -208,7 +257,11 @@ export function resolveConfiguredPanel(
   cfg: CouncilConfig,
   cliPanelWide?: ThinkingLevel,
 ): Reviewer[] {
-  const deduped = collapseDuplicates(panel, (entry) => `${entry.provider}/${entry.model}`);
+  const deduped = collapseDuplicates(
+    panel,
+    (entry) => `${entry.provider}/${entry.model}`,
+    keepEarlierLevel<PanelEntry, 'thinking'>('thinking'),
+  );
   return deduped.map((entry) => {
     const model = findModel(catalog, entry.provider, entry.model);
     if (!model) {
@@ -218,14 +271,11 @@ export function resolveConfiguredPanel(
       );
     }
 
-    const providerInfo = catalog.providers.find((p) => p.id === entry.provider);
-    if (!providerInfo || !providerInfo.ready) {
-      const reason = providerInfo?.reason ? ` (${providerInfo.reason})` : '';
-      throw new PanelError(
-        `configured panel entry's provider "${entry.provider}" is not ready${reason}: ` +
-          `${entry.provider}/${entry.model}`,
-      );
-    }
+    assertProviderReady(
+      catalog,
+      entry.provider,
+      `configured panel entry ${entry.provider}/${entry.model}`,
+    );
 
     const key = `${entry.provider}/${entry.model}`;
     return buildReviewer(model, {
@@ -237,7 +287,8 @@ export function resolveConfiguredPanel(
 }
 
 /** Resolves a `--models` command-line spec into reviewers. Each entry's own `:level` pin, if
- * any, is that model's CLI pin — the most specific source in the precedence chain. */
+ * any, is that model's CLI pin — the most specific source in the precedence chain. Every entry
+ * must name a ready provider's model (see `expandPanelSpec`), as a configured panel must. */
 export function resolveSpecPanel(
   spec: string,
   catalog: Catalog,
@@ -245,7 +296,11 @@ export function resolveSpecPanel(
   cliPanelWide?: ThinkingLevel,
 ): Reviewer[] {
   const expanded = expandPanelSpec(spec, catalog);
-  const deduped = collapseDuplicates(expanded, (entry) => `${entry.provider}/${entry.model}`);
+  const deduped = collapseDuplicates(
+    expanded,
+    (entry) => `${entry.provider}/${entry.model}`,
+    keepEarlierLevel<ParsedEntry, 'pin'>('pin'),
+  );
   return deduped.map((entry) => {
     const model = findModel(catalog, entry.provider, entry.model);
     if (!model) {
@@ -297,16 +352,9 @@ export interface GuardResult {
 export function checkIndependence(
   reviewers: readonly { provider: string; model: string; vendor: string }[],
 ): GuardResult {
-  const vendors = new Map<string, string[]>();
-  for (const r of reviewers) {
-    const key = `${r.provider}/${r.model}`;
-    const existing = vendors.get(r.vendor);
-    if (existing) {
-      existing.push(key);
-    } else {
-      vendors.set(r.vendor, [key]);
-    }
-  }
+  const vendors = collapsedVendorGroups(
+    reviewers.map((r) => ({ provider: r.provider, id: r.model, vendor: r.vendor })),
+  );
 
   if (reviewers.length < MIN_MODELS) {
     return {
@@ -339,14 +387,20 @@ export function formatVendorGrouping(vendors: ReadonlyMap<string, string[]>): st
 
 /**
  * Enforces the independence guard. Throws `GuardRefusal` (exit code 4) when the panel fails the
- * guard and `allowCorrelated` is false. Stateless and cheap to call twice — at the end of
- * selection and again immediately before launch — which is how a panel that reached
- * configuration by hand-editing (never passing through the picker) still gets checked.
+ * guard and `allowCorrelated` is false. An empty panel is refused with `PanelError` (exit code 2)
+ * whatever the flags: `--allow-correlated` waives independence, not the need for a reviewer, and
+ * a run that launches nobody must never exit 0 as though it had reviewed something. Stateless
+ * and cheap to call twice — at the end of selection and again immediately before launch — which
+ * is how a panel that reached configuration by hand-editing (never passing through the picker)
+ * still gets checked.
  */
 export function enforceIndependence(
   reviewers: readonly Reviewer[],
   allowCorrelated: boolean,
 ): void {
+  if (reviewers.length === 0) {
+    throw new PanelError('panel holds no models; at least one reviewer is required');
+  }
   const result = checkIndependence(reviewers);
   if (!result.ok && !allowCorrelated) {
     throw new GuardRefusal(result.reason ?? 'panel failed the independence guard', result.vendors);

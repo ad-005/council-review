@@ -207,8 +207,17 @@ describe('parsePanelEntry', () => {
     }
   });
 
-  it('errors when the trailing colon suffix is not a recognised thinking level', () => {
-    expect(() => parsePanelEntry('minimax/MiniMax-M2.7:not-a-level')).toThrow(PanelError);
+  it('keeps a colon suffix that is not a thinking level as part of the model id', () => {
+    // Host ids may carry a colon of their own (`…:free`, `…-v1:0`); only a real level is a pin.
+    expect(parsePanelEntry('openrouter/qwen/qwen3-coder:free')).toEqual({
+      provider: 'openrouter',
+      model: 'qwen/qwen3-coder:free',
+    });
+    expect(parsePanelEntry('bedrock/anthropic.claude-v1:0:high')).toEqual({
+      provider: 'bedrock',
+      model: 'anthropic.claude-v1:0',
+      pin: 'high',
+    });
   });
 
   it('errors on an empty entry', () => {
@@ -284,6 +293,56 @@ describe('expandPanelSpec', () => {
   it('ignores blank entries produced by stray commas', () => {
     const expanded = expandPanelSpec('minimax/MiniMax-M2.7,,openai-codex/gpt-5.4', CATALOG);
     expect(expanded).toHaveLength(2);
+  });
+
+  it.each(['', ',', ' , ,'])('errors (exit 2) on a spec that names no models: %j', (spec) => {
+    try {
+      expandPanelSpec(spec, CATALOG);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(PanelError);
+      expect((err as PanelError).exitCode).toBe(2);
+    }
+  });
+
+  it('resolves a literal id that itself contains a colon, with or without a pin', () => {
+    const FREE = model({ id: 'qwen/qwen3-coder:free', provider: 'openrouter', vendor: 'qwen' });
+    const catalog = makeCatalog({ models: [...ALL_MODELS, FREE] });
+    expect(expandPanelSpec('openrouter/qwen/qwen3-coder:free', catalog)).toEqual([
+      { provider: 'openrouter', model: 'qwen/qwen3-coder:free' },
+    ]);
+    expect(expandPanelSpec('openrouter/qwen/qwen3-coder:free:low', catalog)).toEqual([
+      { provider: 'openrouter', model: 'qwen/qwen3-coder:free', pin: 'low' },
+    ]);
+  });
+
+  it('a mistyped pin surfaces as an unknown model naming the entry', () => {
+    expect(() => expandPanelSpec('minimax/MiniMax-M2.7:hgih', CATALOG)).toThrow(
+      /unknown provider or model.*MiniMax-M2\.7:hgih/,
+    );
+  });
+
+  it('refuses a literal entry whose provider is not ready, naming it', () => {
+    const catalog = makeCatalog({ unreadyProvider: 'minimax' });
+    try {
+      expandPanelSpec('minimax/MiniMax-M2.7', catalog);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(PanelError);
+      expect((err as PanelError).exitCode).toBe(2);
+      expect((err as Error).message).toContain('minimax/MiniMax-M2.7');
+      expect((err as Error).message).toContain('not ready');
+    }
+  });
+
+  it('expands a glob against ready providers only', () => {
+    const catalog = makeCatalog({ unreadyProvider: 'opencode-go' });
+    expect(expandPanelSpec('*/*', catalog).map((e) => e.provider)).not.toContain('opencode-go');
+  });
+
+  it('errors when a glob matches only models of unready providers', () => {
+    const catalog = makeCatalog({ unreadyProvider: 'opencode-go' });
+    expect(() => expandPanelSpec('opencode-go/*', catalog)).toThrow(/not ready/);
   });
 });
 
@@ -381,6 +440,22 @@ describe('resolveSpecPanel', () => {
   it('propagates a glob expansion error as a PanelError', () => {
     expect(() => resolveSpecPanel('nowhere/*', CATALOG, BASE_CONFIG)).toThrow(PanelError);
   });
+
+  it('refuses an empty spec with PanelError rather than resolving an empty panel', () => {
+    expect(() => resolveSpecPanel('', CATALOG, BASE_CONFIG)).toThrow(PanelError);
+    expect(() => resolveSpecPanel(',', CATALOG, BASE_CONFIG)).toThrow(PanelError);
+  });
+
+  it('refuses a literal entry of an unready provider, as a configured panel does', () => {
+    const catalog = makeCatalog({ unreadyProvider: 'minimax' });
+    expect(() =>
+      resolveSpecPanel(
+        'minimax/MiniMax-M2.7,opencode-go/glm-5.2,openai-codex/gpt-5.4',
+        catalog,
+        BASE_CONFIG,
+      ),
+    ).toThrow(PanelError);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -445,6 +520,19 @@ describe('resolveSpecPanel duplicate collapsing', () => {
     expect(reviewers.find((r) => r.model === 'MiniMax-M2.7')?.thinking.requested).toBe('high');
   });
 
+  it('keeps an explicit pin when a later, pinless glob matches the same model again', () => {
+    const reviewers = resolveSpecPanel(
+      'opencode-go/glm-5.2:high,opencode-go/*',
+      CATALOG,
+      BASE_CONFIG,
+    );
+    expect(reviewers.map((r) => `${r.provider}/${r.model}`)).toEqual([
+      'opencode-go/glm-5.2',
+      'opencode-go/kimi-k2.6',
+    ]);
+    expect(reviewers.find((r) => r.model === 'glm-5.2')?.thinking.requested).toBe('high');
+  });
+
   it('a spec naming the same model three times collapses to a single-model panel, refused by the guard', () => {
     // This is the "de-duplication must happen BEFORE the guard" requirement: --models 'a,a,a'
     // must be refused as ONE model (too few models), not silently pass as three.
@@ -489,6 +577,16 @@ describe('resolveConfiguredPanel duplicate collapsing', () => {
     const reviewers = resolveConfiguredPanel(panel, CATALOG, BASE_CONFIG);
     expect(reviewers).toHaveLength(2);
     expect(reviewers.find((r) => r.model === 'MiniMax-M2.7')?.thinking.requested).toBe('high');
+  });
+
+  it('a later duplicate with no saved thinking level keeps the earlier one', () => {
+    const panel: PanelEntry[] = [
+      { provider: 'minimax', model: 'MiniMax-M2.7', thinking: 'low' },
+      { provider: 'minimax', model: 'MiniMax-M2.7' },
+    ];
+    const reviewers = resolveConfiguredPanel(panel, CATALOG, BASE_CONFIG);
+    expect(reviewers).toHaveLength(1);
+    expect(reviewers[0]?.thinking.requested).toBe('low');
   });
 });
 
@@ -575,6 +673,18 @@ describe('enforceIndependence', () => {
 
     const tooFewVendors = [CLAUDE_HAIKU, CLAUDE_FABLE, GPT].map(reviewerFrom);
     expect(() => enforceIndependence(tooFewVendors, true)).not.toThrow();
+  });
+
+  it('refuses an empty panel with PanelError (exit 2), even with the correlated-panel override', () => {
+    for (const allowCorrelated of [false, true]) {
+      try {
+        enforceIndependence([], allowCorrelated);
+        expect.unreachable();
+      } catch (err) {
+        expect(err).toBeInstanceOf(PanelError);
+        expect((err as PanelError).exitCode).toBe(2);
+      }
+    }
   });
 
   it('is safe to call twice — end of selection and again before launch — with identical results', () => {

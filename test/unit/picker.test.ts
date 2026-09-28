@@ -4,8 +4,10 @@ import { describe, expect, it } from 'vitest';
 import type { Catalog, CatalogModel, ProviderInfo } from '../../src/providers.js';
 import type { ThinkingLevel } from '../../src/levels.js';
 import {
-  PickerCancelled,
+  PickerInterrupted,
+  PickerNoReadyProviders,
   PickerNonInteractive,
+  defaultPickerIO,
   THINKING_BACK_VALUE,
   buildModelRows,
   buildThinkingChoices,
@@ -506,8 +508,10 @@ describe('pickPanel — model stage rendering', () => {
   }, 10_000);
 });
 
-describe('pickPanel — cancellation', () => {
-  it('cancelling at the provider stage throws PickerCancelled(exitCode 2) and resolves nothing', async () => {
+// Ctrl+C is an interrupt, so it exits 130 like every other interrupt (README's exit-code table),
+// not 2. `PickerCancelled` (2) remains for a prompt closed out from under the user by anything else.
+describe('pickPanel — interruption', () => {
+  it('Ctrl+C at the provider stage throws PickerInterrupted(exitCode 130) and resolves nothing', async () => {
     const catalog = catalogOf([MINIMAX]);
     const term = new ScriptedTerminal();
 
@@ -520,10 +524,10 @@ describe('pickPanel — cancellation', () => {
     await term.waitFor('Select providers');
     term.send(CTRL_C);
 
-    await expect(resultPromise).rejects.toBeInstanceOf(PickerCancelled);
+    await expect(resultPromise).rejects.toBeInstanceOf(PickerInterrupted);
   }, 10_000);
 
-  it('cancelling at the model stage throws PickerCancelled(exitCode 2)', async () => {
+  it('Ctrl+C at the model stage throws PickerInterrupted(exitCode 130)', async () => {
     const catalog = catalogOf([MINIMAX]);
     const term = new ScriptedTerminal();
 
@@ -543,12 +547,12 @@ describe('pickPanel — cancellation', () => {
       await resultPromise;
       expect.unreachable();
     } catch (err) {
-      expect(err).toBeInstanceOf(PickerCancelled);
-      expect((err as PickerCancelled).exitCode).toBe(2);
+      expect(err).toBeInstanceOf(PickerInterrupted);
+      expect((err as PickerInterrupted).exitCode).toBe(130);
     }
   }, 10_000);
 
-  it('cancelling at the thinking stage throws PickerCancelled(exitCode 2)', async () => {
+  it('Ctrl+C at the thinking stage throws PickerInterrupted(exitCode 130)', async () => {
     const catalog = catalogOf([MINIMAX]);
     const term = new ScriptedTerminal();
 
@@ -565,8 +569,60 @@ describe('pickPanel — cancellation', () => {
     await term.waitFor('Thinking level for minimax/MiniMax-M2.7');
     term.send(CTRL_C);
 
-    await expect(resultPromise).rejects.toBeInstanceOf(PickerCancelled);
+    await expect(resultPromise).rejects.toBeInstanceOf(PickerInterrupted);
+    // The keypress listener used to tell Ctrl+C apart is removed again afterwards.
+    expect(term.input.listenerCount('keypress')).toBe(0);
   }, 10_000);
+});
+
+describe('pickPanel — no ready providers', () => {
+  it('refuses with exit code 2 before any prompt renders', async () => {
+    const base = catalogOf([MINIMAX]);
+    const catalog: Catalog = {
+      ...base,
+      providers: base.providers.map((p) => ({ ...p, ready: false, reason: 'not_configured' })),
+    };
+    const term = new ScriptedTerminal();
+
+    const result = pickPanel(catalog, { input: term.input, output: term.output, isTTY: true });
+
+    await expect(result).rejects.toBeInstanceOf(PickerNoReadyProviders);
+    await expect(
+      pickPanel(catalog, { input: term.input, output: term.output, isTTY: true }),
+    ).rejects.toMatchObject({ exitCode: 2, message: expect.stringContaining('pi') });
+    expect(term.buffer).toBe('');
+  });
+});
+
+describe('defaultPickerIO', () => {
+  function withStdinTTY<T>(isTTY: boolean | undefined, fn: () => T): T {
+    const saved = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+    Object.defineProperty(process.stdin, 'isTTY', { value: isTTY, configurable: true });
+    try {
+      return fn();
+    } finally {
+      if (saved) Object.defineProperty(process.stdin, 'isTTY', saved);
+      else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    }
+  }
+
+  function fakeOutput(isTTY: boolean): NodeJS.WriteStream {
+    const stream = new PassThrough() as unknown as NodeJS.WriteStream;
+    Object.defineProperty(stream, 'isTTY', { value: isTTY, configurable: true });
+    return stream;
+  }
+
+  it('renders to the stream it is given (e.g. stderr, keeping --json stdout clean)', () => {
+    const out = fakeOutput(true);
+    expect(defaultPickerIO(out).output).toBe(out);
+    expect(defaultPickerIO().output).toBe(process.stdout);
+  });
+
+  it('is interactive only when both stdin and the output stream are terminals', () => {
+    expect(withStdinTTY(true, () => defaultPickerIO(fakeOutput(true)).isTTY)).toBe(true);
+    expect(withStdinTTY(true, () => defaultPickerIO(fakeOutput(false)).isTTY)).toBe(false);
+    expect(withStdinTTY(undefined, () => defaultPickerIO(fakeOutput(true)).isTTY)).toBe(false);
+  });
 });
 
 describe('buildThinkingChoices — back choice', () => {
