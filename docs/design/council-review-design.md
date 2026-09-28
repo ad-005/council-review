@@ -110,9 +110,9 @@ follows the scope. Three builders, one selected per run:
 
 | Scope | Snapshot source |
 |---|---|
-| default (worktree work) | copy of `git ls-files --cached --others --exclude-standard -z` |
-| `--staged` | `git checkout-index -a --prefix=<snap>/` — the index exactly |
-| `--range A..B`, `--rev` | `git archive <B> \| tar -x -C <snap>` |
+| default (worktree work) | copy of `git ls-files --cached --others --exclude-standard -z`; skips deleted paths, directories (submodules, embedded repos) and paths beyond a symlinked directory |
+| `--staged` | stage-0 blobs from `git ls-files -s -z`, read by sha via one `git cat-file --batch` — the index exactly; gitlinks skipped |
+| `--range A..B`, `--rev` | blobs from `git ls-tree -r -z <B>`, read by sha via one `git cat-file --batch`; gitlinks skipped |
 
 Reviewing a historical range against the current worktree would show reviewers
 code that has since moved, so this mapping is a correctness requirement, not a
