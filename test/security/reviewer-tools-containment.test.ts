@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  MAX_TOOL_OUTPUT_CHARS,
   councilGrepTool,
   councilListTool,
   councilReadTool,
@@ -289,6 +290,22 @@ describe('council_list containment', () => {
     expect(result.content[0]?.text).toContain('inside.txt');
   });
 
+  it('reports truncated only when an entry was actually left out', () => {
+    // The root holds exactly four entries: inside.txt, subdir, escaping-symlink.txt and
+    // escaping-dir.
+    const all = listInRoot(fx.snapshotRoot, {});
+    expect(all.entries).toHaveLength(4);
+    expect(listInRoot(fx.snapshotRoot, { maxEntries: 4 }).truncated).toBe(false);
+    expect(listInRoot(fx.snapshotRoot, { maxEntries: 3 }).truncated).toBe(true);
+
+    // Recursive: the four root entries plus subdir/nested.txt.
+    expect(listInRoot(fx.snapshotRoot, { recursive: true }).entries).toHaveLength(5);
+    expect(listInRoot(fx.snapshotRoot, { recursive: true, maxEntries: 5 }).truncated).toBe(false);
+    const cut = listInRoot(fx.snapshotRoot, { recursive: true, maxEntries: 4 });
+    expect(cut.entries).toHaveLength(4);
+    expect(cut.truncated).toBe(true);
+  });
+
   it('never follows a symlinked subdirectory during a recursive listing', () => {
     const outcome = listInRoot(fx.snapshotRoot, { recursive: true });
     const names = outcome.entries.map((e) => e.path);
@@ -296,5 +313,143 @@ describe('council_list containment', () => {
     // presence), but nothing beneath it is descended into.
     expect(names).toContain('escaping-dir');
     expect(names.some((n) => n.startsWith('escaping-dir/'))).toBe(false);
+  });
+});
+
+describe('snapshot tools: line numbering, bounded work and bounded output', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'council-review-bounds-'));
+    process.env.COUNCIL_SNAPSHOT_ROOT = root;
+  });
+  afterEach(() => {
+    delete process.env.COUNCIL_SNAPSHOT_ROOT;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a trailing newline does not add a phantom last line', () => {
+    writeFileSync(join(root, 'two.txt'), 'a\nb\n');
+    const outcome = readInRoot(root, { path: 'two.txt' });
+    expect(outcome.totalLines).toBe(2);
+    expect(outcome.content).toBe('a\nb');
+    writeFileSync(join(root, 'crlf.txt'), 'a\r\nb\r\n');
+    expect(readInRoot(root, { path: 'crlf.txt' }).totalLines).toBe(2);
+    writeFileSync(join(root, 'unterminated.txt'), 'a\nb');
+    expect(readInRoot(root, { path: 'unterminated.txt' }).totalLines).toBe(2);
+  });
+
+  it('a lone carriage return is not a line break, matching git', () => {
+    writeFileSync(join(root, 'cr.txt'), 'one\rstill one\ntarget\n');
+    expect(readInRoot(root, { path: 'cr.txt' }).totalLines).toBe(2);
+    const outcome = grepInRoot(root, { pattern: 'target' });
+    expect(outcome.matches).toEqual([{ path: 'cr.txt', line: 2, text: 'target' }]);
+  });
+
+  it('stops a catastrophically backtracking pattern at the deadline instead of hanging', () => {
+    writeFileSync(join(root, 'redos.txt'), `${'a'.repeat(35)}!\n`);
+    const started = Date.now();
+    expect(() => grepInRoot(root, { pattern: '^(a+)+$' }, { timeoutMs: 200 })).toThrow(
+      /too expensive/,
+    );
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // The host process is still usable afterwards.
+    expect(grepInRoot(root, { pattern: 'a!' }).matches).toHaveLength(1);
+  });
+
+  it('marks a search that hit the file limit instead of silently reporting no matches', async () => {
+    mkdirSync(join(root, 'many'));
+    for (let i = 0; i < 5001; i++) {
+      writeFileSync(join(root, 'many', `f${String(i).padStart(5, '0')}.txt`), 'nothing\n');
+    }
+    // Sorts after every file under many/, so it is beyond the file limit.
+    writeFileSync(join(root, 'zzz-needle.txt'), 'needle\n');
+    const outcome = grepInRoot(root, { pattern: 'needle' });
+    expect(outcome.matches).toHaveLength(0);
+    expect(outcome.filesScanned).toBe(5000);
+    expect(outcome.fileLimitReached).toBe(true);
+    const result = await councilGrepTool.execute(
+      'id',
+      { pattern: 'needle' },
+      undefined,
+      undefined,
+      {},
+    );
+    expect(result.content[0]?.text).toMatch(/file limit reached/);
+    expect(result.content[0]?.text).toMatch(/narrow path/);
+
+    const narrowed = grepInRoot(root, { pattern: 'needle', path: 'zzz-needle.txt' });
+    expect(narrowed.fileLimitReached).toBe(false);
+    expect(narrowed.matches).toHaveLength(1);
+  });
+
+  it('does not mark the file limit when the tree fits within it', () => {
+    writeFileSync(join(root, 'one.txt'), 'needle\n');
+    expect(grepInRoot(root, { pattern: 'needle' }).fileLimitReached).toBe(false);
+  });
+
+  it('clips a long matching line (e.g. a minified bundle) to a short excerpt', () => {
+    writeFileSync(join(root, 'bundle.min.js'), `needle${'x'.repeat(1_000_000)}\n`);
+    const outcome = grepInRoot(root, { pattern: 'needle' });
+    expect(outcome.matches).toHaveLength(1);
+    const text = outcome.matches[0]?.text ?? '';
+    expect(text.length).toBeLessThan(400);
+    expect(text.startsWith('needle')).toBe(true);
+    expect(text).toMatch(/1000006 characters/);
+  });
+
+  it('bounds council_grep output with a truncation marker', async () => {
+    const line = `needle ${'z'.repeat(290)}\n`;
+    writeFileSync(join(root, 'wide.txt'), line.repeat(1000));
+    const result = await councilGrepTool.execute(
+      'id',
+      { pattern: 'needle', maxResults: 1000 },
+      undefined,
+      undefined,
+      {},
+    );
+    const text = result.content[0]?.text ?? '';
+    expect(text.length).toBeLessThan(MAX_TOOL_OUTPUT_CHARS + 500);
+    expect(text).toMatch(/\[output truncated: \d+ characters total/);
+  });
+
+  it('bounds council_read output and says where to continue', async () => {
+    const line = `${'r'.repeat(99)}\n`;
+    writeFileSync(join(root, 'long.txt'), line.repeat(3000));
+    const outcome = readInRoot(root, { path: 'long.txt' });
+    expect(outcome.truncated).toBe(true);
+    expect(outcome.content.length).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_CHARS);
+    const result = await councilReadTool.execute(
+      'id',
+      { path: 'long.txt' },
+      undefined,
+      undefined,
+      {},
+    );
+    const text = result.content[0]?.text ?? '';
+    expect(text.length).toBeLessThan(MAX_TOOL_OUTPUT_CHARS + 500);
+    expect(text).toContain(`lines 1-${outcome.endLine} of 3000`);
+    expect(text).toContain(`startLine=${outcome.endLine + 1}`);
+
+    const rest = readInRoot(root, { path: 'long.txt', startLine: outcome.endLine + 1 });
+    expect(rest.startLine).toBe(outcome.endLine + 1);
+  });
+
+  it('bounds council_read output even for a single enormous line', async () => {
+    writeFileSync(join(root, 'one-line.min.js'), 'q'.repeat(1_000_000));
+    const result = await councilReadTool.execute(
+      'id',
+      { path: 'one-line.min.js' },
+      undefined,
+      undefined,
+      {},
+    );
+    const text = result.content[0]?.text ?? '';
+    expect(text.length).toBeLessThan(MAX_TOOL_OUTPUT_CHARS + 500);
+    expect(text).toMatch(/truncated/);
+  });
+
+  it('a read that fits is not marked truncated', () => {
+    writeFileSync(join(root, 'small.txt'), 'x\ny\n');
+    expect(readInRoot(root, { path: 'small.txt' }).truncated).toBe(false);
   });
 });

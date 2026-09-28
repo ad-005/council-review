@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   CODEGRAPH_FALLBACK_MESSAGE,
   CODEGRAPH_SUBCOMMANDS,
+  MAX_TOOL_OUTPUT_CHARS,
   buildCodegraphArgv,
   getCodegraphBin,
   runCodegraph,
@@ -475,6 +476,26 @@ describe('runCodegraph against stub binaries', () => {
     expect(output).toContain('150000');
     expect(output).toMatch(/truncat/i);
     expect(output).toMatch(/narrow the query/i);
+  });
+
+  it('truncates output beyond the exec buffer instead of failing with ENOBUFS', () => {
+    const root = makeSnapshot(true);
+    process.env.COUNCIL_CODEGRAPH_BIN = writeStub("head -c 3000000 /dev/zero | tr '\\0' 'B'");
+    const output = runCodegraph(root, { subcommand: 'query', query: 'foo' });
+    expect(output.length).toBeLessThan(MAX_TOOL_OUTPUT_CHARS + 500);
+    expect(output).toMatch(/\[output truncated: more than \d+ characters/);
+    expect(output).toMatch(/narrow the query/i);
+  });
+
+  it('omits numeric flags the reviewer did not set, leaving the binary its own defaults', () => {
+    const root = makeSnapshot(false);
+    expect(buildCodegraphArgv(root, { subcommand: 'query', query: 'q' })).toEqual([
+      'query',
+      '-p',
+      root,
+      'q',
+    ]);
+    expect(buildCodegraphArgv(root, { subcommand: 'affected' })).toEqual(['affected', '-p', root]);
   });
 
   it('wraps a failing binary with the stderr-first message', () => {
