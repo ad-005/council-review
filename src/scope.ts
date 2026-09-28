@@ -21,6 +21,7 @@ import { delimiter, isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import picomatch from 'picomatch';
 import { reviewsDirPath } from './report.js';
+import { CHILD_MAX_BUFFER, childErrorMessage } from './child-output.js';
 
 export type ScopeMode = 'worktree' | 'staged' | 'range' | 'revision';
 
@@ -56,9 +57,6 @@ export class ScopeError extends Error {
 }
 
 const execFileAsync = promisify(execFile);
-
-// Diffs on a large default scope must not be silently truncated by Node's default 1MB buffer.
-const GIT_MAX_BUFFER = 1024 * 1024 * 256;
 
 // The canonical empty-tree object, used as the "parent" of a root commit so a single-revision
 // scope on a repository's first commit still produces a literal `git diff` (a full-file-addition
@@ -380,9 +378,12 @@ async function resolveMergeBase(
 }
 
 async function listUntrackedNotIgnored(repoRoot: string): Promise<string[]> {
+  // An entry ending in `/` is an untracked embedded repository, which git lists as one directory
+  // rather than descending into: none of its content belongs to this repository's change (the
+  // snapshot skips it too), and `add --intent-to-add` refuses one with no commit checked out.
   return splitNul(
     await runGit(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot }),
-  );
+  ).filter((f) => !f.endsWith('/'));
 }
 
 /** Paths changed between the given endpoints (`revArgs` as `git diff` takes them), with each
@@ -560,7 +561,7 @@ async function runGit(
     const pending = execFileAsync('git', [...GIT_GLOBAL_ARGS, ...args], {
       cwd: opts.cwd,
       env: opts.env,
-      maxBuffer: GIT_MAX_BUFFER,
+      maxBuffer: CHILD_MAX_BUFFER,
     });
     // stdin is always closed, so no git command can ever wait on it. A write error (git exited
     // before reading its input) surfaces as the command's own failure below.
@@ -569,7 +570,7 @@ async function runGit(
     const { stdout } = await pending;
     return stdout;
   } catch (err) {
-    throw new ScopeError(`git ${describeArgs(args)} failed: ${errorMessage(err)}`);
+    throw new ScopeError(`git ${describeArgs(args)} failed: ${childErrorMessage(err)}`);
   }
 }
 
@@ -577,14 +578,4 @@ async function runGit(
 function describeArgs(args: readonly string[]): string {
   const text = args.join(' ');
   return text.length > 300 ? `${text.slice(0, 300)}...` : text;
-}
-
-function errorMessage(err: unknown): string {
-  if (err && typeof err === 'object') {
-    const stderr = (err as { stderr?: unknown }).stderr;
-    if (typeof stderr === 'string' && stderr.trim().length > 0) {
-      return stderr.trim();
-    }
-  }
-  return err instanceof Error ? err.message : String(err);
 }

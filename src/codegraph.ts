@@ -12,6 +12,7 @@ import { execFile } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { CHILD_MAX_BUFFER, isEnoent } from './child-output.js';
 
 /** Index layout the real binary produces inside the indexed root: `<root>/.codegraph/codegraph.db`.
  *  The reviewer-side gate in `reviewer-tools.ts` probes this same path (it cannot import this
@@ -35,10 +36,6 @@ export interface CodegraphIndexStatus {
 
 const execFileAsync = promisify(execFile);
 
-// Same generous buffer as snapshot.ts's GIT_MAX_BUFFER: index output must never be
-// truncated by Node's default 1MB buffer.
-const INDEX_MAX_BUFFER = 1024 * 1024 * 256;
-
 const DEFAULT_TIMEOUT_SECONDS = 300;
 
 /**
@@ -54,7 +51,7 @@ export interface EnsureSnapshotIndexOptions {
   bin?: string;
   enabled?: boolean;
   timeoutSeconds?: number;
-  /** Output cap before the indexer is killed (default `INDEX_MAX_BUFFER`); a test seam only. */
+  /** Output cap before the indexer is killed (default `CHILD_MAX_BUFFER`); a test seam only. */
   maxBufferBytes?: number;
 }
 
@@ -81,7 +78,7 @@ export async function ensureSnapshotIndex(
   try {
     await execFileAsync(bin, ['init', snapshotRoot], {
       timeout: timeoutSeconds * 1000,
-      maxBuffer: opts.maxBufferBytes ?? INDEX_MAX_BUFFER,
+      maxBuffer: opts.maxBufferBytes ?? CHILD_MAX_BUFFER,
       // SIGKILL, not the default SIGTERM: a timed-out indexer must actually be dead before
       // the caller freezes the tree and reviewers start querying it -- a child that ignores
       // SIGTERM (or one whose workers outlive it) would otherwise keep mutating the index
@@ -111,10 +108,6 @@ function hasIndexArtifact(snapshotRoot: string): boolean {
   } catch {
     return false;
   }
-}
-
-function isEnoent(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT';
 }
 
 /** `killed` is also set when Node kills a child for overflowing `maxBuffer`; that is an index

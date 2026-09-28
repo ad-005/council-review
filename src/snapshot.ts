@@ -56,6 +56,7 @@ import {
   resolveCodegraphBin,
   type CodegraphIndexStatus,
 } from './codegraph.js';
+import { CHILD_MAX_BUFFER, childErrorMessage, isEnoent } from './child-output.js';
 
 export interface SnapshotIdentity {
   head: string;
@@ -107,10 +108,6 @@ function resolveScratchDir(scratchDir: string | undefined): string {
 const LIVENESS_MARKER = '.council-run.pid';
 
 const execFileAsync = promisify(execFile);
-
-// A whole-tree listing (`ls-files` / `ls-tree`) must not be truncated by Node's default 1MB
-// buffer. Blob content never goes through this limit: it is streamed (see `readBlobs`).
-const GIT_MAX_BUFFER = 1024 * 1024 * 256;
 
 // ---------------------------------------------------------------------------------------------
 // Process-wide registry: cleanup on normal exit and on a terminating signal is a safety net on
@@ -276,7 +273,7 @@ export async function buildSnapshot(
     // Abort-before-launch: whatever was built (or half-built) must not survive a failed build.
     forceRemove(root);
     if (err instanceof SnapshotError) throw err;
-    throw new SnapshotError(`failed to build snapshot: ${errorMessage(err)}`);
+    throw new SnapshotError(`failed to build snapshot: ${childErrorMessage(err)}`);
   }
 }
 
@@ -658,11 +655,12 @@ async function runGit(repoRoot: string, args: string[]): Promise<string> {
   try {
     const { stdout } = await execFileAsync('git', args, {
       cwd: repoRoot,
-      maxBuffer: GIT_MAX_BUFFER,
+      // Whole-tree listings only: blob content is streamed (see `readBlobs`).
+      maxBuffer: CHILD_MAX_BUFFER,
     });
     return stdout;
   } catch (err) {
-    throw new SnapshotError(`git ${args.join(' ')} failed: ${errorMessage(err)}`);
+    throw new SnapshotError(`git ${args.join(' ')} failed: ${childErrorMessage(err)}`);
   }
 }
 
@@ -758,21 +756,4 @@ function readBlobs(
 
     child.stdin.end(`${shas.join('\n')}\n`);
   });
-}
-
-function isEnoent(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT';
-}
-
-function errorMessage(err: unknown): string {
-  if (err && typeof err === 'object') {
-    const stderr = (err as { stderr?: unknown }).stderr;
-    if (typeof stderr === 'string' && stderr.trim().length > 0) {
-      return stderr.trim();
-    }
-    if (Buffer.isBuffer(stderr) && stderr.length > 0) {
-      return stderr.toString('utf8').trim();
-    }
-  }
-  return err instanceof Error ? err.message : String(err);
 }

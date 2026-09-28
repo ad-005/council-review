@@ -27,6 +27,7 @@ import { promisify } from 'node:util';
 import { resolveCodegraphBin } from './codegraph.js';
 import { BLAST_RADIUS_DEFAULTS } from './config.js';
 import type { ResolvedScope } from './scope.js';
+import { CHILD_MAX_BUFFER } from './child-output.js';
 
 // -------------------------------------------------------------------------------------------
 // Caps and defaults (`codegraph.blastRadius` config in `src/config.ts` is the source of
@@ -63,10 +64,6 @@ export const BLAST_RADIUS_QUERY_TIMEOUT_MS = 60_000;
 
 /** Maximum concurrent `codegraph` subprocesses. */
 export const BLAST_RADIUS_CONCURRENCY = 4;
-
-// Same generous buffer as `codegraph.ts`: query output must never be truncated by Node's
-// default 1MB buffer (a truncated JSON payload would misreport as `parse-failed`).
-const QUERY_MAX_BUFFER = 1024 * 1024 * 256;
 
 // -------------------------------------------------------------------------------------------
 // Small deterministic helpers
@@ -956,7 +953,8 @@ async function runBlastQuery(
     const { stdout } = await execFileAsync(bin, argv, {
       cwd: snapshotRoot,
       timeout: timeoutMs,
-      maxBuffer: QUERY_MAX_BUFFER,
+      // A truncated JSON payload would misreport as `parse-failed`.
+      maxBuffer: CHILD_MAX_BUFFER,
       // Mirror `codegraph.ts`: a timed-out query must actually be dead before the next
       // query reuses the index.
       killSignal: 'SIGKILL',

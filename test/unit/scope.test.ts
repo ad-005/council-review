@@ -127,6 +127,18 @@ describe('scope', () => {
       expect(scope.files).not.toContain('node_modules/dep/index.js');
     });
 
+    it('leaves an untracked embedded repository out, even one with no commit checked out', async () => {
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+      repo.writeFile('base.txt', 'changed\n');
+      repo.writeFile('nested/inner.txt', 'belongs to another repository\n');
+      repo.git(['-C', join(repo.root, 'nested'), 'init', '--quiet']);
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+
+      expect(scope.files).toEqual(['base.txt']);
+      expect(scope.patch).not.toContain('nested');
+    });
+
     it('excludes gitignored paths from both the patch and the file set', async () => {
       repo.writeAndCommit('base.txt', 'base\n', 'base commit');
       repo.writeFile('.gitignore', 'env/\n*.secret\n');
