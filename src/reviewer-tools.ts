@@ -33,6 +33,7 @@
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, normalize, relative, sep } from 'node:path';
+import { createContext, runInContext } from 'node:vm';
 
 // -------------------------------------------------------------------------------------------
 // Minimal local stand-ins for pi's ExtensionAPI/ToolDefinition shapes. Deliberately not imported
@@ -131,9 +132,7 @@ function safeRealpath(target: string, label: string): string {
   try {
     return realpathSync(target);
   } catch (err) {
-    const code =
-      err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : undefined;
-    if (code === 'ENOENT') {
+    if (errorCode(err) === 'ENOENT') {
       throw new Error(`no such file or directory: ${label}`, { cause: err });
     }
     throw new Error(
@@ -143,8 +142,9 @@ function safeRealpath(target: string, label: string): string {
   }
 }
 
-function clampInt(value: unknown, def: number, min: number, max: number, label: string): number {
-  if (value === undefined) return def;
+/** Validates an integer parameter the reviewer supplied: rejects (never silently clamps) a
+ *  non-integer or out-of-range value. */
+function requireInt(value: unknown, min: number, max: number, label: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value)) {
     throw new Error(`${label} must be an integer`);
   }
@@ -152,6 +152,67 @@ function clampInt(value: unknown, def: number, min: number, max: number, label: 
     throw new Error(`${label} must be between ${min} and ${max}`);
   }
   return value;
+}
+
+/** `requireInt` for an optional parameter whose default this module applies itself. */
+function clampInt(value: unknown, def: number, min: number, max: number, label: string): number {
+  return value === undefined ? def : requireInt(value, min, max, label);
+}
+
+// -------------------------------------------------------------------------------------------
+// Output bounds shared by every tool. A tool result goes straight into a model's context, so no
+// tool may return more than MAX_TOOL_OUTPUT_CHARS; anything longer is cut with an explicit marker
+// telling the reviewer how to narrow the request, never silently.
+// -------------------------------------------------------------------------------------------
+
+export const MAX_TOOL_OUTPUT_CHARS = 100_000;
+
+/** stdout captured from a spawned binary. Past this the child is killed and the partial output
+ *  truncated (reported as "more than N characters") rather than surfacing a raw ENOBUFS. */
+const MAX_EXEC_BUFFER_BYTES = 1024 * 1024;
+
+/** Cuts `text` to MAX_TOOL_OUTPUT_CHARS with a marker. `incomplete` means `text` is itself only a
+ *  prefix of the real output (the exec buffer overflowed), so its length is a lower bound. */
+function truncateOutput(text: string, hint: string, opts: { incomplete?: boolean } = {}): string {
+  if (text.length <= MAX_TOOL_OUTPUT_CHARS && !opts.incomplete) return text;
+  const shown = Math.min(text.length, MAX_TOOL_OUTPUT_CHARS);
+  const total = opts.incomplete
+    ? `more than ${text.length} characters`
+    : `${text.length} characters total`;
+  return `${text.slice(0, shown)}\n[output truncated: ${total}, showing the first ${shown}; ${hint}]`;
+}
+
+/** Splits file content into lines the way git numbers them: only `\n` (optionally preceded by
+ *  `\r`) ends a line, a lone `\r` is ordinary content, and a final line terminator does not start
+ *  an extra empty line. */
+function splitLines(content: string): string[] {
+  const lines = content.split(/\r?\n/);
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+function errorCode(err: unknown): unknown {
+  return err && typeof err === 'object' && 'code' in err
+    ? (err as { code?: unknown }).code
+    : undefined;
+}
+
+/** The reviewer-facing reason a spawned binary failed: its stderr when it wrote any, otherwise
+ *  the spawn error's own message. */
+function execErrorMessage(err: unknown): string {
+  const stderr =
+    err && typeof err === 'object' && 'stderr' in err
+      ? String((err as { stderr?: unknown }).stderr ?? '').trim()
+      : '';
+  if (stderr.length > 0) return stderr;
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** The stdout a failed spawn had already captured (present on ENOBUFS). */
+function execPartialStdout(err: unknown): string {
+  return err && typeof err === 'object' && 'stdout' in err
+    ? String((err as { stdout?: unknown }).stdout ?? '')
+    : '';
 }
 
 // -------------------------------------------------------------------------------------------
@@ -179,6 +240,8 @@ export function getRepoRoot(env: NodeJS.ProcessEnv = process.env): string {
 // -------------------------------------------------------------------------------------------
 
 const MAX_READ_BYTES = 4_000_000;
+/** Room left under MAX_TOOL_OUTPUT_CHARS for the header line (whose path can be long). */
+const READ_CONTENT_BUDGET = MAX_TOOL_OUTPUT_CHARS - 5_000;
 
 export interface ReadParams {
   path?: unknown;
@@ -191,7 +254,10 @@ export interface ReadOutcome {
   content: string;
   totalLines: number;
   startLine: number;
+  /** The last line actually returned: below the requested end when `truncated`. */
   endLine: number;
+  /** The requested range did not fit in MAX_TOOL_OUTPUT_CHARS and was cut at a line boundary. */
+  truncated: boolean;
 }
 
 export function readInRoot(root: string, params: ReadParams): ReadOutcome {
@@ -214,12 +280,23 @@ export function readInRoot(root: string, params: ReadParams): ReadOutcome {
     throw new Error('file appears to be binary and cannot be read as text');
   }
 
-  const lines = raw.split(/\r\n|\r|\n/);
+  const lines = splitLines(raw);
   const totalLines = lines.length;
   const startLine = clampInt(params.startLine, 1, 1, Math.max(totalLines, 1), 'startLine');
-  const endLine = clampInt(params.endLine, totalLines, 1, Math.max(totalLines, 1), 'endLine');
-  if (startLine > endLine) {
+  const requestedEnd = clampInt(params.endLine, totalLines, 1, Math.max(totalLines, 1), 'endLine');
+  if (startLine > requestedEnd) {
     throw new Error('startLine must be <= endLine');
+  }
+
+  // Cut at a line boundary so the reviewer can resume at `endLine + 1`; the first line is always
+  // kept, and a single line longer than the limit is left to the tool's own truncateOutput.
+  let endLine = startLine;
+  let size = (lines[startLine - 1] as string).length;
+  while (endLine < requestedEnd) {
+    const next = size + 1 + (lines[endLine] as string).length;
+    if (next > READ_CONTENT_BUDGET) break;
+    size = next;
+    endLine += 1;
   }
 
   return {
@@ -228,6 +305,7 @@ export function readInRoot(root: string, params: ReadParams): ReadOutcome {
     totalLines,
     startLine,
     endLine,
+    truncated: endLine < requestedEnd,
   };
 }
 
@@ -263,9 +341,21 @@ export const councilReadTool: ReviewerToolDefinition = {
     const root = getSnapshotRoot();
     const outcome = readInRoot(root, (params ?? {}) as ReadParams);
     const header = `${outcome.relPath} (lines ${outcome.startLine}-${outcome.endLine} of ${outcome.totalLines}):`;
+    let text = truncateOutput(
+      `${header}\n${outcome.content}`,
+      'the line is too long to show in full; use council_grep to find the part you need',
+    );
+    if (outcome.truncated) {
+      text += `\n[output truncated at line ${outcome.endLine} of ${outcome.totalLines} (limit ${MAX_TOOL_OUTPUT_CHARS} characters); continue with startLine=${outcome.endLine + 1}]`;
+    }
     return {
-      content: [{ type: 'text', text: `${header}\n${outcome.content}` }],
-      details: { path: outcome.relPath, startLine: outcome.startLine, endLine: outcome.endLine },
+      content: [{ type: 'text', text }],
+      details: {
+        path: outcome.relPath,
+        startLine: outcome.startLine,
+        endLine: outcome.endLine,
+        truncated: outcome.truncated,
+      },
     };
   },
 };
@@ -277,6 +367,18 @@ export const councilReadTool: ReviewerToolDefinition = {
 const MAX_GREP_FILE_BYTES = 2_000_000;
 const MAX_GREP_FILES_SCANNED = 5_000;
 const DEFAULT_GREP_MAX_RESULTS = 200;
+/** A matching line is returned as at most this many characters (a minified bundle is one line). */
+const MAX_GREP_MATCH_CHARS = 300;
+/**
+ * Wall-clock budget for the matching loop. The pattern is model-supplied and V8's backtracking
+ * engine can take exponential time on one short line (`^(a+)+$` against 35 `a`s and a `!`), which
+ * would block this whole host process. The loop therefore runs under `node:vm`'s `timeout`, whose
+ * watchdog terminates the running JavaScript -- including a regex mid-backtrack -- and throws, and
+ * the host process stays usable afterwards (verified empirically; pinned by
+ * `reviewer-tools-containment.test.ts`). The vm context holds no capability: it only calls back
+ * into the scan closure below, so it is purely a deadline, not a sandbox.
+ */
+const GREP_TIMEOUT_MS = 10_000;
 
 export interface GrepParams {
   pattern?: unknown;
@@ -294,38 +396,59 @@ export interface GrepMatch {
 export interface GrepOutcome {
   matches: GrepMatch[];
   filesScanned: number;
+  /** maxResults was reached; more matches may exist. */
   truncated: boolean;
+  /** The search root holds more than MAX_GREP_FILES_SCANNED files; only the first were searched. */
+  fileLimitReached: boolean;
+  /** The search hit its time limit after finding `matches`; the rest of the tree is unsearched. */
+  timedOut: boolean;
 }
 
-/** Collects real (non-symlink) files under `startAbs`. Symlinks -- whether the entry itself or an
- *  intermediate directory -- are never followed, so no per-entry realpath check is needed here:
- *  containment of the search root itself is already enforced by `resolveContained`. */
-function collectFiles(startAbs: string): string[] {
+/** Collects up to `limit` real (non-symlink) files under `startAbs`. Symlinks -- whether the entry
+ *  itself or an intermediate directory -- are never followed, so no per-entry realpath check is
+ *  needed here: containment of the search root itself is already enforced by `resolveContained`.
+ *
+ *  The walk is pre-order with each directory's entries in code-unit name order, so the files kept
+ *  under the limit are deterministic, and it stops as soon as a file beyond the limit is seen
+ *  rather than walking the whole tree first. */
+function collectFiles(startAbs: string, limit: number): { files: string[]; limitReached: boolean } {
   const stat = statSync(startAbs);
-  if (stat.isFile()) return [startAbs];
+  if (stat.isFile()) return { files: [startAbs], limitReached: false };
   if (!stat.isDirectory()) {
     throw new Error('path is neither a file nor a directory');
   }
 
   const files: string[] = [];
-  const stack: string[] = [startAbs];
+  const stack: Array<{ abs: string; isDir: boolean }> = [{ abs: startAbs, isDir: true }];
   while (stack.length > 0) {
-    const dir = stack.pop() as string;
-    const entries = readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-      } else if (entry.isFile()) {
-        files.push(full);
-      }
+    const next = stack.pop() as { abs: string; isDir: boolean };
+    if (!next.isDir) {
+      if (files.length >= limit) return { files, limitReached: true };
+      files.push(next.abs);
+      continue;
+    }
+    const children = readdirSync(next.abs, { withFileTypes: true })
+      .filter((entry) => !entry.isSymbolicLink() && (entry.isDirectory() || entry.isFile()))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (let i = children.length - 1; i >= 0; i--) {
+      const child = children[i] as (typeof children)[number];
+      stack.push({ abs: join(next.abs, child.name), isDir: child.isDirectory() });
     }
   }
-  return files.sort();
+  return { files, limitReached: false };
 }
 
-export function grepInRoot(root: string, params: GrepParams): GrepOutcome {
+function clipMatchText(line: string): string {
+  if (line.length <= MAX_GREP_MATCH_CHARS) return line;
+  return `${line.slice(0, MAX_GREP_MATCH_CHARS)} [line clipped: ${line.length} characters total]`;
+}
+
+export function grepInRoot(
+  root: string,
+  params: GrepParams,
+  opts: { timeoutMs?: number } = {},
+): GrepOutcome {
+  const timeoutMs = opts.timeoutMs ?? GREP_TIMEOUT_MS;
   if (typeof params.pattern !== 'string' || params.pattern.length === 0) {
     throw new Error('pattern must be a non-empty string');
   }
@@ -342,35 +465,59 @@ export function grepInRoot(root: string, params: GrepParams): GrepOutcome {
   const maxResults = clampInt(params.maxResults, DEFAULT_GREP_MAX_RESULTS, 1, 1000, 'maxResults');
   const resolvedRoot = resolveRoot(root);
   const searchRootAbs = resolveContained(root, params.path ?? '.');
-  const files = collectFiles(searchRootAbs).slice(0, MAX_GREP_FILES_SCANNED);
+  const { files, limitReached } = collectFiles(searchRootAbs, MAX_GREP_FILES_SCANNED);
 
   const matches: GrepMatch[] = [];
   let truncated = false;
 
-  outer: for (const file of files) {
-    if (statSync(file).size > MAX_GREP_FILE_BYTES) continue;
-    let content: string;
-    try {
-      content = readFileSync(file, 'utf8');
-    } catch {
-      continue;
-    }
-    if (content.includes('\0')) continue; // skip binary files
+  const scan = (): void => {
+    for (const file of files) {
+      if (statSync(file).size > MAX_GREP_FILE_BYTES) continue;
+      let content: string;
+      try {
+        content = readFileSync(file, 'utf8');
+      } catch {
+        continue;
+      }
+      if (content.includes('\0')) continue; // skip binary files
 
-    const lines = content.split(/\r\n|\r|\n/);
-    const relFile = relative(resolvedRoot, file);
-    for (let i = 0; i < lines.length; i++) {
-      if (regex.test(lines[i] as string)) {
-        matches.push({ path: relFile, line: i + 1, text: lines[i] as string });
-        if (matches.length >= maxResults) {
-          truncated = true;
-          break outer;
+      const lines = splitLines(content);
+      const relFile = relative(resolvedRoot, file);
+      for (let i = 0; i < lines.length; i++) {
+        if (regex.test(lines[i] as string)) {
+          matches.push({ path: relFile, line: i + 1, text: clipMatchText(lines[i] as string) });
+          if (matches.length >= maxResults) {
+            truncated = true;
+            return;
+          }
         }
       }
     }
+  };
+
+  let timedOut = false;
+  try {
+    runInContext('scan()', createContext({ scan }), { timeout: timeoutMs });
+  } catch (err) {
+    // Matches found before the deadline are still real: return them, marked partial. Only a
+    // search that found nothing at all reports the time limit as an error.
+    if (errorCode(err) !== 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw err;
+    if (matches.length === 0) {
+      throw new Error(
+        `council_grep stopped after ${timeoutMs}ms: the pattern is too expensive to evaluate (avoid nested quantifiers such as (a+)+) or the search is too broad; simplify the pattern or narrow path`,
+        { cause: err },
+      );
+    }
+    timedOut = true;
   }
 
-  return { matches, filesScanned: files.length, truncated };
+  return {
+    matches,
+    filesScanned: files.length,
+    truncated,
+    fileLimitReached: limitReached,
+    timedOut,
+  };
 }
 
 const grepParameters = {
@@ -398,7 +545,8 @@ const grepParameters = {
 export const councilGrepTool: ReviewerToolDefinition = {
   name: 'council_grep',
   label: 'Search content',
-  description: 'Search text content in the reviewed snapshot with a regular expression.',
+  description:
+    'Search text content in the reviewed snapshot with a regular expression. Searches at most 5000 files (in path order), skips binary files and files over 2 MB, clips each matching line to 300 characters, and stops a pattern that takes too long to evaluate.',
   parameters: grepParameters,
   async execute(_toolCallId, params) {
     const root = getSnapshotRoot();
@@ -408,12 +556,29 @@ export const councilGrepTool: ReviewerToolDefinition = {
         ? ['no matches']
         : outcome.matches.map((m) => `${m.path}:${m.line}: ${m.text}`);
     if (outcome.truncated) lines.push('[results truncated]');
+    if (outcome.timedOut) {
+      lines.push(
+        '[search stopped at its time limit: results are partial; simplify the pattern or narrow path]',
+      );
+    }
+    if (outcome.fileLimitReached) {
+      lines.push(
+        `[file limit reached: only the first ${outcome.filesScanned} files were searched; narrow path]`,
+      );
+    }
     return {
-      content: [{ type: 'text', text: lines.join('\n') }],
+      content: [
+        {
+          type: 'text',
+          text: truncateOutput(lines.join('\n'), 'lower maxResults or narrow the pattern or path'),
+        },
+      ],
       details: {
         matches: outcome.matches.length,
         filesScanned: outcome.filesScanned,
         truncated: outcome.truncated,
+        fileLimitReached: outcome.fileLimitReached,
+        timedOut: outcome.timedOut,
       },
     };
   },
@@ -455,14 +620,17 @@ function walk(
   dirAbs: string,
   relBase: string,
   out: ListEntry[],
-  budget: { remaining: number },
+  budget: { remaining: number; skipped: boolean },
 ): void {
-  if (budget.remaining <= 0) return;
+  if (budget.skipped) return;
   const entries = readdirSync(dirAbs, { withFileTypes: true }).sort((a, b) =>
     a.name.localeCompare(b.name),
   );
   for (const entry of entries) {
-    if (budget.remaining <= 0) return;
+    if (budget.remaining <= 0) {
+      budget.skipped = true;
+      return;
+    }
     const relPath = relBase === '' ? entry.name : `${relBase}/${entry.name}`;
     const type = entryType(entry);
     out.push({ path: relPath, type });
@@ -481,20 +649,24 @@ export function listInRoot(root: string, params: ListParams): ListOutcome {
   }
   const maxEntries = clampInt(params.maxEntries, DEFAULT_LIST_MAX_ENTRIES, 1, 10_000, 'maxEntries');
   const out: ListEntry[] = [];
+  // Truncated means an entry was actually left out, not merely that exactly maxEntries exist.
+  let truncated: boolean;
 
   if (params.recursive) {
-    walk(resolved, '', out, { remaining: maxEntries });
+    const budget = { remaining: maxEntries, skipped: false };
+    walk(resolved, '', out, budget);
+    truncated = budget.skipped;
   } else {
     const entries = readdirSync(resolved, { withFileTypes: true }).sort((a, b) =>
       a.name.localeCompare(b.name),
     );
-    for (const entry of entries) {
-      if (out.length >= maxEntries) break;
+    for (const entry of entries.slice(0, maxEntries)) {
       out.push({ path: entry.name, type: entryType(entry) });
     }
+    truncated = entries.length > maxEntries;
   }
 
-  return { entries: out, truncated: out.length >= maxEntries };
+  return { entries: out, truncated };
 }
 
 const listParameters = {
@@ -532,8 +704,14 @@ export const councilListTool: ReviewerToolDefinition = {
       return e.path;
     });
     if (outcome.truncated) lines.push('[listing truncated]');
+    const text = lines.length > 0 ? lines.join('\n') : '(empty)';
     return {
-      content: [{ type: 'text', text: lines.length > 0 ? lines.join('\n') : '(empty)' }],
+      content: [
+        {
+          type: 'text',
+          text: truncateOutput(text, 'lower maxEntries or list a subdirectory'),
+        },
+      ],
       details: { entries: outcome.entries.length, truncated: outcome.truncated },
     };
   },
@@ -545,6 +723,9 @@ export const councilListTool: ReviewerToolDefinition = {
 // -------------------------------------------------------------------------------------------
 
 const GIT_SUBCOMMANDS = ['log', 'show', 'blame', 'diff'] as const;
+const DEFAULT_GIT_LOG_MAX_COUNT = 50;
+/** A git call that outlives this is killed (SIGKILL: a hung hook or filter may ignore SIGTERM). */
+const GIT_TIMEOUT_MS = 60_000;
 type GitSubcommand = (typeof GIT_SUBCOMMANDS)[number];
 
 export interface GitParams {
@@ -586,8 +767,65 @@ function assertRepoRelativePath(value: string): void {
     throw new Error('path must be repository-relative, not absolute');
   }
   const normalized = normalize(value);
-  if (normalized === '..' || normalized.startsWith(`..${sep}`) || normalized.startsWith(sep)) {
+  if (normalized === '..' || normalized.startsWith(`..${sep}`)) {
     throw new Error('path must not escape the repository root');
+  }
+}
+
+/** Pseudo-refs other than HEAD (case-insensitively, for case-insensitive filesystems). Each can
+ *  name a commit no branch reaches: ORIG_HEAD after a `reset` that discarded an accidental commit,
+ *  MERGE_AUTOSTASH a stash, AUTO_MERGE a tree of conflicted working-tree state. */
+// git's pseudo-refs other than HEAD, matched on a ref name's last segment so a per-worktree
+// spelling (`main-worktree/ORIG_HEAD`, `worktrees/<id>/ORIG_HEAD`) is caught too. An explicit
+// list rather than a `*_HEAD` pattern: branches such as `fix_head` are legitimate history.
+const PSEUDO_REFS: ReadonlySet<string> = new Set([
+  'ORIG_HEAD',
+  'FETCH_HEAD',
+  'MERGE_HEAD',
+  'CHERRY_PICK_HEAD',
+  'REVERT_HEAD',
+  'BISECT_HEAD',
+  'REBASE_HEAD',
+  'AUTO_MERGE',
+  'MERGE_AUTOSTASH',
+]);
+
+// `@{u}` / `@{upstream}` / `@{push}` name a branch's configured remote-tracking branch, not a
+// reflog entry, so they are the one `@{...}` form a revision may keep.
+const TRACKING_SUFFIX = /@\{(?:u|upstream|push)\}/gi;
+
+/**
+ * A revision may name only history a branch, tag, remote or HEAD reaches. Rejected, because each
+ * reaches content that was never committed to that history:
+ *  - the stash (`stash`, `refs/stash`, compared case-insensitively): `git stash -u`/`--all`
+ *    records untracked and *ignored* files (`.env`) as the stash's third parent, so
+ *    `stash^3:.env` would read a file the snapshot deliberately excluded;
+ *  - reflog syntax (`@{`): `stash@{n}`, and `HEAD@{n}` reaching commits a `reset` discarded;
+ *  - `:/<text>`: finds the youngest commit whose message matches, searched from *every* ref,
+ *    `refs/stash` included (`:/untracked files on` is the stash's untracked-files commit);
+ *  - pseudo-refs other than HEAD (see PSEUDO_REFS).
+ * Every endpoint of a `A..B`/`A...B` range and a `^A` exclusion is checked; the ref name is the
+ * part before any `~`, `^` or `:` suffix. What stays reachable: a commit id, HEAD/`@`, branches,
+ * tags, remote branches, ranges, and `^{/text}` (which searches only the given commit's
+ * ancestors). A stash commit named by its raw object id is not caught here; nothing this tool
+ * returns lists one once the names above are refused.
+ */
+function assertRevisionAllowed(revision: string): void {
+  if (revision.replace(TRACKING_SUFFIX, '').includes('@{')) {
+    throw new Error('revision must not use reflog syntax (@{...})');
+  }
+  if (revision.includes(':/')) {
+    throw new Error('revision must not use a :/ commit-message search');
+  }
+  for (const endpoint of revision.split(/\.\.\.?/)) {
+    const name = endpoint.replace(/^\^+/, '').split(/[~^:]/, 1)[0] as string;
+    const lower = name.replace(TRACKING_SUFFIX, '').toLowerCase();
+    if (lower === 'stash' || lower === 'refs/stash' || lower.endsWith('/refs/stash')) {
+      throw new Error('revision must not reference the stash');
+    }
+    if (PSEUDO_REFS.has((lower.split('/').pop() as string).toUpperCase())) {
+      throw new Error(`revision must not reference the pseudo-ref ${name}`);
+    }
   }
 }
 
@@ -603,14 +841,22 @@ export function buildGitArgv(params: GitParams): string[] {
   // (verified empirically against a real git). `blame`'s own output has no ANSI colour to begin
   // with when stdout isn't a TTY (true here, since output is captured via execFileSync), so
   // there is nothing to suppress for it anyway.
-  const argv: string[] = subcommand === 'blame' ? [subcommand] : [subcommand, '--no-color'];
+  //
+  // HOME passes through to reviewers, so the user's own git config applies: `diff.external` and a
+  // `textconv` driver would each run an arbitrary configured command and replace the real diff
+  // text. `--no-ext-diff`/`--no-textconv` switch both off (blame knows only `--no-textconv`).
+  const argv: string[] =
+    subcommand === 'blame'
+      ? [subcommand, '--no-textconv']
+      : [subcommand, '--no-color', '--no-ext-diff', '--no-textconv'];
 
-  if (params.maxCount !== undefined) {
-    if (subcommand !== 'log') {
-      throw new Error('maxCount is only supported for log');
-    }
-    const maxCount = clampInt(params.maxCount, 50, 1, 500, 'maxCount');
-    argv.push(`--max-count=${maxCount}`);
+  if (params.maxCount !== undefined && subcommand !== 'log') {
+    throw new Error('maxCount is only supported for log');
+  }
+  if (subcommand === 'log') {
+    argv.push(
+      `--max-count=${clampInt(params.maxCount, DEFAULT_GIT_LOG_MAX_COUNT, 1, 500, 'maxCount')}`,
+    );
   }
 
   if (subcommand === 'blame' && (typeof params.path !== 'string' || params.path.length === 0)) {
@@ -623,6 +869,7 @@ export function buildGitArgv(params: GitParams): string[] {
       throw new Error('revision must be a string');
     }
     assertLiteralArgValue('revision', params.revision);
+    assertRevisionAllowed(params.revision);
     revision = params.revision;
   } else if (subcommand === 'show') {
     revision = 'HEAD';
@@ -640,22 +887,37 @@ export function buildGitArgv(params: GitParams): string[] {
   return argv;
 }
 
-export function runGitHistory(repoRoot: string, params: GitParams): string {
+export function runGitHistory(
+  repoRoot: string,
+  params: GitParams,
+  opts: { timeoutMs?: number } = {},
+): string {
+  const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
   const argv = buildGitArgv(params);
+  const hint = 'narrow with a revision range, a path, or a lower maxCount';
   try {
-    return execFileSync('git', argv, {
+    const output = execFileSync('git', argv, {
       cwd: repoRoot,
       encoding: 'utf8',
-      maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      maxBuffer: MAX_EXEC_BUFFER_BYTES,
     });
+    return truncateOutput(output, hint);
   } catch (err) {
-    const stderr =
-      err && typeof err === 'object' && 'stderr' in err
-        ? String((err as { stderr?: unknown }).stderr ?? '')
-        : '';
-    const message =
-      stderr.trim().length > 0 ? stderr.trim() : err instanceof Error ? err.message : String(err);
-    throw new Error(`git ${String(params.subcommand)} failed: ${message}`, { cause: err });
+    const code = errorCode(err);
+    if (code === 'ENOBUFS') {
+      return truncateOutput(execPartialStdout(err), hint, { incomplete: true });
+    }
+    if (code === 'ETIMEDOUT') {
+      throw new Error(
+        `git ${String(params.subcommand)} timed out after ${timeoutMs}ms; ${hint} and try again`,
+        { cause: err },
+      );
+    }
+    throw new Error(`git ${String(params.subcommand)} failed: ${execErrorMessage(err)}`, {
+      cause: err,
+    });
   }
 }
 
@@ -670,7 +932,7 @@ const gitParameters = {
     revision: {
       type: 'string',
       description:
-        'A single revision or revision range (e.g. "HEAD", "abc1234", "main..feature"). Optional for log/diff; defaults to HEAD for show.',
+        'A single revision or revision range (e.g. "HEAD", "abc1234", "main..feature"). Optional for log/diff/blame; defaults to HEAD for show. The stash, reflog syntax (@{...}), :/ message searches and pseudo-refs such as ORIG_HEAD are refused.',
     },
     path: {
       type: 'string',
@@ -689,7 +951,7 @@ export const councilGitTool: ReviewerToolDefinition = {
   name: 'council_git',
   label: 'Repository history',
   description:
-    'Query read-only history of the real repository: log, show, blame or diff. No other git operation is available.',
+    'Query read-only history of the real repository: log, show, blame or diff. No other git operation is available. This runs against the live repository, not the frozen snapshot the other tools read: without a revision, diff compares the live working tree with the index and blame annotates the live working-tree file, either of which may have changed since the snapshot was taken (so their line numbers may not match council_read). Pass a revision for a stable answer.',
   parameters: gitParameters,
   async execute(_toolCallId, params) {
     const repoRoot = getRepoRoot();
@@ -735,8 +997,6 @@ export interface CodegraphParams {
   offset?: unknown;
 }
 
-export const MAX_CODEGRAPH_OUTPUT_CHARS = 100_000;
-
 export const CODEGRAPH_FALLBACK_MESSAGE =
   'The CodeGraph index is not available for this run (it was not built, is disabled, or failed ' +
   'to build). Continue the review with council_grep and council_read instead.';
@@ -774,14 +1034,14 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
     case 'explore': {
       argv.push(codegraphStringField('query', params.query));
       if (params.maxFiles !== undefined) {
-        argv.push('--max-files', String(clampInt(params.maxFiles, 10, 1, 50, 'maxFiles')));
+        argv.push('--max-files', String(requireInt(params.maxFiles, 1, 50, 'maxFiles')));
       }
       break;
     }
     case 'query': {
       argv.push(codegraphStringField('query', params.query));
       if (params.limit !== undefined) {
-        argv.push('--limit', String(clampInt(params.limit, 10, 1, 100, 'limit')));
+        argv.push('--limit', String(requireInt(params.limit, 1, 100, 'limit')));
       }
       if (params.kind !== undefined) {
         argv.push('--kind', codegraphStringField('kind', params.kind));
@@ -804,13 +1064,13 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
         if (!hasFile) {
           throw new Error('offset is only supported with file');
         }
-        argv.push('--offset', String(clampInt(params.offset, 1, 1, 1_000_000, 'offset')));
+        argv.push('--offset', String(requireInt(params.offset, 1, 1_000_000, 'offset')));
       }
       if (params.limit !== undefined) {
         if (!hasFile) {
           throw new Error('limit is only supported with file');
         }
-        argv.push('--limit', String(clampInt(params.limit, 20, 1, 1000, 'limit')));
+        argv.push('--limit', String(requireInt(params.limit, 1, 1000, 'limit')));
       }
       break;
     }
@@ -818,14 +1078,14 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
     case 'callees': {
       argv.push(codegraphStringField('symbol', params.symbol));
       if (params.limit !== undefined) {
-        argv.push('--limit', String(clampInt(params.limit, 20, 1, 100, 'limit')));
+        argv.push('--limit', String(requireInt(params.limit, 1, 100, 'limit')));
       }
       break;
     }
     case 'impact': {
       argv.push(codegraphStringField('symbol', params.symbol));
       if (params.depth !== undefined) {
-        argv.push('--depth', String(clampInt(params.depth, 2, 1, 10, 'depth')));
+        argv.push('--depth', String(requireInt(params.depth, 1, 10, 'depth')));
       }
       break;
     }
@@ -842,7 +1102,7 @@ export function buildCodegraphArgv(root: string, params: CodegraphParams): strin
         }
       }
       if (params.depth !== undefined) {
-        argv.push('--depth', String(clampInt(params.depth, 5, 1, 10, 'depth')));
+        argv.push('--depth', String(requireInt(params.depth, 1, 10, 'depth')));
       }
       break;
     }
@@ -886,40 +1146,31 @@ export function runCodegraph(
     return CODEGRAPH_FALLBACK_MESSAGE;
   }
   const argv = buildCodegraphArgv(root, params);
-  let output: string;
+  const hint = 'narrow the query to a more specific symbol, file, or lower limit';
   try {
-    output = execFileSync(getCodegraphBin(), argv, {
+    const output = execFileSync(getCodegraphBin(), argv, {
       cwd: root,
       encoding: 'utf8',
       timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024,
+      killSignal: 'SIGKILL',
+      maxBuffer: MAX_EXEC_BUFFER_BYTES,
     });
+    return truncateOutput(output, hint);
   } catch (err) {
-    const code =
-      err && typeof err === 'object' && 'code' in err
-        ? (err as { code?: unknown }).code
-        : undefined;
+    const code = errorCode(err);
+    if (code === 'ENOBUFS') {
+      return truncateOutput(execPartialStdout(err), hint, { incomplete: true });
+    }
     if (code === 'ETIMEDOUT') {
       throw new Error(
         `codegraph ${String(params.subcommand)} timed out after ${timeoutMs}ms; narrow the query to a more specific symbol or file and try again`,
         { cause: err },
       );
     }
-    const stderr =
-      err && typeof err === 'object' && 'stderr' in err
-        ? String((err as { stderr?: unknown }).stderr ?? '')
-        : '';
-    const message =
-      stderr.trim().length > 0 ? stderr.trim() : err instanceof Error ? err.message : String(err);
-    throw new Error(`codegraph ${String(params.subcommand)} failed: ${message}`, { cause: err });
+    throw new Error(`codegraph ${String(params.subcommand)} failed: ${execErrorMessage(err)}`, {
+      cause: err,
+    });
   }
-  if (output.length > MAX_CODEGRAPH_OUTPUT_CHARS) {
-    return (
-      output.slice(0, MAX_CODEGRAPH_OUTPUT_CHARS) +
-      `\n[output truncated: ${output.length} characters total, showing the first ${MAX_CODEGRAPH_OUTPUT_CHARS}; narrow the query to a more specific symbol, file, or lower limit]`
-    );
-  }
-  return output;
 }
 
 const codegraphParameters = {

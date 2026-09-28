@@ -38,6 +38,10 @@ interface StubOpts {
   updateBumpTo?: string;
   /** When set, `update` appends its received argv (one JSON array per line) here. */
   updateLog?: string;
+  /** When set, `update` writes its pid here before doing anything else. */
+  updatePidFile?: string;
+  /** When true, `update` ignores SIGTERM, so only SIGKILL can stop it. */
+  updateIgnoreSigterm?: boolean;
 }
 
 /**
@@ -63,6 +67,8 @@ if (args[0] === '--version') {
   process.exit(${opts.versionExit ?? 0});
 }
 if (args[0] === 'update') {
+  ${opts.updatePidFile !== undefined ? `fs.writeFileSync(${JSON.stringify(opts.updatePidFile)}, String(process.pid));` : ''}
+  ${opts.updateIgnoreSigterm === true ? `process.on('SIGTERM', () => {});` : ''}
   sleep(${opts.updateDelayMs ?? 0});
   ${opts.updateLog !== undefined ? `fs.appendFileSync(${JSON.stringify(opts.updateLog)}, JSON.stringify(args) + '\\n', 'utf8');` : ''}
   ${opts.updateBumpTo !== undefined && opts.versionFile !== undefined ? `fs.writeFileSync(${JSON.stringify(opts.versionFile)}, ${JSON.stringify(opts.updateBumpTo)}, 'utf8');` : ''}
@@ -91,6 +97,10 @@ describe('parsePiVersion', () => {
 
   it('keeps a pre-release suffix', () => {
     expect(parsePiVersion('1.0.0-beta.1\n')).toBe('1.0.0-beta.1');
+  });
+
+  it('keeps a pre-release suffix followed by build metadata', () => {
+    expect(parsePiVersion('1.2.3-beta.1+build.5\n')).toBe('1.2.3-beta.1+build.5');
   });
 
   it('finds the version among banner lines', () => {
@@ -265,6 +275,32 @@ describe('ensurePiCurrent', () => {
       reason: 'update-timeout',
     });
   });
+
+  it('kills a timed-out update that ignores SIGTERM, and only settles once it is gone', async () => {
+    // Reviewers launch from this binary right after the check returns; a hung `pi update --self`
+    // still rewriting it at that point is exactly what the SIGKILL escalation prevents.
+    const versionFile = writeVersionFile('version.txt', '1.2.3\n');
+    const pidFile = path.join(dir, 'update.pid');
+    const piBin = writeStubPi('pi.cjs', {
+      versionFile,
+      updateDelayMs: 30_000,
+      updatePidFile: pidFile,
+      updateIgnoreSigterm: true,
+    });
+
+    const start = Date.now();
+    const result = await ensurePiCurrent({
+      piBin,
+      env: {},
+      updateTimeoutMs: 300,
+      killGraceMs: 200,
+    });
+
+    expect(result.reason).toBe('update-timeout');
+    expect(Date.now() - start).toBeLessThan(10_000);
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+  }, 20_000);
 
   it('fails when the post-update version is unparseable', async () => {
     const versionFile = writeVersionFile('version.txt', '1.2.3\n');

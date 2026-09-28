@@ -246,7 +246,7 @@ To re-verify:
 
 1. Run the security suite: `npm run test:security` (in particular
    `test/security/reviewer-tool-surface.test.ts`, which asserts the reviewer extension registers
-   exactly the four `council_*` tools, and `test/security/reviewer-spawn.test.ts`, which asserts
+   exactly the five `council_*` tools, and `test/security/reviewer-spawn.test.ts`, which asserts
    the spawn argument vector). These are zero-cost and zero-model-call, and will catch a renamed
    export or a changed extension-loading contract on this package's own side.
 2. Run the opt-in live suite once, deliberately, with `COUNCIL_LIVE=1`

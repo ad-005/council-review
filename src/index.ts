@@ -9,8 +9,10 @@
  * re-exporting it here would violate that separation for no benefit, since it has nothing this
  * package's own consumers would call directly.
  *
- * `src/cli.ts` is the executable entry point (`bin.council-review` in package.json), not part of
- * the library surface, and is not re-exported here either.
+ * `src/cli.ts` (the command implementation), `src/bin.ts` (the executable entry point,
+ * `bin.council-review` in package.json) and `src/status.ts` (the `status` subcommand) are not
+ * part of the library surface and are not re-exported here either. `herdr.ts` is re-exported by
+ * name so its test-only reset hook stays out of the public API.
  */
 
 export * from './levels.js';
@@ -28,6 +30,13 @@ export * from './schema.js';
 export * from './merge.js';
 export * from './resolve.js';
 export * from './report.js';
-export * from './herdr.js';
+export {
+  HERDR_COMMAND_TIMEOUT_MS,
+  isHerdrEnv,
+  splitPaneAndRun,
+  setPaneTitle,
+  notifyComplete,
+  handoffToAgent,
+} from './herdr.js';
 export * from './reviewer-spawn.js';
 export * from './pi-update.js';

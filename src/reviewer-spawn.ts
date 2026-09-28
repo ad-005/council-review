@@ -96,6 +96,10 @@ const ALLOWLISTED_EXACT_VARS: readonly string[] = [
  *  adding another `PI_*` var does not require a code change here. */
 const ALLOWLISTED_PREFIXES: readonly string[] = ['PI_'];
 
+/** Credential-shaped names are dropped even inside an allowlisted prefix: `PI_OPENAI_API_KEY`
+ *  or `PI_GITHUB_TOKEN` would otherwise ride the `PI_` prefix into a reviewer. */
+const CREDENTIAL_SHAPED = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$/i;
+
 /**
  * Builds the reviewer process environment: an allowlist, not a denylist. Every variable from
  * `parentEnv` is dropped unless it is the executable search path, the home directory (needed so
@@ -112,7 +116,8 @@ export function buildReviewerEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEn
     if (value === undefined) continue;
     const allowed =
       ALLOWLISTED_EXACT_VARS.includes(key) ||
-      ALLOWLISTED_PREFIXES.some((prefix) => key.startsWith(prefix));
+      (ALLOWLISTED_PREFIXES.some((prefix) => key.startsWith(prefix)) &&
+        !CREDENTIAL_SHAPED.test(key));
     if (allowed) {
       env[key] = value;
     }

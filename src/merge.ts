@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 
 import type { IgnoreFile } from './config.js';
-import type { RawFinding, Severity } from './schema.js';
+import { normaliseFindingPath, type RawFinding, type Severity } from './schema.js';
 
 // -------------------------------------------------------------------------------------------
 // Public types
@@ -66,6 +66,20 @@ export interface MergeOutcome {
   suppressed: number;
   launched: number;
   reporting: number;
+}
+
+// -------------------------------------------------------------------------------------------
+// String ordering
+// -------------------------------------------------------------------------------------------
+
+/**
+ * Plain UTF-16 code-unit order — the one string comparator every ordering in this module (and
+ * any consumer that must reproduce it) uses. Deliberately not `localeCompare`: that follows
+ * LANG and the ICU build, so the same input could sort differently (and even pick a different
+ * cluster representative, hence a different fingerprint) on a da_DK machine than on an en_US one.
+ */
+export function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -121,8 +135,10 @@ function claimTokens(claim: string): Set<string> {
 
 /**
  * Overlap coefficient over normalised claim tokens: |intersection| / min(|A|, |B|). Two claims
- * that both normalise to nothing are treated as identical (similarity 1), matching the
- * fingerprint behaviour for the same case.
+ * that both normalise to nothing (punctuation or stopwords only) have no tokens to compare, so
+ * they score 1 only when their raw text is the same up to case, whitespace and a trailing
+ * punctuation mark, and 0 otherwise — scoring every such pair 1 would let any two contentless
+ * claims near each other in one file collapse into a cluster regardless of what they said.
  *
  * This used to be a plain Jaccard index (|intersection| / |union|), which punishes asymmetric
  * verbosity: one reviewer writes a terse claim, another a detailed one covering the same
@@ -142,27 +158,11 @@ function claimTokens(claim: string): Set<string> {
 function claimOverlap(a: string, b: string): number {
   const ta = claimTokens(a);
   const tb = claimTokens(b);
-  if (ta.size === 0 && tb.size === 0) return 1;
+  if (ta.size === 0 && tb.size === 0) return normaliseFreeText(a) === normaliseFreeText(b) ? 1 : 0;
   if (ta.size === 0 || tb.size === 0) return 0; // one side has no content-bearing tokens at all
   let intersection = 0;
   for (const token of ta) if (tb.has(token)) intersection++;
   return intersection / Math.min(ta.size, tb.size);
-}
-
-/**
- * A lighter normalisation for file paths: lowercased, backslashes folded to forward slashes, a
- * leading "./" dropped, repeated slashes collapsed, and a trailing slash trimmed. Path
- * separators and extensions are structural, not punctuation to strip — unlike claim text,
- * stopword removal does not apply here.
- */
-function normaliseFilePath(file: string): string {
-  return file
-    .trim()
-    .toLowerCase()
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .replace(/\/+/g, '/')
-    .replace(/\/$/, '');
 }
 
 /**
@@ -183,7 +183,7 @@ function normaliseFilePath(file: string): string {
  * the same fingerprint, in a source file git can still read as text.
  */
 export function fingerprint(file: string, claim: string): string {
-  const key = `${normaliseFilePath(file)}\0${normaliseClaim(claim)}`;
+  const key = `${normaliseFindingPath(file)}\0${normaliseClaim(claim)}`;
   return createHash('sha256').update(key, 'utf8').digest('hex');
 }
 
@@ -203,7 +203,8 @@ function lineRange(f: RawFinding): readonly [number, number] {
   return [f.line, f.endLine ?? f.line];
 }
 
-/** 0 when the ranges overlap; otherwise the number of lines strictly between them. */
+/** 0 when the ranges overlap; otherwise the distance from one range's end to the other's start
+ * — one more than the number of lines strictly between them, so adjacent lines score 1. */
 function rangeGap(a: readonly [number, number], b: readonly [number, number]): number {
   if (a[1] < b[0]) return b[0] - a[1];
   if (b[1] < a[0]) return a[0] - b[1];
@@ -244,7 +245,8 @@ function shouldMerge(a: RawFinding, b: RawFinding, o: MergeOptions): boolean {
 }
 
 /**
- * Per-file union-find over `flat`. Findings are grouped by their exact `file` string first, so
+ * Per-file union-find over `flat`. Findings are grouped by their normalised `file` path
+ * (`normaliseFindingPath` — the same normalisation the fingerprint uses) first, so
  * two findings in different files are never even compared, let alone unioned — clustering
  * cannot cross a file boundary. Within a file, clustering is transitive: unioning is pairwise,
  * but the resulting connected components let a chain of pairwise merges form one cluster even
@@ -253,9 +255,10 @@ function shouldMerge(a: RawFinding, b: RawFinding, o: MergeOptions): boolean {
 function clusterFlatFindings(flat: readonly FlatFinding[], o: MergeOptions): number[][] {
   const byFile = new Map<string, number[]>();
   flat.forEach((f, i) => {
-    const list = byFile.get(f.finding.file);
+    const key = normaliseFindingPath(f.finding.file);
+    const list = byFile.get(key);
     if (list) list.push(i);
-    else byFile.set(f.finding.file, [i]);
+    else byFile.set(key, [i]);
   });
 
   const parent = flat.map((_, i) => i);
@@ -358,7 +361,9 @@ function assembleCluster(
 ): UnidentifiedFinding {
   const members = indices
     .map((i) => flat[i]!)
-    .sort((x, y) => x.reviewerId.localeCompare(y.reviewerId) || x.findingIndex - y.findingIndex);
+    .sort(
+      (x, y) => compareCodeUnits(x.reviewerId, y.reviewerId) || x.findingIndex - y.findingIndex,
+    );
 
   // All members share a file (clustering never crosses files); every pair of members has at
   // least *compatible* categories (see `categoriesCompatible`) for any two to have merged in the
@@ -371,7 +376,7 @@ function assembleCluster(
   // `category` below — because "first by reviewerId" is alphabetical order of provider/model
   // strings, which has no bearing on which category is the more meaningful one to show.
   const representative = members[0]!;
-  const file = representative.finding.file;
+  const file = normaliseFindingPath(representative.finding.file);
 
   const line = Math.min(...members.map((m) => m.finding.line));
   const maxEndLine = Math.max(...members.map((m) => m.finding.endLine ?? m.finding.line));
@@ -398,19 +403,21 @@ function assembleCluster(
   // Two members can still tie on severity while disagreeing on category. That tie must NOT be
   // broken by reviewerId (i.e. by `representative`/member order): reviewerId is exactly the
   // arbitrary, renameable input this whole fix exists to stop depending on, and using it here
-  // would silently reintroduce the bug for every tied pair. Instead the tie is broken on the
-  // same kind of content-derived key `compareMergedFindings` already uses as its own final,
-  // never-arbitrary tiebreaker: each tied member's own fingerprint (file + its claim text),
-  // ascending. Fingerprint depends only on `file` and `claim`, never on which reviewer said it,
-  // so renaming a reviewer changes nothing about which member wins a tie.
+  // would silently reintroduce the bug for every tied pair. Instead the tie is broken on
+  // content alone: each tied member's own fingerprint (file + its claim text), ascending, and —
+  // when two members also share a fingerprint (the same claim, labelled "security" by one
+  // reviewer and "correctness" by another) — the category text itself, ascending. Neither key
+  // depends on which reviewer said it, so renaming a reviewer changes nothing about which
+  // member wins a tie. Members that tie on all three keys carry the same category, so whichever
+  // of them is kept yields the same result.
   const categoryHolder = members.reduce((best, m) => {
     const bestRank = SEVERITY_RANK[best.finding.severity];
     const mRank = SEVERITY_RANK[m.finding.severity];
     if (mRank !== bestRank) return mRank > bestRank ? m : best;
-    return fingerprint(file, m.finding.claim).localeCompare(fingerprint(file, best.finding.claim)) <
-      0
-      ? m
-      : best;
+    const order =
+      compareCodeUnits(fingerprint(file, m.finding.claim), fingerprint(file, best.finding.claim)) ||
+      compareCodeUnits(m.finding.category, best.finding.category);
+    return order < 0 ? m : best;
   }, members[0]!);
   const category = categoryHolder.finding.category;
 
@@ -422,7 +429,7 @@ function assembleCluster(
     }
   }
 
-  const raisedBy = Array.from(new Set(members.map((m) => m.reviewerId))).sort();
+  const raisedBy = Array.from(new Set(members.map((m) => m.reviewerId))).sort(compareCodeUnits);
 
   const evidence = dedupeFreeText(
     members.map((m) => m.finding.evidence).filter((e): e is string => !!e),
@@ -484,9 +491,15 @@ function isSuppressed(cluster: UnidentifiedFinding, ignore: IgnoreFile | undefin
 
 /**
  * Total order: agreement (raisers) descending, severity descending, file path ascending, line
- * ascending, then fingerprint ascending as a final deterministic tiebreaker so no two distinct
- * findings can ever compare equal — without it, findings tied on all four documented keys would
- * fall back to array order, which is not itself guaranteed stable across environments.
+ * ascending, then fingerprint, category, end line and finally the cluster's sources ascending.
+ * Fingerprint alone is NOT enough to make the order total: two clusters can share a file, line,
+ * severity, raiser count and (normalised) claim — hence a fingerprint — when their categories
+ * are incompatible (one reviewer's "security" next to another's "style" on the same wording).
+ * Without further keys those would compare equal and fall back to cluster iteration order,
+ * i.e. reviewer input order. Category and end line separate most of them; sources — each
+ * `(reviewer, findingIndex)` pair belongs to exactly one cluster — separate every remaining
+ * pair, so no two distinct findings can ever compare equal. Every string comparison is by code
+ * unit (`compareCodeUnits`), never by locale.
  *
  * Sorting by raisers (rather than a raisers/reporting ratio) is equivalent to sorting by
  * agreement ratio here: `reporting` is the same constant for every finding produced by one
@@ -496,10 +509,24 @@ function compareMergedFindings(a: UnidentifiedFinding, b: UnidentifiedFinding): 
   return (
     b.agreement.raisers - a.agreement.raisers ||
     SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
-    a.file.localeCompare(b.file) ||
+    compareCodeUnits(a.file, b.file) ||
     a.line - b.line ||
-    a.fingerprint.localeCompare(b.fingerprint)
+    compareCodeUnits(a.fingerprint, b.fingerprint) ||
+    compareCodeUnits(a.category, b.category) ||
+    (a.endLine ?? a.line) - (b.endLine ?? b.line) ||
+    compareSources(a.sources, b.sources)
   );
+}
+
+/** Lexicographic over `(reviewer, findingIndex)` pairs, already in member order. */
+function compareSources(a: readonly SourceRef[], b: readonly SourceRef[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const order =
+      compareCodeUnits(a[i]!.reviewer, b[i]!.reviewer) ||
+      Number(a[i]!.findingId) - Number(b[i]!.findingId);
+    if (order !== 0) return order;
+  }
+  return a.length - b.length;
 }
 
 /** Zero-padded, 1-based, assigned strictly after sorting so that identical input always

@@ -110,9 +110,9 @@ follows the scope. Three builders, one selected per run:
 
 | Scope | Snapshot source |
 |---|---|
-| default (worktree work) | copy of `git ls-files --cached --others --exclude-standard -z` |
-| `--staged` | `git checkout-index -a --prefix=<snap>/` — the index exactly |
-| `--range A..B`, `--rev` | `git archive <B> \| tar -x -C <snap>` |
+| default (worktree work) | copy of `git ls-files --cached --others --exclude-standard -z`; skips deleted paths, directories (submodules, embedded repos) and paths beyond a symlinked directory |
+| `--staged` | stage-0 blobs from `git ls-files -s -z`, read by sha via one `git cat-file --batch` — the index exactly; gitlinks skipped |
+| `--range A..B`, `--rev` | blobs from `git ls-tree -r -z <B>`, read by sha via one `git cat-file --batch`; gitlinks skipped |
 
 Reviewing a historical range against the current worktree would show reviewers
 code that has since moved, so this mapping is a correctness requirement, not a
@@ -204,15 +204,26 @@ Vendor is derived in this order:
 1. `provider/model` exact match in config `vendorOverrides`.
 2. For gateway providers whose ids are `vendor/model` (OpenRouter), the leading
    segment, after stripping a `~` prefix.
-3. A shipped prefix table for flat-id gateways (`kimi-*` → moonshot,
-   `glm-*` → z-ai, `deepseek-*` → deepseek, `qwen*` → alibaba,
-   `grok-*` → x-ai, `gpt-*` → openai, `minimax-*` → minimax, and so on).
+3. A shipped prefix table for flat-id gateways, matched case-insensitively,
+   longest prefix first (`kimi-*` → moonshot, `glm-*` → zhipu,
+   `deepseek-*` → deepseek, `qwen*` → qwen, `grok-*` → xai,
+   `gpt-*`/`o1`/`o3`/`o4`/`chatgpt-*` → openai, `minimax-*` → minimax,
+   `gemma*` → google, `mixtral*`/`codestral*`/`devstral*` → mistral, and so on).
 4. Otherwise `unknown`, which counts as its own distinct vendor and is flagged
    in the picker and the manifest.
 
+The guard counts distinct vendor *strings*, so every name from steps 1 and 2 is
+canonicalized to the spelling the prefix table uses: lowercased, then folded
+through a shipped alias map of gateway organisation slugs — `x-ai` → xai,
+`z-ai`/`zai`/`zai-org`/`zhipuai`/`thudm` → zhipu, `meta-llama` → meta,
+`mistralai` → mistral, `moonshotai` → moonshot, `deepseek-ai` → deepseek,
+`alibaba` → qwen, `minimaxai` → minimax. So `openrouter/x-ai/grok-4` and
+`opencode-go/grok-4.6` are one vendor, `xai`; an unaliased leading segment
+(`aion-labs`) stands as its own lowercased vendor.
+
 ### Vendor-independence guard
 
-At the end of selection and again immediately before launch, the panel must
+At the end of selection, which is the exact panel that launches, the panel must
 contain at least 3 models resolving to at least 3 distinct vendors. Otherwise
 the run refuses with exit 4 and prints the collapsed grouping.
 `--allow-correlated` overrides both the vendor count and the 3-model minimum,
@@ -305,7 +316,8 @@ From the JSON stream the runner keeps:
   manifest, so a reviewer that never opened a file is visibly not equal to one
   that read twelve.
 
-Per-reviewer timeout (default 600s) and an output-token ceiling. Breaching
+Per-reviewer timeout (default 10800s) and an output-token ceiling, each
+covering the reviewer as a whole, repair attempt included. Breaching
 either marks that reviewer `timeout` or `over-budget`; the run continues and
 the report is marked degraded.
 
@@ -325,34 +337,51 @@ appended to the conversation. Still invalid and the reviewer is marked
 
 ## Merge
 
-Fingerprint: `sha256(normalizedPath + "\0" + normalizeClaim(claim))`, where
-normalization lowercases, strips punctuation and collapses whitespace and
-stopwords. Stable across line moves, which is what lets suppression survive a
-refactor.
+Fingerprint: `sha256(normalizePath(file) + "\0" + normalizeClaim(claim))`.
+Claim normalization lowercases, strips punctuation, collapses whitespace and
+drops stopwords. Path normalization (`normaliseFindingPath`, shared with
+clustering and snapshot verification) trims, folds backslashes, `./` segments,
+duplicate and trailing slashes, but preserves case: `src/Foo.ts` and
+`src/foo.ts` are different files. Stable across line moves, which is what lets
+suppression survive a refactor.
 
-Clustering is union-find within a file. Two findings merge when all three hold:
+Clustering is union-find within one normalized path. Two findings merge when
+all three hold:
 
-1. line ranges overlap or lie within `mergeWindow` (default 8) lines;
-2. categories are equal;
-3. claim token Jaccard similarity >= `claimSimilarity` (default 0.45).
+1. line ranges overlap or lie within `mergeWindow` (default 10) lines;
+2. categories are compatible: equal (case-insensitive), or both in the
+   `security`/`correctness` pair, which independent reviewers routinely split
+   on for one defect;
+3. claim-token overlap coefficient (|A∩B| / min(|A|, |B|)) >=
+   `claimSimilarity` (default 0.6). Two claims with no content tokens at all
+   match only if their text is the same.
 
 Condition 3 is what prevents two unrelated findings on the same line from
-collapsing into one.
+collapsing into one. The overlap coefficient replaced Jaccard because it does
+not penalize one reviewer simply being more verbose than another.
 
-This is a heuristic, and the design treats it as one: `raw/` is kept verbatim,
-and every merged finding lists the source finding ids it was built from, so the
-consuming agent can always check the merge.
+This is a heuristic, and the design treats it as one: `reviewers/` keeps every
+reviewer's output verbatim, and every merged finding lists the source finding
+ids it was built from, so the consuming agent can always check the merge.
 
-Merged finding fields: `id`, `file`, `line`, `severity` (max of members),
-`severities` (per model), `category`, `claim`, `failure`, `raised_by`,
-`agreement`, `of`, `evidence[]`, `sources[]`, `fingerprint`.
+Within a cluster, members are ordered by reviewer id then finding index; the
+first supplies `claim` and `impact` (and so the fingerprint). `category` comes
+from the highest-severity member, ties broken by that member's fingerprint and
+then the category text — never by reviewer id.
 
-`of` is the number of reviewers that returned schema-valid findings, not the
-number launched. A panel of three where one timed out yields `of: 2`, so an
-agreement score is never silently deflated by a reviewer that never reported.
-The manifest carries the launched-versus-reported counts.
+Merged finding fields: `id`, `fingerprint`, `file` (normalized), `line`,
+`endLine`, `severity` (max of members), `perReviewerSeverity`, `category`,
+`claim`, `impact`, `evidence[]`, `suggestions[]`, `raisedBy`, `sources[]`,
+`agreement` (`raisers` of `reporting`), `unverifiable`, `memberFingerprints`.
 
-Sort by agreement desc, severity desc, path asc, line asc. Ids `F01…` are
+`agreement.reporting` is the number of reviewers that returned schema-valid
+findings, not the number launched. A panel of three where one timed out yields
+`reporting: 2`, so an agreement score is never silently deflated by a reviewer
+that never reported. The manifest carries the launched-versus-reported counts.
+
+Sort by agreement desc, severity desc, path asc, line asc, then fingerprint,
+category, end line and sources asc, which makes the order total. Every string
+comparison is by UTF-16 code unit, never locale collation. Ids `F001…` are
 assigned after sorting so they are stable for a given input.
 
 Suppression: a cluster is dropped if its fingerprint, or any member's, matches
@@ -361,8 +390,10 @@ Suppression: a cluster is dropped if its fingerprint, or any member's, matches
 
 ## Resolution tracking
 
-`--since last|<run-id>` loads the prior `findings.json` and matches by
-fingerprint:
+`--since last|<run-id>` loads the prior `findings.json` before any reviewer
+launches, and matches two findings when their fingerprints or any of their
+member fingerprints coincide (so a change of which reviewer's wording
+represents a cluster is not a resolve plus a new finding):
 
 - present before, absent now → `resolved`
 - present before and now → `still-present`
@@ -415,12 +446,15 @@ Exit codes:
 Active only when `HERDR_ENV=1`; otherwise every call below is a no-op with one
 printed notice, and the tool works normally in a plain shell and in CI.
 
-- `--pane [right|down]` reads `$HERDR_PANE_ID`, runs
+- `--pane` reads `$HERDR_PANE_ID`, runs
   `herdr pane split --current --direction <dir> --cwd "$PWD" --no-focus`, takes
   the new id from `.result.pane.pane_id`, then
   `herdr pane run <id> council-review --no-pane …`, and titles it with
   `herdr pane report-metadata --title "council · N models"`. Focus stays where
-  the user left it.
+  the user left it. `--direction horizontal|vertical` maps to `right|down`. If
+  the split or the run fails, the review runs in the invoking process instead;
+  the delegated run never re-opens `--pick`. Every herdr command is bounded by
+  a short timeout.
 - On completion, `herdr notification show` unless `--no-notify`.
 - `--handoff <agent>` writes HANDOFF.md, then `herdr agent prompt <agent>` with
   a prompt naming `findings.json` and instructing the agent to reproduce each
@@ -462,14 +496,15 @@ council-review [scope] [panel] [run] [herdr]
 council-review init [--pick]
 council-review models
 council-review show [<run-id>|last]
-council-review ignore <finding-id> [--reason <text>] [--run <run-id>]
+council-review ignore <finding-id> [--reason <text>] [--run <run-id>|last]
 council-review gc [--keep <n>]
 
 Scope   --staged  --range <A..B>  --paths <glob>...  --base <branch>
 Panel   --models <spec>[,…]  --pick  --thinking <level>  --allow-correlated
 Run     --timeout <s>  --max-tokens <n>  --since <last|run-id>
         --fail-on <severity|none>  --no-suppress  --json
-herdr   --pane [right|down]  --no-pane  --handoff <agent>  --no-notify
+herdr   --pane  --direction <horizontal|vertical>  --no-pane  --handoff <agent>
+        --no-notify
 ```
 
 ## Testing
@@ -485,7 +520,7 @@ herdr   --pane [right|down]  --no-pane  --handoff <agent>  --no-notify
   two unrelated findings on one line; suppression matching; resolution
   diffing; vendor mapping and the independence guard; scope resolution and
   snapshot building against temp git repos.
-- **Security.** Path-escape rejection in all four reviewer tools: `..`
+- **Security.** Path-escape rejection in every path-taking reviewer tool: `..`
   traversal, absolute paths, and symlinks pointing out of the snapshot. Plus a
   test asserting the spawn argv contains `-nbt` and no path that would
   re-enable a built-in.

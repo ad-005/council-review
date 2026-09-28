@@ -6,12 +6,14 @@
  */
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +24,10 @@ import {
   createRunDir,
   emitMachineReadableFindings,
   gcRuns,
+  listRunIds,
   listRuns,
+  readRunFindings,
+  resolveLastRunId,
   serializeFindings,
   slugifyModel,
   updateLastPointer,
@@ -888,5 +893,232 @@ describe('gcRuns', () => {
     symlinkSync('does-not-exist', join(reviewsDir, 'last'), 'dir');
 
     expect(() => gcRuns(projectRoot, 1)).not.toThrow();
+  });
+});
+
+// -------------------------------------------------------------------------------------------
+// Reviewer-controlled text in REPORT.md
+// -------------------------------------------------------------------------------------------
+
+/** Headings of a Markdown document that are outside any fenced code block, tracking fences the
+ * CommonMark way: an opening run of n >= 3 backticks is closed only by a line of >= n backticks
+ * and nothing else. */
+function headingsOutsideFences(text: string): string[] {
+  const headings: string[] = [];
+  let open = 0;
+  for (const line of text.split('\n')) {
+    const fence = /^ {0,3}(`{3,})(.*)$/.exec(line);
+    if (open === 0) {
+      if (fence) open = fence[1]!.length;
+      else if (/^#{1,6} /.test(line)) headings.push(line);
+    } else if (fence && fence[1]!.length >= open && fence[2]!.trim() === '') {
+      open = 0;
+    }
+  }
+  return headings;
+}
+
+describe('writeReport: reviewer-controlled text cannot restructure the report', () => {
+  const injection = 'x\n## Summary\n- Degraded: none';
+
+  it('collapses newlines in claim, impact and category so none can open a fake section', () => {
+    const run = createRunDir(projectRoot);
+    const findings = [
+      mergedFinding({
+        id: 'F001',
+        fingerprint: 'fp-1',
+        claim: injection,
+        impact: injection,
+        category: `security\n## Findings`,
+      }),
+    ];
+    const resolution: ResolutionOutcome = {
+      baselineRunId: 'prior-run',
+      current: [{ ...findings[0]!, resolution: 'new' }],
+      resolved: [
+        {
+          ...mergedFinding({ id: 'F009', fingerprint: 'fp-9', claim: injection }),
+          resolution: 'resolved',
+        },
+      ],
+      counts: { resolved: 1, stillPresent: 0, new: 1 },
+    };
+    const text = readFileSync(
+      writeReport(run, makeManifestInput(run), findings, resolution),
+      'utf8',
+    );
+
+    expect(headingsOutsideFences(text)).toEqual([
+      `# Council Review — ${run.id}`,
+      '## Resolution',
+      '## Panel',
+      '## Findings',
+      '### F001 — MEDIUM · security ## Findings [new]',
+      '## Summary',
+    ]);
+    expect(text).toContain('- **Claim:** x ## Summary - Degraded: none');
+    expect(text.match(/^- Degraded: none$/gm)).toHaveLength(1);
+  });
+
+  it('fences multi-line evidence and suggestions with a fence longer than any backtick run inside', () => {
+    const run = createRunDir(projectRoot);
+    const evidence = 'before\n```\n## Injected heading\n````';
+    const findings = [
+      mergedFinding({
+        id: 'F001',
+        fingerprint: 'fp-1',
+        evidence: [evidence, 'plain single-line evidence'],
+        suggestions: ['```ts\nfix()\n```', 'just do the obvious thing'],
+      }),
+    ];
+    const text = readFileSync(writeReport(run, makeManifestInput(run), findings, null), 'utf8');
+
+    expect(text).toContain(`\`\`\`\`\`\n${evidence}\n\`\`\`\`\``);
+    expect(text).toContain('````\n```ts\nfix()\n```\n````');
+    expect(text).toContain('- plain single-line evidence');
+    expect(text).toContain('- just do the obvious thing');
+    expect(headingsOutsideFences(text)).not.toContain('## Injected heading');
+    expect(headingsOutsideFences(text)).toContain('## Summary');
+  });
+
+  it('renders a path containing backticks in a code span with a longer delimiter', () => {
+    const run = createRunDir(projectRoot);
+    const findings = [
+      mergedFinding({ id: 'F001', fingerprint: 'fp-1', file: 'src/a`b.ts' }),
+      mergedFinding({ id: 'F002', fingerprint: 'fp-2', file: '`edge.ts', endLine: 12 }),
+    ];
+    const text = readFileSync(writeReport(run, makeManifestInput(run), findings, null), 'utf8');
+    expect(text).toContain('- **Location:** ``src/a`b.ts:10``');
+    expect(text).toContain('- **Location:** `` `edge.ts:10-12 ``');
+  });
+
+  it('renders the Location/Agreement/Claim/Impact metadata as separate list items', () => {
+    const run = createRunDir(projectRoot);
+    const findings = [mergedFinding({ id: 'F001', fingerprint: 'fp-1' })];
+    const text = readFileSync(writeReport(run, makeManifestInput(run), findings, null), 'utf8');
+    expect(text).toContain(
+      [
+        '- **Location:** `src/a.ts:10`',
+        '- **Agreement:** 1/2 reviewers (openrouter/vendor-x/model-a)',
+        '- **Claim:** placeholder claim',
+        '- **Impact:** placeholder impact',
+      ].join('\n'),
+    );
+  });
+
+  it('collapses newlines in a degraded reviewer error', () => {
+    const run = createRunDir(projectRoot);
+    const reviewer = makeReviewer({ provider: 'openrouter', model: 'model-a' });
+    const results = [
+      makeReviewerResult({ reviewer, state: 'failed', findings: null, error: 'bad\n## Summary' }),
+    ];
+    const input = makeManifestInput(run, { outcome: makeOutcome(results) });
+    const text = readFileSync(writeReport(run, input, [], null), 'utf8');
+    expect(headingsOutsideFences(text).filter((h) => h.startsWith('## Summary'))).toHaveLength(1);
+    expect(text).toContain('(failed: bad ## Summary)');
+  });
+
+  it('marks resolution per finding by id, so two findings sharing a fingerprint keep their own markers', () => {
+    const run = createRunDir(projectRoot);
+    const findings = [
+      mergedFinding({ id: 'F001', fingerprint: 'fp-same', category: 'security' }),
+      mergedFinding({ id: 'F002', fingerprint: 'fp-same', category: 'style' }),
+    ];
+    const resolution: ResolutionOutcome = {
+      baselineRunId: 'prior-run',
+      current: [
+        { ...findings[0]!, resolution: 'still-present' },
+        { ...findings[1]!, resolution: 'new' },
+      ],
+      resolved: [],
+      counts: { resolved: 0, stillPresent: 1, new: 1 },
+    };
+    const text = readFileSync(
+      writeReport(run, makeManifestInput(run), findings, resolution),
+      'utf8',
+    );
+    expect(text).toContain('### F001 — MEDIUM · security [still-present]');
+    expect(text).toContain('### F002 — MEDIUM · style [new]');
+  });
+
+  it('describes a missing baseline without claiming this is the first run', () => {
+    const run = createRunDir(projectRoot);
+    const resolution: ResolutionOutcome = {
+      baselineRunId: null,
+      current: [],
+      resolved: [],
+      counts: { resolved: 0, stillPresent: 0, new: 0 },
+    };
+    const text = readFileSync(writeReport(run, makeManifestInput(run), [], resolution), 'utf8');
+    expect(text).not.toMatch(/first run/i);
+    expect(text).toMatch(/could not be read/);
+  });
+});
+
+describe('writeManifest: resolution summary', () => {
+  it('records the baseline, counts and resolved fingerprints when a diff was requested', () => {
+    const run = createRunDir(projectRoot);
+    const resolution: ResolutionOutcome = {
+      baselineRunId: 'prior-run',
+      current: [{ ...mergedFinding({ id: 'F001', fingerprint: 'fp-1' }), resolution: 'new' }],
+      resolved: [{ ...mergedFinding({ id: 'F009', fingerprint: 'fp-9' }), resolution: 'resolved' }],
+      counts: { resolved: 1, stillPresent: 0, new: 1 },
+    };
+    const manifest = JSON.parse(
+      readFileSync(writeManifest(makeManifestInput(run, { resolution })), 'utf8'),
+    );
+    expect(manifest.resolution).toEqual({
+      baselineRunId: 'prior-run',
+      counts: { resolved: 1, stillPresent: 0, new: 1 },
+      resolvedFingerprints: ['fp-9'],
+    });
+  });
+
+  it('omits the resolution key when no diff was requested', () => {
+    const run = createRunDir(projectRoot);
+    const manifest = JSON.parse(
+      readFileSync(writeManifest(makeManifestInput(run, { resolution: null })), 'utf8'),
+    );
+    expect(manifest).not.toHaveProperty('resolution');
+  });
+});
+
+describe('resolveLastRunId / readRunFindings / listRunIds', () => {
+  it('resolves the last symlink to its run id', () => {
+    const run = createRunDir(projectRoot);
+    updateLastPointer(run);
+    expect(resolveLastRunId(run.reviewsDir)).toBe(run.id);
+  });
+
+  it('returns null for no link at all, a dangling link, or a real directory named last', () => {
+    const reviewsDir = join(projectRoot, '.council', 'reviews');
+    expect(resolveLastRunId(reviewsDir)).toBeNull();
+    createRunDir(projectRoot);
+    symlinkSync('does-not-exist', join(reviewsDir, 'last'), 'dir');
+    expect(resolveLastRunId(reviewsDir)).toBeNull();
+    rmSync(join(reviewsDir, 'last'));
+    mkdirSync(join(reviewsDir, 'last'));
+    expect(resolveLastRunId(reviewsDir)).toBeNull();
+  });
+
+  it('reads a well-formed findings.json and rejects malformed ones', () => {
+    const run = createRunDir(projectRoot);
+    const findings = [mergedFinding({ id: 'F001', fingerprint: 'fp-1' })];
+    writeFindings(run, findings);
+    expect(readRunFindings(run.reviewsDir, run.id)).toEqual(findings);
+
+    for (const body of ['{}', '[null]', '[{}]', '[{"id":"F001","fingerprint":7}]', 'nope']) {
+      writeFileSync(join(run.path, 'findings.json'), body, 'utf8');
+      expect(readRunFindings(run.reviewsDir, run.id), body).toBeNull();
+    }
+    expect(readRunFindings(run.reviewsDir, 'no-such-run')).toBeNull();
+  });
+
+  it('lists run ids newest first, excluding last and dot-entries', () => {
+    const a = createRunDir(projectRoot);
+    const b = createRunDir(projectRoot);
+    updateLastPointer(b);
+    mkdirSync(join(a.reviewsDir, '.hidden'));
+    expect(listRunIds(a.reviewsDir)).toEqual([a.id, b.id].sort().reverse());
   });
 });

@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `council-review` sends the work in a git worktree to several models from **different vendors** and
 merges their findings in deterministic code, never through another model. Each reviewer is a
-separate `pi` host process launched with every built-in removed; its entire tool surface is four
+separate `pi` host process launched with every built-in removed; its entire tool surface is five
 read-only tools scoped to a frozen, non-writable copy of the tree. Read
 `docs/design/council-review-design.md` before any non-trivial change — it is the committed design
 source of truth.
@@ -72,10 +72,10 @@ Invariants that are not obvious from any single file:
 - **`src/reviewer-tools.ts` is the security boundary.** It is loaded by path into a foreign
   reviewer process, is never imported by this package's runtime (deliberately absent from
   `index.ts`), may import **only** `node:` builtins (enforced by an eslint `no-restricted-imports`
-  rule and by `test/security/reviewer-spawn.test.ts`), and registers exactly four tools:
-  `council_read`, `council_grep`, `council_list`, `council_git`.
-- **Two roots, never confused.** `COUNCIL_SNAPSHOT_ROOT` is the frozen tree the three read tools
-  are contained within; `COUNCIL_REPO_ROOT` is the real repository, reachable only through
+  rule and by `test/security/reviewer-spawn.test.ts`), and registers exactly five tools:
+  `council_read`, `council_grep`, `council_list`, `council_git`, `council_codegraph`.
+- **Two roots, never confused.** `COUNCIL_SNAPSHOT_ROOT` is the frozen tree the read tools (and
+  `council_codegraph`'s index) are contained within; `COUNCIL_REPO_ROOT` is the real repository, reachable only through
   `council_git`'s read-only subcommand allowlist with literal arguments.
 - **The reviewer environment is an allowlist, not a denylist** (`buildReviewerEnv`). No
   `*_API_KEY`-shaped variable reaches a reviewer; a reviewer authenticates only through the host's

@@ -105,6 +105,20 @@ describe('ensureSnapshotIndex', () => {
     expect(Date.now() - started).toBeLessThan(20000);
   });
 
+  it('maps runaway output killed at the buffer cap to index-failed, not index-timeout', async () => {
+    const dir = makeTmpDir();
+    // Node sets `killed` for a maxBuffer overflow too; only the timeout is a timeout.
+    const stub = writeStub(dir, 'codegraph-noisy', 'head -c 65536 /dev/zero; sleep 5');
+
+    const status = await ensureSnapshotIndex(join(dir, 'snapshot-root'), {
+      bin: stub,
+      timeoutSeconds: 20,
+      maxBufferBytes: 1024,
+    });
+
+    expect(status).toEqual({ available: false, reason: 'index-failed' });
+  });
+
   it('returns disabled without spawning when enabled is false', async () => {
     const dir = makeTmpDir();
     const status = await ensureSnapshotIndex(join(dir, 'snapshot-root'), {

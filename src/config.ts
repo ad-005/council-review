@@ -300,6 +300,12 @@ function applyDefaults(raw: RawConfig): CouncilConfig {
   };
 }
 
+/** A fully-defaulted configuration with an empty panel: what a run uses when a panel override
+ *  (`--models`/`--pick`) stands in for a missing `.council/config.json`. */
+export function defaultConfig(): CouncilConfig {
+  return applyDefaults({ version: CONFIG_DEFAULTS.version!, panel: [] });
+}
+
 export function loadConfig(projectRoot: string): CouncilConfig {
   const file = configPath(projectRoot);
   const raw = tryReadJsonFile(file);
@@ -336,6 +342,21 @@ export function loadConfig(projectRoot: string): CouncilConfig {
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * The raw config document `writeConfig` would merge into: `{}` when none exists, the parsed
+ * object otherwise. Throws `ConfigError` for unreadable or malformed JSON, or a non-object top
+ * level -- so a caller about to do interactive work before writing can fail first, not after.
+ */
+export function readConfigDocument(projectRoot: string): Record<string, unknown> {
+  const file = configPath(projectRoot);
+  const raw = tryReadJsonFile(file);
+  if (raw === NOT_FOUND) return {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError(`Invalid config in ${file}: expected a JSON object at the top level`);
+  }
+  return raw as Record<string, unknown>;
+}
+
+/**
  * Merges `patch` over the document currently on disk (or over `{}` when none exists yet) and
  * writes the result back. The merge is a shallow object spread over the *raw* JSON, not the
  * typed `CouncilConfig` — so a key the current schema does not know about survives untouched,
@@ -343,17 +364,7 @@ export function loadConfig(projectRoot: string): CouncilConfig {
  */
 export function writeConfig(projectRoot: string, patch: Partial<CouncilConfig>): void {
   const file = configPath(projectRoot);
-  const raw = tryReadJsonFile(file);
-
-  let existing: Record<string, unknown> = {};
-  if (raw !== NOT_FOUND) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-      throw new ConfigError(`Invalid config in ${file}: expected a JSON object at the top level`);
-    }
-    existing = raw as Record<string, unknown>;
-  }
-
-  const merged = { ...existing, ...patch };
+  const merged = { ...readConfigDocument(projectRoot), ...patch };
 
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(merged, null, 2) + '\n', 'utf8');

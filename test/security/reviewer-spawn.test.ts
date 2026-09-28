@@ -146,6 +146,16 @@ describe('buildReviewerEnv', () => {
     expect(env.PI_TELEMETRY).toBe('0');
   });
 
+  it('drops credential-shaped names even inside the PI_* namespace', () => {
+    const env = buildReviewerEnv({
+      PI_OPENAI_API_KEY: 'sk-x',
+      PI_GITHUB_TOKEN: 'ghp-x',
+      PI_CLIENT_SECRET: 's',
+      PI_OFFLINE: '1',
+    });
+    expect(env).toEqual({ PI_OFFLINE: '1' });
+  });
+
   it('produces an empty environment from an empty input', () => {
     expect(buildReviewerEnv({})).toEqual({});
   });

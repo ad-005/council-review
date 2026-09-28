@@ -5,23 +5,29 @@
  * the live tree" for why the snapshot builder (Section 8) keys off `endRevision` the way it does.
  *
  * Every git invocation uses an argument array, never a shell string, and under no circumstances
- * does this module modify the caller's working tree, index, HEAD, stash or refs: the default
- * scope's fold of untracked files happens against a throwaway index file (see
- * `withThrowawayIndex`), and every other operation is read-only.
+ * does this module modify the caller's working tree, index, object store, HEAD, stash or refs:
+ * the default scope's fold of untracked files happens against a throwaway index file and object
+ * directory (see `withThrowawayIndex`), every other operation is read-only, and every call runs
+ * with `--no-optional-locks` so not even a stat refresh is written back to the real index.
+ *
+ * Paths are data, never syntax: listings are read NUL-separated (`-z`, no C-quoting, no
+ * trimming), and file names handed back to git are literal pathspecs (`--literal-pathspecs`),
+ * never pathspec magic or globs.
  */
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtemp, copyFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, copyFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { delimiter, isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import picomatch from 'picomatch';
 import { reviewsDirPath } from './report.js';
+import { CHILD_MAX_BUFFER, childErrorMessage } from './child-output.js';
 
 export type ScopeMode = 'worktree' | 'staged' | 'range' | 'revision';
 
 export interface ScopeSelectors {
   staged?: boolean;
-  range?: string; // 'A..B'
+  range?: string; // 'A..B' ('A...B' is accepted but diffed identically -- see resolveRangeScope)
   revision?: string; // single rev
   paths?: string[]; // globs
   base?: string; // base-branch override
@@ -52,13 +58,34 @@ export class ScopeError extends Error {
 
 const execFileAsync = promisify(execFile);
 
-// Diffs on a large default scope must not be silently truncated by Node's default 1MB buffer.
-const GIT_MAX_BUFFER = 1024 * 1024 * 256;
-
 // The canonical empty-tree object, used as the "parent" of a root commit so a single-revision
 // scope on a repository's first commit still produces a literal `git diff` (a full-file-addition
 // patch) rather than needing special-cased handling downstream.
 const EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+// Prepended to every git call. `--no-optional-locks` stops read-only commands (notably
+// `status`) from refreshing stat data and rewriting the caller's real index under index.lock;
+// `core.quotePath=false` keeps non-ASCII names readable in the patch reviewers receive (names
+// with control characters, `"` or `\` are still C-quoted by git; blast-radius.ts decodes them).
+const GIT_GLOBAL_ARGS: readonly string[] = ['--no-optional-locks', '-c', 'core.quotePath=false'];
+
+// Pinned on every `git diff`, so user config cannot reshape the output: no color
+// (`color.ui=always`), no external diff program (`diff.external`, attribute drivers), no
+// textconv filter, and git's standard `a/`/`b/` prefixes whatever `diff.noprefix` or
+// `diff.mnemonicPrefix` say (blast-radius.ts parses the patch). Binary files still render as
+// git's default "Binary files ... differ" line.
+const DIFF_OPTS: readonly string[] = [
+  '--no-color',
+  '--no-ext-diff',
+  '--no-textconv',
+  '--src-prefix=a/',
+  '--dst-prefix=b/',
+];
+
+// Upper bound on the pathspec bytes one `git diff` receives. `git diff` has no
+// `--pathspec-from-file`, so a large file set is split across several calls instead of
+// overflowing argv (E2BIG). Well under Linux's 2MB ARG_MAX and Windows' 32K command line.
+const PATHSPEC_BATCH_BYTES = 24 * 1024;
 
 /**
  * Resolves the repository root containing `cwd`. Synchronous, and does not require the rest of
@@ -71,11 +98,13 @@ export function findRepoRoot(cwd: string): string {
     // `catch` below already raises a better-worded `ScopeError`, and callers like `status` treat
     // "not a git repository" as ordinary, reportable state rather than a crash -- git's own noise
     // on top of that would make a clean status report look like a failure.
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
+    return chompLine(
+      execFileSync('git', [...GIT_GLOBAL_ARGS, 'rev-parse', '--show-toplevel'], {
+        cwd,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }),
+    );
   } catch {
     throw new ScopeError(`not a git repository (or any parent up to the mount point): "${cwd}"`);
   }
@@ -106,10 +135,25 @@ export async function resolveScope(
   const mode = determineMode(selectors);
   const paths = selectors.paths && selectors.paths.length > 0 ? selectors.paths : undefined;
 
-  const head = (await runGit(['rev-parse', 'HEAD'], { cwd: repoRoot })).trim();
-  const dirty =
-    (await runGit(['status', '--porcelain', '--untracked-files=normal'], { cwd: repoRoot })).trim()
-      .length > 0;
+  const head = await tryRevParse(repoRoot, 'HEAD^{commit}');
+  if (head === null) {
+    throw new ScopeError(
+      'the repository has no commits yet (HEAD does not resolve to a commit); make a first commit before reviewing',
+    );
+  }
+  // The tool's own run artifacts are excluded here for the same reason as everywhere else
+  // (see `excludeOwnRunArtifacts`): a previous run's output must not make the tree look dirty.
+  const status = await runGit(
+    [
+      'status',
+      '--porcelain',
+      '--untracked-files=normal',
+      '--',
+      `:(top,exclude,literal)${reviewsDirRelPath(repoRoot)}`,
+    ],
+    { cwd: repoRoot },
+  );
+  const dirty = status.length > 0;
 
   let baseBranch: string | null = null;
   let mergeBase: string | null = null;
@@ -121,7 +165,7 @@ export async function resolveScope(
     const branchName = selectors.base ?? opts.baseBranch;
     const baseSha = await resolveBaseBranch(repoRoot, branchName);
     baseBranch = branchName;
-    mergeBase = (await runGit(['merge-base', head, baseSha], { cwd: repoRoot })).trim();
+    mergeBase = await resolveMergeBase(repoRoot, head, baseSha, branchName);
     ({ patch, files } = await resolveWorktreeScope(repoRoot, mergeBase, paths));
     endRevision = null;
   } else if (mode === 'staged') {
@@ -164,6 +208,11 @@ function determineMode(selectors: ScopeSelectors): ScopeMode {
 
 // ---------------------------------------------------------------------------------------------
 // Per-mode resolution
+//
+// Every mode lists its changed paths with `--no-renames`, so a rename contributes both its old
+// path (a deletion) and its new path to `files`, and `--paths` narrows each side independently.
+// The patch then diffs exactly those paths with rename detection on, so a rename whose two sides
+// both survive narrowing still renders as one `rename from`/`rename to` entry.
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -189,15 +238,22 @@ async function resolveWorktreeScope(
     // them only to filter them back out of `files` a few lines down.
     const narrowedUntracked = excludeOwnRunArtifacts(narrowByGlobs(untracked, paths), repoRoot);
     if (narrowedUntracked.length > 0) {
-      await runGit(['add', '--intent-to-add', '--', ...narrowedUntracked], { cwd: repoRoot, env });
+      // Over stdin, NUL-separated: no argv size limit, however many untracked files there are.
+      await runGit(
+        [
+          '--literal-pathspecs',
+          'add',
+          '--intent-to-add',
+          '--pathspec-from-file=-',
+          '--pathspec-file-nul',
+        ],
+        { cwd: repoRoot, env, input: narrowedUntracked.join('\0') },
+      );
     }
 
-    const nameOnly = await runGit(['diff', '--name-only', mergeBase], { cwd: repoRoot, env });
-    const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
-    if (files.length === 0) {
-      return { patch: '', files: [] };
-    }
-    const patch = await runGit(['diff', mergeBase, '--', ...files], { cwd: repoRoot, env });
+    const changed = await listChangedPaths(repoRoot, [mergeBase], env);
+    const files = excludeOwnRunArtifacts(narrowByGlobs(changed, paths), repoRoot);
+    const patch = await diffPatch(repoRoot, [mergeBase], files, env);
     return { patch, files };
   });
 }
@@ -207,16 +263,17 @@ async function resolveStagedScope(
   repoRoot: string,
   paths: string[] | undefined,
 ): Promise<{ patch: string; files: string[] }> {
-  const nameOnly = await runGit(['diff', '--cached', '--name-only'], { cwd: repoRoot });
-  const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
-  if (files.length === 0) {
-    return { patch: '', files: [] };
-  }
-  const patch = await runGit(['diff', '--cached', '--', ...files], { cwd: repoRoot });
+  const changed = await listChangedPaths(repoRoot, ['--cached']);
+  const files = excludeOwnRunArtifacts(narrowByGlobs(changed, paths), repoRoot);
+  const patch = await diffPatch(repoRoot, ['--cached'], files);
   return { patch, files };
 }
 
-/** A range scope is a literal diff between its two endpoints, whichever separator (`..`/`...`) was typed. */
+/**
+ * A range scope is a literal diff between its two endpoints, whichever separator was typed.
+ * This deliberately differs from `git diff A...B`, which diffs from `merge-base(A, B)` to B:
+ * here `A...B` means exactly what `A..B` does, the tree at A against the tree at B.
+ */
 async function resolveRangeScope(
   repoRoot: string,
   range: string,
@@ -226,10 +283,9 @@ async function resolveRangeScope(
   const from = await resolveRevision(repoRoot, fromRef);
   const to = await resolveRevision(repoRoot, toRef);
 
-  const nameOnly = await runGit(['diff', '--name-only', from, to], { cwd: repoRoot });
-  const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
-  const patch =
-    files.length === 0 ? '' : await runGit(['diff', from, to, '--', ...files], { cwd: repoRoot });
+  const changed = await listChangedPaths(repoRoot, [from, to]);
+  const files = excludeOwnRunArtifacts(narrowByGlobs(changed, paths), repoRoot);
+  const patch = await diffPatch(repoRoot, [from, to], files);
   return { patch, files, endRevision: to };
 }
 
@@ -242,12 +298,9 @@ async function resolveRevisionScope(
   const rev = await resolveRevision(repoRoot, revision);
   const parent = await resolveParent(repoRoot, rev);
 
-  const nameOnly = await runGit(['diff', '--name-only', parent, rev], { cwd: repoRoot });
-  const files = excludeOwnRunArtifacts(narrowByGlobs(splitLines(nameOnly), paths), repoRoot);
-  const patch =
-    files.length === 0
-      ? ''
-      : await runGit(['diff', parent, rev, '--', ...files], { cwd: repoRoot });
+  const changed = await listChangedPaths(repoRoot, [parent, rev]);
+  const files = excludeOwnRunArtifacts(narrowByGlobs(changed, paths), repoRoot);
+  const patch = await diffPatch(repoRoot, [parent, rev], files);
   return { patch, files, endRevision: rev };
 }
 
@@ -255,9 +308,10 @@ async function resolveRevisionScope(
 // git plumbing
 // ---------------------------------------------------------------------------------------------
 
-/** Splits a range selector on its first `..` or `...`. Refnames cannot contain `..`, so the
- *  first occurrence is always the unambiguous split point regardless of which form was typed.
- *  A missing side defaults to HEAD, matching git's own range syntax. */
+/** Splits a range selector on its first `..` or `...` (both mean the same here -- see
+ *  `resolveRangeScope`). Refnames cannot contain `..`, so the first occurrence is always the
+ *  unambiguous split point regardless of which form was typed. A missing side defaults to HEAD,
+ *  matching git's own range syntax. */
 function splitRange(range: string): { fromRef: string; toRef: string } {
   const match = /^(.*?)\.\.\.?(.*)$/.exec(range);
   if (!match) {
@@ -270,83 +324,158 @@ function splitRange(range: string): { fromRef: string; toRef: string } {
   };
 }
 
-async function resolveRevision(repoRoot: string, ref: string): Promise<string> {
+/** `git rev-parse --verify` of one spec, or null when it does not resolve. */
+async function tryRevParse(repoRoot: string, spec: string): Promise<string | null> {
   try {
-    const out = await execFileAsync('git', ['rev-parse', '--verify', `${ref}^{commit}`], {
-      cwd: repoRoot,
-      maxBuffer: GIT_MAX_BUFFER,
-    });
-    return out.stdout.trim();
+    return (await runGit(['rev-parse', '--verify', '--quiet', spec], { cwd: repoRoot })).trim();
   } catch {
-    throw new ScopeError(`unresolvable revision: "${ref}"`);
+    return null;
   }
 }
 
-async function resolveParent(repoRoot: string, rev: string): Promise<string> {
-  try {
-    const out = await execFileAsync('git', ['rev-parse', '--verify', `${rev}^`], {
-      cwd: repoRoot,
-      maxBuffer: GIT_MAX_BUFFER,
-    });
-    return out.stdout.trim();
-  } catch {
-    // No parent: rev is a root commit. Diff against the empty tree instead.
-    return EMPTY_TREE_SHA;
+async function resolveRevision(repoRoot: string, ref: string): Promise<string> {
+  const sha = await tryRevParse(repoRoot, `${ref}^{commit}`);
+  if (sha === null) {
+    throw new ScopeError(`unresolvable revision: "${ref}"`);
   }
+  return sha;
+}
+
+/** A revision's first parent, or the empty tree when it has none (a root commit). */
+async function resolveParent(repoRoot: string, rev: string): Promise<string> {
+  return (await tryRevParse(repoRoot, `${rev}^`)) ?? EMPTY_TREE_SHA;
 }
 
 /** Resolves a base branch name to a commit, naming it in the error on failure. Tries a local
  *  branch first, then falls back to any ref of that name (a remote-tracking ref such as
  *  `origin/main` is the common case for a base branch that isn't checked out locally). */
 async function resolveBaseBranch(repoRoot: string, branch: string): Promise<string> {
+  const sha =
+    (await tryRevParse(repoRoot, `refs/heads/${branch}^{commit}`)) ??
+    (await tryRevParse(repoRoot, `${branch}^{commit}`));
+  if (sha === null) {
+    throw new ScopeError(`unknown base branch: "${branch}"`);
+  }
+  return sha;
+}
+
+async function resolveMergeBase(
+  repoRoot: string,
+  head: string,
+  baseSha: string,
+  branch: string,
+): Promise<string> {
   try {
-    const out = await execFileAsync(
-      'git',
-      ['rev-parse', '--verify', `refs/heads/${branch}^{commit}`],
-      {
-        cwd: repoRoot,
-        maxBuffer: GIT_MAX_BUFFER,
-      },
-    );
-    return out.stdout.trim();
+    return (await runGit(['merge-base', head, baseSha], { cwd: repoRoot })).trim();
   } catch {
-    try {
-      const out = await execFileAsync('git', ['rev-parse', '--verify', `${branch}^{commit}`], {
-        cwd: repoRoot,
-        maxBuffer: GIT_MAX_BUFFER,
-      });
-      return out.stdout.trim();
-    } catch {
-      throw new ScopeError(`unknown base branch: "${branch}"`);
-    }
+    // Both sides are verified commits, so the one way this fails is `merge-base` exiting 1
+    // with no output at all: the histories share no commit (an orphan branch, an unrelated
+    // import), and git's own message would be empty.
+    throw new ScopeError(
+      `no common ancestor between HEAD and base branch "${branch}"; pass --base <branch> or --range <A..B>`,
+    );
   }
 }
 
 async function listUntrackedNotIgnored(repoRoot: string): Promise<string[]> {
-  const out = await runGit(['ls-files', '--others', '--exclude-standard'], { cwd: repoRoot });
-  return splitLines(out);
+  // An entry ending in `/` is an untracked embedded repository, which git lists as one directory
+  // rather than descending into: none of its content belongs to this repository's change (the
+  // snapshot skips it too), and `add --intent-to-add` refuses one with no commit checked out.
+  return splitNul(
+    await runGit(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot }),
+  ).filter((f) => !f.endsWith('/'));
+}
+
+/** Paths changed between the given endpoints (`revArgs` as `git diff` takes them), with each
+ *  rename split into its deletion and its addition so both paths are listed. */
+async function listChangedPaths(
+  repoRoot: string,
+  revArgs: readonly string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<string[]> {
+  const out = await runGit(
+    ['diff', ...DIFF_OPTS, '--no-renames', '--name-only', '-z', ...revArgs],
+    { cwd: repoRoot, env },
+  );
+  return splitNul(out);
+}
+
+/**
+ * The unified patch for exactly `files` between the given endpoints, as literal pathspecs. A
+ * file set too large for one argv is diffed in batches and concatenated; the only visible
+ * difference is that a rename whose two sides land in different batches renders as a deletion
+ * plus an addition, which is still a correct patch.
+ */
+async function diffPatch(
+  repoRoot: string,
+  revArgs: readonly string[],
+  files: readonly string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  let patch = '';
+  for (const batch of pathspecBatches(files)) {
+    patch += await runGit(
+      ['--literal-pathspecs', 'diff', ...DIFF_OPTS, '--find-renames', ...revArgs, '--', ...batch],
+      { cwd: repoRoot, env },
+    );
+  }
+  return patch;
+}
+
+function pathspecBatches(files: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  let current: string[] = [];
+  let bytes = 0;
+  for (const f of files) {
+    const size = Buffer.byteLength(f) + 3; // separator, plus quoting on Windows
+    if (current.length > 0 && bytes + size > PATHSPEC_BATCH_BYTES) {
+      batches.push(current);
+      current = [];
+      bytes = 0;
+    }
+    current.push(f);
+    bytes += size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
 /**
  * Runs `fn` with an env pointing `GIT_INDEX_FILE` at a private copy of the repo's real index, so
- * `git add --intent-to-add` inside `fn` can never touch the caller's real index. The temp copy
- * (and its containing directory) is removed once `fn` settles, success or failure.
+ * `git add --intent-to-add` inside `fn` can never touch the caller's real index. Object writes
+ * are redirected the same way: `--intent-to-add` records an empty blob, and `GIT_OBJECT_DIRECTORY`
+ * sends that write into the temp directory while the real object store stays readable as an
+ * alternate. The temp directory is removed once `fn` settles, success or failure.
  */
 async function withThrowawayIndex<T>(
   repoRoot: string,
   fn: (env: NodeJS.ProcessEnv) => Promise<T>,
 ): Promise<T> {
-  const gitDirRaw = (await runGit(['rev-parse', '--git-dir'], { cwd: repoRoot })).trim();
-  const gitDir = isAbsolute(gitDirRaw) ? gitDirRaw : join(repoRoot, gitDirRaw);
-  const realIndex = join(gitDir, 'index');
+  // `--git-path` resolves both correctly in a linked worktree (its own index, the common object
+  // store) and honours a GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY already set in the environment.
+  const [realIndex, realObjects] = (
+    await runGit(['rev-parse', '--git-path', 'index', '--git-path', 'objects'], { cwd: repoRoot })
+  )
+    .split('\n')
+    .slice(0, 2)
+    .map((p) => (isAbsolute(p) ? p : join(repoRoot, p)));
 
   const tempDir = await mkdtemp(join(tmpdir(), 'council-review-scope-'));
   const tempIndex = join(tempDir, 'index');
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_INDEX_FILE: tempIndex };
+  const tempObjects = join(tempDir, 'objects');
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_INDEX_FILE: tempIndex,
+    GIT_OBJECT_DIRECTORY: tempObjects,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: [realObjects, process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES]
+      .filter((d) => d !== undefined && d.length > 0)
+      .join(delimiter),
+  };
 
   try {
+    await mkdir(tempObjects);
     try {
-      await copyFile(realIndex, tempIndex);
+      await copyFile(realIndex as string, tempIndex);
     } catch {
       // No index file exists yet (nothing has ever been staged in this repo): seed the
       // throwaway index from HEAD's tree so it starts equivalent to a clean checkout.
@@ -414,35 +543,55 @@ function narrowByGlobs(files: readonly string[], globs: readonly string[] | unde
   return files.filter((f) => isMatch(f));
 }
 
-function splitLines(s: string): string[] {
-  return s
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+/** Splits `-z` output. Entries are taken verbatim: a path may begin or end with whitespace. */
+function splitNul(s: string): string[] {
+  return s.split('\0').filter((entry) => entry.length > 0);
+}
+
+/** Drops the single trailing newline git prints after a path, keeping any other whitespace. */
+function chompLine(s: string): string {
+  return s.endsWith('\n') ? s.slice(0, -1) : s;
+}
+
+/** Global pathspec modes a user can set in the environment. Each changes how every pathspec
+ *  below is read (`GIT_LITERAL_PATHSPECS` defeats the dirty check's exclude magic; the others
+ *  are rejected outright alongside `--literal-pathspecs`), so none reaches a git call here. */
+const PATHSPEC_ENV_VARS = [
+  'GIT_LITERAL_PATHSPECS',
+  'GIT_GLOB_PATHSPECS',
+  'GIT_NOGLOB_PATHSPECS',
+  'GIT_ICASE_PATHSPECS',
+] as const;
+
+function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...base };
+  for (const name of PATHSPEC_ENV_VARS) delete env[name];
+  return env;
 }
 
 async function runGit(
   args: readonly string[],
-  opts: { cwd: string; env?: NodeJS.ProcessEnv },
+  opts: { cwd: string; env?: NodeJS.ProcessEnv; input?: string },
 ): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', args as string[], {
+    const pending = execFileAsync('git', [...GIT_GLOBAL_ARGS, ...args], {
       cwd: opts.cwd,
-      env: opts.env,
-      maxBuffer: GIT_MAX_BUFFER,
+      env: gitEnv(opts.env),
+      maxBuffer: CHILD_MAX_BUFFER,
     });
+    // stdin is always closed, so no git command can ever wait on it. A write error (git exited
+    // before reading its input) surfaces as the command's own failure below.
+    pending.child.stdin?.on('error', () => {});
+    pending.child.stdin?.end(opts.input ?? '');
+    const { stdout } = await pending;
     return stdout;
   } catch (err) {
-    throw new ScopeError(`git ${args.join(' ')} failed: ${errorMessage(err)}`);
+    throw new ScopeError(`git ${describeArgs(args)} failed: ${childErrorMessage(err)}`);
   }
 }
 
-function errorMessage(err: unknown): string {
-  if (err && typeof err === 'object') {
-    const stderr = (err as { stderr?: unknown }).stderr;
-    if (typeof stderr === 'string' && stderr.trim().length > 0) {
-      return stderr.trim();
-    }
-  }
-  return err instanceof Error ? err.message : String(err);
+/** The argv for an error message, capped: a batched diff can carry thousands of paths. */
+function describeArgs(args: readonly string[]): string {
+  const text = args.join(' ');
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
 }

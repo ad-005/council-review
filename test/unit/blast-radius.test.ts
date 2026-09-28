@@ -29,7 +29,8 @@ import {
   type ChangedSymbol,
   type CodeRef,
 } from '../../src/blast-radius.js';
-import type { ResolvedScope } from '../../src/scope.js';
+import { resolveScope, type ResolvedScope } from '../../src/scope.js';
+import { createTestRepo } from '../helpers/git-repo.js';
 
 const tmpDirs: string[] = [];
 
@@ -104,13 +105,13 @@ function sym(name: string, kind: string, file: string, startLine: number): Chang
 // -------------------------------------------------------------------------------------------
 
 describe('parsePatchHunks', () => {
-  it('parses a modified file with one hunk', () => {
+  it('parses a modified file with one hunk, excluding its context lines', () => {
     expect(parsePatchHunks(PATCH_ADD)).toEqual([
       {
         path: 'src/add.js',
         oldPath: 'src/add.js',
         status: 'modified',
-        hunks: [{ start: 1, count: 3 }],
+        hunks: [{ start: 2, end: 2 }],
       },
     ]);
   });
@@ -121,14 +122,21 @@ describe('parsePatchHunks', () => {
       '--- a/a.js',
       '+++ b/a.js',
       '@@ -1,2 +1,2 @@',
-      ' x',
-      '@@ -10,3 +10,5 @@',
+      '-x',
+      '+X',
       ' y',
+      '@@ -10,3 +10,5 @@',
+      ' p',
+      '+q1',
+      '+q2',
+      ' r',
+      ' s',
       'diff --git a/b.js b/b.js',
       '--- a/b.js',
       '+++ b/b.js',
       '@@ -4 +4,2 @@',
       ' z',
+      '+w',
     ].join('\n');
     expect(parsePatchHunks(patch)).toEqual([
       {
@@ -136,35 +144,71 @@ describe('parsePatchHunks', () => {
         oldPath: 'a.js',
         status: 'modified',
         hunks: [
-          { start: 1, count: 2 },
-          { start: 10, count: 5 },
+          { start: 1, end: 1 },
+          { start: 11, end: 12 },
         ],
       },
-      { path: 'b.js', oldPath: 'b.js', status: 'modified', hunks: [{ start: 4, count: 2 }] },
+      { path: 'b.js', oldPath: 'b.js', status: 'modified', hunks: [{ start: 5, end: 5 }] },
     ]);
   });
 
-  it('defaults an omitted hunk count to 1 and keeps a zero count', () => {
+  it('splits one hunk into a run per block of changes separated by context', () => {
+    const patch = [
+      'diff --git a/a.js b/a.js',
+      '--- a/a.js',
+      '+++ b/a.js',
+      '@@ -1,7 +1,7 @@',
+      ' one',
+      '-two',
+      '+TWO',
+      ' three',
+      ' four',
+      ' five',
+      '-six',
+      '+SIX',
+      ' seven',
+    ].join('\n');
+    expect(parsePatchHunks(patch)[0]?.hunks).toEqual([
+      { start: 2, end: 2 },
+      { start: 6, end: 6 },
+    ]);
+  });
+
+  it('counts an omitted hunk length as 1 and places a pure deletion after its preceding line', () => {
     const patch = [
       'diff --git a/a.js b/a.js',
       '--- a/a.js',
       '+++ b/a.js',
       '@@ -1,0 +2 @@',
-      ' x',
+      '+x',
       '@@ -5,3 +5,0 @@',
-      ' y',
+      '-a',
+      '-b',
+      '-c',
+      '@@ -20,3 +17,2 @@',
+      ' keep',
+      '-gone',
+      ' keep',
     ].join('\n');
-    expect(parsePatchHunks(patch)).toEqual([
-      {
-        path: 'a.js',
-        oldPath: 'a.js',
-        status: 'modified',
-        hunks: [
-          { start: 2, count: 1 },
-          { start: 5, count: 0 },
-        ],
-      },
+    expect(parsePatchHunks(patch)[0]?.hunks).toEqual([
+      { start: 2, end: 2 },
+      { start: 5, end: 5 },
+      { start: 17, end: 17 },
     ]);
+  });
+
+  it('counts an empty line inside a hunk as context (diff.suppressBlankEmpty)', () => {
+    const patch = [
+      'diff --git a/a.js b/a.js',
+      '--- a/a.js',
+      '+++ b/a.js',
+      '@@ -1,3 +1,4 @@',
+      ' x',
+      '',
+      ' y',
+      '+z',
+    ].join('\n');
+    expect(parsePatchHunks(patch)[0]?.hunks).toEqual([{ start: 4, end: 4 }]);
   });
 
   it('marks a new file as added', () => {
@@ -175,13 +219,14 @@ describe('parsePatchHunks', () => {
       '+++ b/src/new.js',
       '@@ -0,0 +1,2 @@',
       '+a',
+      '+b',
     ].join('\n');
     expect(parsePatchHunks(patch)).toEqual([
       {
         path: 'src/new.js',
         oldPath: '/dev/null',
         status: 'added',
-        hunks: [{ start: 1, count: 2 }],
+        hunks: [{ start: 1, end: 2 }],
       },
     ]);
   });
@@ -194,13 +239,15 @@ describe('parsePatchHunks', () => {
       '+++ /dev/null',
       '@@ -1,3 +0,0 @@',
       '-a',
+      '-b',
+      '-c',
     ].join('\n');
     expect(parsePatchHunks(patch)).toEqual([
       {
         path: 'src/gone.js',
         oldPath: 'src/gone.js',
         status: 'deleted',
-        hunks: [{ start: 0, count: 0 }],
+        hunks: [{ start: 0, end: 0 }],
       },
     ]);
   });
@@ -214,15 +261,45 @@ describe('parsePatchHunks', () => {
       '--- a/src/old.js',
       '+++ b/src/new.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+y',
     ].join('\n');
     expect(parsePatchHunks(patch)).toEqual([
       {
         path: 'src/new.js',
         oldPath: 'src/old.js',
         status: 'renamed',
-        hunks: [{ start: 1, count: 1 }],
+        hunks: [{ start: 1, end: 1 }],
       },
+    ]);
+  });
+
+  it('keeps a real a/ or b/ directory in rename paths, which carry no diff prefix', () => {
+    const patch = [
+      'diff --git a/b/old.js b/a/new.js',
+      'similarity index 100%',
+      'rename from b/old.js',
+      'rename to a/new.js',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      { path: 'a/new.js', oldPath: 'b/old.js', status: 'renamed', hunks: [] },
+    ]);
+  });
+
+  it('marks a copy and tracks its source', () => {
+    const patch = [
+      'diff --git a/b/src.js b/b/copy.js',
+      'similarity index 90%',
+      'copy from b/src.js',
+      'copy to b/copy.js',
+      '--- a/b/src.js',
+      '+++ b/b/copy.js',
+      '@@ -1 +1 @@',
+      '-x',
+      '+y',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      { path: 'b/copy.js', oldPath: 'b/src.js', status: 'copied', hunks: [{ start: 1, end: 1 }] },
     ]);
   });
 
@@ -240,7 +317,7 @@ describe('parsePatchHunks', () => {
         path: 'a.js',
         oldPath: 'a.js',
         status: 'modified',
-        hunks: [{ start: 1, count: 1 }],
+        hunks: [{ start: 0, end: 0 }],
       },
     ]);
   });
@@ -252,7 +329,7 @@ describe('parsePatchHunks', () => {
       '+++ b/a.js',
       '@@ -1 +1 @@',
       ' context',
-      '@@ -10 +10 @@',
+      '@@ -10,0 +11 @@',
       '+++ y',
     ].join('\n');
     expect(parsePatchHunks(patch)).toEqual([
@@ -260,10 +337,7 @@ describe('parsePatchHunks', () => {
         path: 'a.js',
         oldPath: 'a.js',
         status: 'modified',
-        hunks: [
-          { start: 1, count: 1 },
-          { start: 10, count: 1 },
-        ],
+        hunks: [{ start: 11, end: 11 }],
       },
     ]);
   });
@@ -284,16 +358,94 @@ describe('parsePatchHunks', () => {
       '--- "a/my file.js"',
       '+++ "b/my file.js"',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+y',
     ].join('\n');
     expect(parsePatchHunks(patch)).toEqual([
       {
         path: 'my file.js',
         oldPath: 'my file.js',
         status: 'modified',
-        hunks: [{ start: 1, count: 1 }],
+        hunks: [{ start: 1, end: 1 }],
       },
     ]);
+  });
+
+  it('splits unquoted paths with spaces where git prints no ---/+++ header', () => {
+    const patch = [
+      'diff --git a/my file.png b/my file.png',
+      'Binary files a/my file.png and b/my file.png differ',
+      'diff --git a/run me.sh b/run me.sh',
+      'old mode 100644',
+      'new mode 100755',
+      'diff --git a/a b/c.txt b/a b/c.txt',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      { path: 'my file.png', oldPath: 'my file.png', status: 'modified', hunks: [] },
+      { path: 'run me.sh', oldPath: 'run me.sh', status: 'modified', hunks: [] },
+      { path: 'a b/c.txt', oldPath: 'a b/c.txt', status: 'added', hunks: [] },
+    ]);
+  });
+
+  it('decodes C-quoted paths, including octal UTF-8 bytes and escapes', () => {
+    const patch = [
+      'diff --git "a/\\303\\251 \\"q\\".txt" "b/\\303\\251 \\"q\\".txt"',
+      'Binary files "a/\\303\\251 \\"q\\".txt" and "b/\\303\\251 \\"q\\".txt" differ',
+      'diff --git a/plain.txt "b/tab\\there.txt"',
+      'similarity index 100%',
+      'rename from plain.txt',
+      'rename to "tab\\there.txt"',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      { path: 'é "q".txt', oldPath: 'é "q".txt', status: 'modified', hunks: [] },
+      { path: 'tab\there.txt', oldPath: 'plain.txt', status: 'renamed', hunks: [] },
+    ]);
+  });
+
+  it('keeps leading and trailing spaces in ---/+++ paths, ending them at the tab', () => {
+    const patch = [
+      'diff --git a/trail.txt  b/trail.txt ',
+      '--- a/trail.txt \t',
+      '+++ b/trail.txt \t',
+      '@@ -1 +1 @@',
+      '-x',
+      '+y',
+    ].join('\n');
+    expect(parsePatchHunks(patch)).toEqual([
+      {
+        path: 'trail.txt ',
+        oldPath: 'trail.txt ',
+        status: 'modified',
+        hunks: [{ start: 1, end: 1 }],
+      },
+    ]);
+  });
+
+  it('reads the paths of a real patch from scope.ts for names git leaves unquoted', async () => {
+    const repo = createTestRepo();
+    try {
+      repo.writeFile('my file.bin', 'a\0b');
+      repo.writeFile('run me.sh', 'echo\n');
+      repo.add();
+      repo.commit('base');
+      repo.writeFile('my file.bin', 'a\0c');
+      chmodSync(join(repo.root, 'run me.sh'), 0o755);
+      repo.writeFile('empty new.txt', '');
+      repo.writeFile('é "q".txt', 'x\n');
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+
+      expect(parsePatchHunks(scope.patch)).toEqual([
+        { path: 'empty new.txt', oldPath: 'empty new.txt', status: 'added', hunks: [] },
+        { path: 'my file.bin', oldPath: 'my file.bin', status: 'modified', hunks: [] },
+        { path: 'run me.sh', oldPath: 'run me.sh', status: 'modified', hunks: [] },
+        { path: 'é "q".txt', oldPath: '/dev/null', status: 'added', hunks: [{ start: 1, end: 1 }] },
+      ]);
+    } finally {
+      repo.cleanup();
+    }
   });
 
   it('returns [] for an empty patch', () => {
@@ -388,8 +540,8 @@ describe('mapHunksToSymbols', () => {
       mapHunksToSymbols(
         'src/add.js',
         [
-          { start: 2, count: 1 },
-          { start: 5, count: 1 },
+          { start: 2, end: 2 },
+          { start: 5, end: 5 },
         ],
         symbols,
       ),
@@ -401,30 +553,75 @@ describe('mapHunksToSymbols', () => {
       mapHunksToSymbols(
         'src/add.js',
         [
-          { start: 6, count: 1 },
-          { start: 2, count: 1 },
-          { start: 3, count: 1 },
+          { start: 6, end: 6 },
+          { start: 2, end: 2 },
+          { start: 3, end: 3 },
         ],
         symbols,
       ),
     ).toEqual([sym('add', 'function', 'src/add.js', 1), sym('mul', 'function', 'src/add.js', 4)]);
   });
 
+  it('maps a run spanning several symbols to every symbol it overlaps', () => {
+    const three = [...symbols, { name: 'div', kind: 'function', startLine: 8 }];
+    expect(mapHunksToSymbols('src/add.js', [{ start: 3, end: 8 }], three)).toEqual([
+      sym('add', 'function', 'src/add.js', 1),
+      sym('mul', 'function', 'src/add.js', 4),
+      sym('div', 'function', 'src/add.js', 8),
+    ]);
+  });
+
   it('maps nothing above the first symbol or at line 0', () => {
     expect(
       mapHunksToSymbols(
         'src/add.js',
-        [{ start: 0, count: 0 }],
+        [{ start: 0, end: 0 }],
         [{ name: 'late', kind: 'function', startLine: 10 }],
       ),
     ).toEqual([]);
     expect(
       mapHunksToSymbols(
         'src/add.js',
-        [{ start: 3, count: 1 }],
+        [{ start: 3, end: 3 }],
         [{ name: 'late', kind: 'function', startLine: 10 }],
       ),
     ).toEqual([]);
+  });
+
+  it('maps a real patch by its changed lines, not by the leading context', () => {
+    const repo = createTestRepo();
+    try {
+      const before = [
+        'function a() {', // 1
+        '  return 1;', // 2
+        '}', // 3
+        'function b() {', // 4
+        '  return 2;', // 5
+        '}', // 6
+        'function c() {', // 7
+        '  return 3;', // 8
+        '}', // 9
+      ];
+      repo.writeAndCommit('src/f.js', before.join('\n') + '\n', 'base');
+      const after = [...before];
+      after[4] = '  return 22;';
+      repo.writeFile('src/f.js', after.join('\n') + '\n');
+      const patch = repo.git(['diff', '--no-color', '--src-prefix=a/', '--dst-prefix=b/']);
+
+      // Git's default 3 lines of context start this hunk inside `a`.
+      expect(patch).toContain('@@ -2,7 +2,7 @@');
+      const [file] = parsePatchHunks(patch);
+      expect(file?.hunks).toEqual([{ start: 5, end: 5 }]);
+      expect(
+        mapHunksToSymbols('src/f.js', file?.hunks ?? [], [
+          { name: 'a', kind: 'function', startLine: 1 },
+          { name: 'b', kind: 'function', startLine: 4 },
+          { name: 'c', kind: 'function', startLine: 7 },
+        ]),
+      ).toEqual([sym('b', 'function', 'src/f.js', 4)]);
+    } finally {
+      repo.cleanup();
+    }
   });
 });
 
@@ -1045,12 +1242,14 @@ describe('computeBlastRadius', () => {
       '--- a/src/add.js',
       '+++ b/src/add.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
       'diff --git a/src/legacy.js b/src/legacy.js',
       '--- a/src/legacy.js',
       '+++ b/src/legacy.js',
       '@@ -1 +1 @@',
-      ' y',
+      '-y',
+      '+yy',
     ].join('\n');
     const stub = writeStub(
       dir,
@@ -1084,12 +1283,14 @@ describe('computeBlastRadius', () => {
       '--- a/docs/notes.md',
       '+++ b/docs/notes.md',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
       'diff --git a/src/add.js b/src/add.js',
       '--- a/src/add.js',
       '+++ b/src/add.js',
       '@@ -1 +1 @@',
-      ' y',
+      '-y',
+      '+yy',
     ].join('\n');
     const stub = writeStub(
       dir,
@@ -1133,9 +1334,11 @@ describe('computeBlastRadius', () => {
       '--- a/src/add.js',
       '+++ b/src/add.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
       '@@ -5 +5 @@',
-      ' y',
+      '-y',
+      '+yy',
     ].join('\n');
     const stub = writeStub(
       dir,
@@ -1191,9 +1394,11 @@ describe('computeBlastRadius', () => {
       '--- a/src/add.js',
       '+++ b/src/add.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
       '@@ -5 +5 @@',
-      ' y',
+      '-y',
+      '+yy',
     ].join('\n');
     const stub = writeBlastStub(dir, {
       node: SYMBOLS_ADD,
@@ -1225,7 +1430,8 @@ describe('computeBlastRadius', () => {
       '--- a/s.js',
       '+++ b/s.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
     ].join('\n');
     const stub = writeBlastStub(dir, {
       node: methodSymbols,
@@ -1295,7 +1501,8 @@ describe('computeBlastRadius', () => {
       '--- a/-foo.js',
       '+++ b/-foo.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
     ].join('\n');
     const log = join(dir, 'argv.log');
     const stub = writeBlastStub(dir, {
@@ -1324,12 +1531,14 @@ describe('computeBlastRadius', () => {
       '--- a/good.js',
       '+++ b/good.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
       'diff --git a/-bad.js b/-bad.js',
       '--- a/-bad.js',
       '+++ b/-bad.js',
       '@@ -1 +1 @@',
-      ' y',
+      '-y',
+      '+yy',
     ].join('\n');
     const symbolsGood = [
       '**good.js** — 1 symbol, no other indexed file depends on it',
@@ -1367,9 +1576,11 @@ describe('computeBlastRadius', () => {
       '--- a/s.js',
       '+++ b/s.js',
       '@@ -1 +1 @@',
-      ' x',
+      '-x',
+      '+xx',
       '@@ -5 +5 @@',
-      ' y',
+      '-y',
+      '+yy',
     ].join('\n');
     const symbols = [
       '**s.js** — 2 symbols, no other indexed file depends on it',

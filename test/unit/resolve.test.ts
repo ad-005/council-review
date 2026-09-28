@@ -4,7 +4,12 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { diffAgainstBaseline, loadPreviousFindings, ResolveError } from '../../src/resolve.js';
+import {
+  diffAgainstBaseline,
+  findingsWithResolution,
+  loadPreviousFindings,
+  ResolveError,
+} from '../../src/resolve.js';
 import type { MergedFinding } from '../../src/merge.js';
 
 function mergedFinding(
@@ -122,6 +127,108 @@ describe('loadPreviousFindings', () => {
     writeFileSync(join(dir, 'findings.json'), '{ not valid json', 'utf8');
 
     expect(() => loadPreviousFindings(reviewsDir, 'broken-run')).toThrow(ResolveError);
+  });
+
+  it('rejects a ref that is not a listed run id, even when it names a readable findings.json', () => {
+    // `--since .` / `--since ..` / a nested path would otherwise read a findings.json outside
+    // the run directories (here: one planted directly in the reviews directory itself).
+    writeFileSync(join(reviewsDir, 'findings.json'), '[]', 'utf8');
+    mkdirSync(join(reviewsDir, 'run-1', 'nested'), { recursive: true });
+    writeFileSync(join(reviewsDir, 'run-1', 'nested', 'findings.json'), '[]', 'utf8');
+    writeFileSync(join(reviewsDir, 'run-1', 'findings.json'), '[]', 'utf8');
+
+    for (const ref of ['.', '..', 'run-1/nested', '../' + 'x', '', '.hidden']) {
+      expect(() => loadPreviousFindings(reviewsDir, ref), ref).toThrow(ResolveError);
+    }
+    expect(loadPreviousFindings(reviewsDir, 'run-1')).toEqual({ runId: 'run-1', findings: [] });
+  });
+
+  it('throws ResolveError (exit 2), not a TypeError, for a named run whose array holds non-findings', () => {
+    for (const [i, body] of ['[null]', '[{}]', '[1, "x"]', '[{"fingerprint": 7}]'].entries()) {
+      const runId = `bad-${i}`;
+      mkdirSync(join(reviewsDir, runId), { recursive: true });
+      writeFileSync(join(reviewsDir, runId, 'findings.json'), body, 'utf8');
+      expect(() => loadPreviousFindings(reviewsDir, runId), body).toThrow(ResolveError);
+    }
+  });
+
+  it('treats a "last" run whose array holds non-findings as no baseline available', () => {
+    mkdirSync(join(reviewsDir, 'run-bad'), { recursive: true });
+    writeFileSync(join(reviewsDir, 'run-bad', 'findings.json'), '[null]', 'utf8');
+    pointLastAt('run-bad');
+    expect(loadPreviousFindings(reviewsDir, 'last')).toBeNull();
+  });
+
+  it('does not follow a "last" that is a real directory rather than a symlink', () => {
+    writeRun('last', [mergedFinding({ id: 'F001', fingerprint: 'fp-a' })]);
+    expect(loadPreviousFindings(reviewsDir, 'last')).toBeNull();
+  });
+});
+
+describe('diffAgainstBaseline: representative changes between runs', () => {
+  it('matches a cluster whose representative fingerprint changed through its member fingerprints', () => {
+    // Run 1: two reviewers raised the defect; the representative was reviewer A's wording.
+    const before = mergedFinding({
+      id: 'F001',
+      fingerprint: 'fp-a',
+      memberFingerprints: ['fp-a', 'fp-b'],
+    });
+    // Run 2: reviewer A failed, so reviewer B's wording is now the representative.
+    const after = mergedFinding({ id: 'F001', fingerprint: 'fp-b', memberFingerprints: ['fp-b'] });
+
+    const outcome = diffAgainstBaseline([after], { runId: 'prev', findings: [before] });
+    expect(outcome.counts).toEqual({ resolved: 0, stillPresent: 1, new: 0 });
+    expect(outcome.current[0]!.resolution).toBe('still-present');
+    expect(outcome.resolved).toEqual([]);
+
+    // And the reverse direction: the current cluster gained a member whose wording was the old
+    // representative's.
+    const reverse = diffAgainstBaseline([before], { runId: 'prev', findings: [after] });
+    expect(reverse.counts).toEqual({ resolved: 0, stillPresent: 1, new: 0 });
+  });
+
+  it('falls back to the fingerprint alone for a baseline written before memberFingerprints existed', () => {
+    const legacy = mergedFinding({ id: 'F001', fingerprint: 'fp-a' }) as Partial<MergedFinding>;
+    delete legacy.memberFingerprints;
+    const current = mergedFinding({
+      id: 'F001',
+      fingerprint: 'fp-b',
+      memberFingerprints: ['fp-b', 'fp-a'],
+    });
+
+    const outcome = diffAgainstBaseline([current], {
+      runId: 'prev',
+      findings: [legacy as MergedFinding],
+    });
+    expect(outcome.counts).toEqual({ resolved: 0, stillPresent: 1, new: 0 });
+  });
+
+  it('loads a legacy baseline file that lacks memberFingerprints', () => {
+    const legacy = mergedFinding({ id: 'F001', fingerprint: 'fp-a' }) as Partial<MergedFinding>;
+    delete legacy.memberFingerprints;
+    writeRun('run-legacy', [legacy as MergedFinding]);
+    const baseline = loadPreviousFindings(reviewsDir, 'run-legacy');
+    expect(baseline?.findings).toHaveLength(1);
+  });
+});
+
+describe('findingsWithResolution', () => {
+  it('returns the merged findings unchanged when no diff was requested', () => {
+    const findings = [mergedFinding({ id: 'F001', fingerprint: 'fp-a' })];
+    expect(findingsWithResolution(findings, null)).toBe(findings);
+  });
+
+  it('annotates every finding with its resolution, in merged order, when a diff was requested', () => {
+    const a = mergedFinding({ id: 'F001', fingerprint: 'fp-a' });
+    const b = mergedFinding({ id: 'F002', fingerprint: 'fp-b' });
+    const outcome = diffAgainstBaseline([a, b], { runId: 'prev', findings: [b] });
+    expect(findingsWithResolution([a, b], outcome).map((f) => [f.id, f.resolution])).toEqual([
+      ['F001', 'new'],
+      ['F002', 'still-present'],
+    ]);
+
+    const none = diffAgainstBaseline([a], null);
+    expect(findingsWithResolution([a], none)).toEqual([{ ...a, resolution: null }]);
   });
 });
 

@@ -10,10 +10,13 @@
  * stays a pure library module that `test/unit/cli.test.ts` can import without triggering `main()`.
  */
 import { assertNodeVersion } from './node-guard.js';
-import { runCli } from './cli.js';
 
 async function main(): Promise<void> {
   assertNodeVersion();
+  // Imported only after the guard: a static import would link and evaluate the whole module
+  // graph first, so an unsupported Node would die on a missing builtin export (a SyntaxError)
+  // before the guard could print its own message.
+  const { runCli } = await import('./cli.js');
   process.exitCode = await runCli(process.argv.slice(2));
 }
 

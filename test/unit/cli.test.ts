@@ -849,6 +849,30 @@ describe('review run exit codes', () => {
     expect(code).toBe(1);
   });
 
+  it('rejects a bad --fail-on, --timeout, --max-tokens or --since before any run directory or reviewer', async () => {
+    useFixtures({ defaultFixture: 'valid-findings' });
+    writeConfigFile();
+    makeWorkingChange();
+
+    for (const args of [
+      ['--fail-on', 'bogus'],
+      ['--timeout', 'abc'],
+      ['--max-tokens', ''],
+      ['--since', 'no-such-run'],
+      ['--since', '..'],
+    ]) {
+      const stderr = captureStream(process.stderr);
+      let code: number;
+      try {
+        code = await runCli(args);
+      } finally {
+        stderr.restore();
+      }
+      expect(code).toBe(2);
+    }
+    expect(fs.existsSync(path.join(repo.root, '.council', 'reviews'))).toBe(false);
+  });
+
   it('fail-on none never breaches the threshold', async () => {
     useFixtures({ defaultFixture: 'valid-findings' });
     writeConfigFile({ failOn: 'none' });
@@ -1331,6 +1355,66 @@ describe('review-time panel flags: --pick vs --models', () => {
     expect(cfg.panel.some((p) => p.provider === 'old-provider')).toBe(false);
   });
 
+  it('--pick --pane delegates without --pick or --thinking, so the child uses the saved picks', async () => {
+    writeMinimalPickerCatalog();
+    useFixtures({ defaultFixture: 'unparseable-lines' });
+    writeConfigFile({ failOn: 'none' });
+    makeWorkingChange();
+
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'council-herdr-stub-'));
+    const log = path.join(binDir, 'calls.log');
+    const herdrStub = path.join(binDir, 'herdr');
+    fs.writeFileSync(
+      herdrStub,
+      [
+        '#!/usr/bin/env node',
+        `require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+        "if (process.argv[2] === 'pane' && process.argv[3] === 'split') {",
+        "  process.stdout.write(JSON.stringify({ result: { pane: { pane_id: 'p1' } } }));",
+        '}',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const saved = { HERDR_ENV: process.env.HERDR_ENV, bin: process.env.COUNCIL_HERDR_BIN };
+    process.env.HERDR_ENV = '1';
+    process.env.COUNCIL_HERDR_BIN = herdrStub;
+
+    const term = new ScriptedTerminal();
+    const stdout = captureStream(process.stdout);
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    let runArgs: string[] | undefined;
+    try {
+      const runPromise = runCli(['--pick', '--thinking', 'low', '--pane', '--fail-on', 'none'], {
+        pickerIO: term.io,
+      });
+      await driveFullPickerSelection(term);
+      code = await runPromise;
+      runArgs = fs
+        .readFileSync(log, 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as string[])
+        .find((a) => a[0] === 'pane' && a[1] === 'run');
+    } finally {
+      stdout.restore();
+      stderr.restore();
+      if (saved.HERDR_ENV === undefined) delete process.env.HERDR_ENV;
+      else process.env.HERDR_ENV = saved.HERDR_ENV;
+      if (saved.bin === undefined) delete process.env.COUNCIL_HERDR_BIN;
+      else process.env.COUNCIL_HERDR_BIN = saved.bin;
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain('delegated');
+    expect(runArgs).toBeDefined();
+    expect(runArgs).not.toContain('--pick');
+    expect(runArgs).not.toContain('--thinking');
+    expect(runArgs).not.toContain('low');
+    expect(runArgs!.slice(-3)).toEqual(['--pane', '--fail-on', 'none']);
+  });
+
   it('--models leaves an existing saved panel byte-for-byte untouched', async () => {
     useFixtures({ defaultFixture: 'unparseable-lines' });
     writeConfigFile(); // the real, resolvable PANEL from the shared catalog
@@ -1404,6 +1488,37 @@ describe('show / ignore / gc', () => {
       /* no capture needed */
     }
     expect(unknownCode).toBe(2);
+  });
+
+  it('show last renders the same run as show with no argument', async () => {
+    await runOneReview();
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli(['show', 'last']);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain('Council Review');
+  });
+
+  it('gc rejects an empty or non-decimal --keep instead of pruning every run', async () => {
+    await runOneReview();
+    const reviewsDir = path.join(repo.root, '.council', 'reviews');
+    const before = fs.readdirSync(reviewsDir).sort();
+
+    for (const keep of ['--keep=', '--keep=0x1', '--keep=1e1']) {
+      const stderr = captureStream(process.stderr);
+      let code: number;
+      try {
+        code = await runCli(['gc', keep]);
+      } finally {
+        stderr.restore();
+      }
+      expect(code).toBe(2);
+    }
+    expect(fs.readdirSync(reviewsDir).sort()).toEqual(before);
   });
 
   it('ignore suppresses a finding idempotently; an unknown id exits 2 and leaves the file unchanged', async () => {
@@ -1528,6 +1643,39 @@ describe('show / ignore / gc', () => {
 // herdr integration is otherwise Section 17's own test surface; this only checks that a plain
 // shell / CI run (HERDR_ENV unset) is unaffected by the herdr-related flags being present.
 // -------------------------------------------------------------------------------------------
+
+describe('--pane when herdr cannot split a pane', () => {
+  it('runs the review in this process instead of reporting a delegation that never happened', async () => {
+    useFixtures({ defaultFixture: 'valid-findings' }); // one "high" finding: exit 1 when reviewed
+    writeConfigFile();
+    makeWorkingChange();
+
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'council-herdr-stub-'));
+    const herdrStub = path.join(binDir, 'herdr');
+    fs.writeFileSync(herdrStub, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const saved = { HERDR_ENV: process.env.HERDR_ENV, bin: process.env.COUNCIL_HERDR_BIN };
+    process.env.HERDR_ENV = '1';
+    process.env.COUNCIL_HERDR_BIN = herdrStub;
+
+    const stdout = captureStream(process.stdout);
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--pane', '--no-notify']);
+    } finally {
+      stdout.restore();
+      stderr.restore();
+      if (saved.HERDR_ENV === undefined) delete process.env.HERDR_ENV;
+      else process.env.HERDR_ENV = saved.HERDR_ENV;
+      if (saved.bin === undefined) delete process.env.COUNCIL_HERDR_BIN;
+      else process.env.COUNCIL_HERDR_BIN = saved.bin;
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+    expect(code).toBe(1);
+    expect(stdout.text()).not.toContain('delegated');
+    expect(stdout.text()).toContain('report written to');
+  });
+});
 
 describe('herdr flags outside a herdr environment', () => {
   it('--no-notify and --handoff do not change the review outcome outside herdr', async () => {

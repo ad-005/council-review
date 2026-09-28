@@ -15,9 +15,9 @@ import { styleText } from 'node:util';
 import { Separator, checkbox, select } from '@inquirer/prompts';
 
 import type { ThinkingLevel } from './levels.js';
-import type { Reviewer } from './panel.js';
+import { buildReviewer, type Reviewer } from './panel.js';
 import type { Catalog, CatalogModel, ProviderInfo } from './providers.js';
-import { resolveThinking, supportedLevels } from './thinking.js';
+import { supportedLevels } from './thinking.js';
 
 export interface PickerIO {
   input: NodeJS.ReadableStream;
@@ -35,6 +35,31 @@ export class PickerCancelled extends Error {
   }
 }
 
+/** Ctrl+C at a prompt: an interrupt, exiting 130 like every other interrupt, not a cancel (2). */
+export class PickerInterrupted extends Error {
+  readonly exitCode = 130 as const;
+
+  constructor(message = 'selection interrupted; no configuration was written') {
+    super(message);
+    this.name = 'PickerInterrupted';
+    Object.setPrototypeOf(this, PickerInterrupted.prototype);
+  }
+}
+
+/** No provider is ready, so there is nothing to select from (exit code 2, before any prompt). */
+export class PickerNoReadyProviders extends Error {
+  readonly exitCode = 2 as const;
+
+  constructor(
+    message = 'no ready providers to select reviewers from; authenticate with pi first ' +
+      '(check with "pi auth check --provider <name> --json")',
+  ) {
+    super(message);
+    this.name = 'PickerNoReadyProviders';
+    Object.setPrototypeOf(this, PickerNoReadyProviders.prototype);
+  }
+}
+
 export class PickerNonInteractive extends Error {
   readonly exitCode = 2 as const;
 
@@ -46,11 +71,13 @@ export class PickerNonInteractive extends Error {
 }
 
 /**
- * `@inquirer/prompts` rejects with `ExitPromptError` on Ctrl+C / SIGINT / a closed input stream,
- * and with `CancelPromptError` when a prompt's own `context.signal` (not used here) fires. Both
- * are checked by `.name` rather than `instanceof` against an imported class, because
- * `@inquirer/core` is a transitive dependency of `@inquirer/prompts` — this package depends only
- * on the latter, per the contract's "do not edit package.json" rule.
+ * `@inquirer/prompts` rejects with `ExitPromptError` on Ctrl+C / SIGINT / process exit (e.g. a
+ * closed input stream draining the event loop), and with `CancelPromptError` when a prompt's own
+ * `context.signal` (not used here) fires. Both are checked by `.name` rather than `instanceof`
+ * against an imported class, because `@inquirer/core` is a transitive dependency of
+ * `@inquirer/prompts` — this package depends only on the latter, per the contract's "do not edit
+ * package.json" rule. Which of those causes it was is not in the error itself (short of parsing
+ * its message), so `pickPanel` watches the input for the Ctrl+C keypress on its own.
  */
 function isCancellation(err: unknown): boolean {
   return (
@@ -58,11 +85,19 @@ function isCancellation(err: unknown): boolean {
   );
 }
 
-function defaultIO(): PickerIO {
+/**
+ * The real-terminal IO: stdin plus `output` (stdout by default). A caller whose stdout is
+ * reserved for machine-readable output (`--json`) passes `process.stderr` so the prompts render
+ * there instead. When `output` is redirected (`init > log`, `| tee log`) but stderr is still the
+ * terminal, the prompts render on stderr, where the user can see them. Interactive only when
+ * stdin and the chosen output are both terminals.
+ */
+export function defaultPickerIO(output: NodeJS.WriteStream = process.stdout): PickerIO {
+  const visible = output.isTTY === true || process.stderr.isTTY !== true ? output : process.stderr;
   return {
     input: process.stdin,
-    output: process.stdout,
-    isTTY: process.stdin.isTTY === true,
+    output: visible,
+    isTTY: process.stdin.isTTY === true && visible.isTTY === true,
   };
 }
 
@@ -298,9 +333,14 @@ function promptContext(io: PickerIO): {
  * prompt offers a trailing "back" choice that returns to the previous reasoning model, so a
  * mis-picked level can be corrected without restarting selection; a re-visited prompt re-opens
  * on its previous pick. Throws `PickerNonInteractive` (exit code 2) without a terminal, before
- * any prompt runs, and `PickerCancelled` (exit code 2) if the user cancels at any stage.
+ * any prompt runs, `PickerNoReadyProviders` (exit code 2) when no provider is ready,
+ * `PickerInterrupted` (exit code 130) on Ctrl+C at any stage, and `PickerCancelled` (exit code
+ * 2) if a prompt is otherwise closed out from under the user.
  */
-export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): Promise<Reviewer[]> {
+export async function pickPanel(
+  catalog: Catalog,
+  io: PickerIO = defaultPickerIO(),
+): Promise<Reviewer[]> {
   if (!io.isTTY) {
     throw new PickerNonInteractive(
       'interactive selection requires a terminal; supply a panel via "council-review init" ' +
@@ -308,9 +348,21 @@ export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): P
     );
   }
 
-  try {
-    const readyProviders = catalog.providers.filter((p) => p.ready);
+  // Checked before any prompt: an empty checkbox makes inquirer throw its own validation error.
+  const readyProviders = catalog.providers.filter((p) => p.ready);
+  if (readyProviders.length === 0) {
+    throw new PickerNoReadyProviders();
+  }
 
+  // Inquirer's readline emits `keypress` on the input it is handed; Ctrl+C there is the one
+  // cause of an `ExitPromptError` that is an interrupt rather than a cancel.
+  let interrupted = false;
+  const onKeypress = (_str: unknown, key: { ctrl?: boolean; name?: string } | undefined): void => {
+    if (key?.ctrl === true && key.name === 'c') interrupted = true;
+  };
+  io.input.on('keypress', onKeypress);
+
+  try {
     const selectedProviderIds = await checkbox<string>(
       {
         message: 'Select providers to draw reviewers from:',
@@ -427,22 +479,16 @@ export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): P
       index += 1;
     }
 
-    const reviewers: Reviewer[] = selectedModels.map((model, i) => {
+    return selectedModels.map((model, i) => {
       const pin = thinkingPicks.get(i);
-      return {
-        provider: model.provider,
-        model: model.id,
-        vendor: model.vendor,
-        catalog: model,
-        thinking: resolveThinking(model, pin === undefined ? {} : { cliPin: pin }),
-      };
+      return buildReviewer(model, pin === undefined ? {} : { cliPin: pin });
     });
-
-    return reviewers;
   } catch (err) {
     if (isCancellation(err)) {
-      throw new PickerCancelled();
+      throw interrupted ? new PickerInterrupted() : new PickerCancelled();
     }
     throw err;
+  } finally {
+    io.input.removeListener('keypress', onKeypress);
   }
 }

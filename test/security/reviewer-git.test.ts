@@ -14,18 +14,28 @@
  * requires for history: the subcommand allowlist, literal-argument handling, and an unchanged
  * repository after every call.
  */
+import { chmodSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { buildGitArgv, runGitHistory, type GitParams } from '../../src/reviewer-tools.js';
+import {
+  MAX_TOOL_OUTPUT_CHARS,
+  buildGitArgv,
+  councilGitTool,
+  runGitHistory,
+  type GitParams,
+} from '../../src/reviewer-tools.js';
 import { createTestRepo, type TestRepo } from '../helpers/git-repo.js';
 
 describe('buildGitArgv allowlist', () => {
   it('builds argv for each allowlisted subcommand', () => {
-    expect(buildGitArgv({ subcommand: 'log' })).toEqual(['log', '--no-color']);
-    expect(buildGitArgv({ subcommand: 'show' })).toEqual(['show', '--no-color', 'HEAD']);
-    expect(buildGitArgv({ subcommand: 'diff' })).toEqual(['diff', '--no-color']);
+    const noDrivers = ['--no-color', '--no-ext-diff', '--no-textconv'];
+    expect(buildGitArgv({ subcommand: 'log' })).toEqual(['log', ...noDrivers, '--max-count=50']);
+    expect(buildGitArgv({ subcommand: 'show' })).toEqual(['show', ...noDrivers, 'HEAD']);
+    expect(buildGitArgv({ subcommand: 'diff' })).toEqual(['diff', ...noDrivers]);
     expect(buildGitArgv({ subcommand: 'blame', path: 'src/foo.ts' })).toEqual([
       'blame',
+      '--no-textconv',
       '--',
       'src/foo.ts',
     ]);
@@ -87,7 +97,14 @@ describe('command composition is impossible', () => {
       // The entire string is exactly one argv element -- nothing about it was interpreted or
       // split, because argv is passed straight to execFileSync with no shell involved.
       expect(argv).toContain(value);
-      expect(argv).toEqual(['log', '--no-color', value]);
+      expect(argv).toEqual([
+        'log',
+        '--no-color',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--max-count=50',
+        value,
+      ]);
     });
 
     it(`treats path value "${value}" as a single literal argv entry after '--'`, () => {
@@ -174,5 +191,247 @@ describe('runGitHistory against a real repository', () => {
     // separate literal argv entries, never concatenated into "rev:path" syntax) -- this test
     // pins the underlying git behaviour this design decision relies on.
     expect(() => repo.git(['show', 'HEAD:../../etc/passwd'])).toThrow();
+  });
+});
+
+describe('council_git log is bounded by default', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+    repo.writeAndCommit('tracked.txt', 'hello\n', 'initial commit');
+    for (let i = 0; i < 59; i++) {
+      repo.git(['commit', '--allow-empty', '--no-gpg-sign', '-m', `empty ${i}`]);
+    }
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('pushes --max-count=50 when maxCount is omitted, matching the schema description', () => {
+    expect(buildGitArgv({ subcommand: 'log' })).toContain('--max-count=50');
+  });
+
+  it('returns at most 50 commits from a 60-commit history when maxCount is omitted', () => {
+    const output = runGitHistory(repo.root, { subcommand: 'log' });
+    expect(output.match(/^commit [0-9a-f]{40}/gm)).toHaveLength(50);
+  });
+
+  it('honours an explicit maxCount', () => {
+    const output = runGitHistory(repo.root, { subcommand: 'log', maxCount: 3 });
+    expect(output.match(/^commit [0-9a-f]{40}/gm)).toHaveLength(3);
+  });
+});
+
+describe('revisions that reach the stash, reflogs or pseudo-refs are refused', () => {
+  const refused = [
+    'stash',
+    'stash^3',
+    'stash^3:.env',
+    'refs/stash^3:.env',
+    'stash~0',
+    'stash^{tree}',
+    'STASH^3:.env',
+    'Refs/Stash^3:.env',
+    'stash@{0}^3:.env',
+    'refs/stash@{1}',
+    'HEAD..stash',
+    'main...refs/stash',
+    '^stash',
+    'HEAD@{1}',
+    '@{-1}',
+    'main@{u}@{1}',
+    ':/untracked files on',
+    'HEAD..:/wip',
+    'ORIG_HEAD',
+    'orig_head:.env',
+    'FETCH_HEAD',
+    'MERGE_HEAD',
+    'CHERRY_PICK_HEAD',
+    'AUTO_MERGE',
+    'MERGE_AUTOSTASH^3',
+    'main-worktree/ORIG_HEAD',
+    'worktrees/wt1/ORIG_HEAD:.env',
+    'main-worktree/refs/stash^3:.env',
+  ];
+  for (const revision of refused) {
+    it(`rejects revision "${revision}"`, () => {
+      expect(() => buildGitArgv({ subcommand: 'show', revision })).toThrow(/revision/);
+    });
+  }
+
+  const accepted = [
+    'HEAD',
+    '@',
+    'HEAD~3',
+    'HEAD^2',
+    'abc1234',
+    '0123456789abcdef0123456789abcdef01234567',
+    'main',
+    'v1.2.3',
+    'origin/main',
+    'refs/heads/stash',
+    'heads/stash',
+    'feature/stash-cleanup',
+    'stashed-work',
+    'HEAD~1..HEAD',
+    'main...feature',
+    'HEAD^{tree}',
+    'HEAD^{/fix bug}',
+    'HEAD:src/foo.ts',
+    'HEAD^!',
+    '@{u}',
+    'main@{upstream}',
+    'HEAD@{push}..HEAD',
+    'fix_head',
+    'feature/my_head',
+  ];
+  for (const revision of accepted) {
+    it(`accepts legitimate revision "${revision}"`, () => {
+      expect(buildGitArgv({ subcommand: 'show', revision })).toContain(revision);
+    });
+  }
+
+  describe('against a real repository with `git stash --all`', () => {
+    let repo: TestRepo;
+
+    beforeEach(() => {
+      repo = createTestRepo();
+      repo.writeAndCommit('.gitignore', '.env\n', 'ignore env');
+      repo.writeFile('.env', 'STASHED-SECRET=1\n');
+      repo.git(['stash', 'push', '--all', '-m', 'wip']);
+    });
+
+    afterEach(() => {
+      repo.cleanup();
+    });
+
+    it('the leak is real: plain git reads the stashed ignored file', () => {
+      expect(repo.git(['show', 'stash^3:.env'])).toContain('STASHED-SECRET');
+      expect(repo.git(['show', ':/untracked files on'])).toContain('STASHED-SECRET');
+    });
+
+    for (const revision of [
+      'stash^3:.env',
+      'refs/stash^3:.env',
+      'stash@{0}^3:.env',
+      ':/untracked files on',
+    ]) {
+      it(`council_git refuses "${revision}" and never reveals the stashed file`, () => {
+        expect(() => runGitHistory(repo.root, { subcommand: 'show', revision })).toThrow(
+          /revision/,
+        );
+      });
+    }
+
+    it('council_git log cannot enumerate stash commits either', () => {
+      expect(() =>
+        runGitHistory(repo.root, { subcommand: 'log', revision: 'HEAD..stash' }),
+      ).toThrow(/revision/);
+    });
+  });
+});
+
+describe('user diff drivers never run', () => {
+  let repo: TestRepo;
+  let marker: string;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+    marker = join(repo.root, '.git', 'driver-ran-marker');
+    const script = join(repo.root, '.git', 'driver.sh');
+    writeFileSync(script, `#!/bin/sh\necho DRIVER-RAN\ntouch '${marker}'\n`);
+    chmodSync(script, 0o755);
+    repo.git(['config', 'diff.external', script]);
+    repo.git(['config', 'diff.upper.textconv', script]);
+    repo.writeAndCommit('.gitattributes', '*.txt diff=upper\n', 'attributes');
+    repo.writeAndCommit('a.txt', 'one\n', 'first');
+    repo.writeAndCommit('a.txt', 'two\n', 'second');
+    repo.writeFile('a.txt', 'three\n');
+  });
+
+  afterEach(() => {
+    rmSync(marker, { force: true });
+    repo.cleanup();
+  });
+
+  it('the drivers are real: plain git runs them', () => {
+    expect(repo.git(['diff', 'HEAD~1..HEAD'])).toContain('DRIVER-RAN');
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  it('adds --no-ext-diff --no-textconv to diff/show/log and --no-textconv to blame', () => {
+    for (const subcommand of ['diff', 'show', 'log'] as const) {
+      const argv = buildGitArgv({ subcommand });
+      expect(argv).toContain('--no-ext-diff');
+      expect(argv).toContain('--no-textconv');
+    }
+    expect(buildGitArgv({ subcommand: 'blame', path: 'a.txt' })).toContain('--no-textconv');
+  });
+
+  it('neither diff.external nor a textconv driver runs for diff, show, log or blame', () => {
+    const outputs = [
+      runGitHistory(repo.root, { subcommand: 'diff' }),
+      runGitHistory(repo.root, { subcommand: 'diff', revision: 'HEAD~1..HEAD' }),
+      runGitHistory(repo.root, { subcommand: 'show' }),
+      runGitHistory(repo.root, { subcommand: 'log', maxCount: 2 }),
+      runGitHistory(repo.root, { subcommand: 'blame', path: 'a.txt' }),
+    ];
+    for (const output of outputs) {
+      expect(output).not.toContain('DRIVER-RAN');
+    }
+    expect(runGitHistory(repo.root, { subcommand: 'show' })).toContain('+two');
+    expect(existsSync(marker)).toBe(false);
+  });
+});
+
+describe('council_git output and runtime are bounded', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('truncates output above the exec buffer with a marker instead of failing with ENOBUFS', () => {
+    const line = `${'x'.repeat(99)}\n`;
+    repo.writeAndCommit('big.txt', line.repeat(30_000), 'a 3MB file');
+    const output = runGitHistory(repo.root, { subcommand: 'show' });
+    expect(output.length).toBeLessThan(MAX_TOOL_OUTPUT_CHARS + 500);
+    expect(output).toMatch(/\[output truncated: more than \d+ characters/);
+  });
+
+  it('truncates output above the tool limit with a marker', () => {
+    const line = `${'y'.repeat(99)}\n`;
+    repo.writeAndCommit('medium.txt', line.repeat(2_000), 'a 200KB file');
+    const output = runGitHistory(repo.root, { subcommand: 'show' });
+    expect(output.length).toBeLessThan(MAX_TOOL_OUTPUT_CHARS + 500);
+    expect(output).toMatch(/\[output truncated: \d+ characters total/);
+  });
+
+  it('kills a hung git and reports a timeout', () => {
+    // A repository-local fsmonitor hook runs on every working-tree diff; a hanging one stands in
+    // for any git invocation that never finishes.
+    repo.writeAndCommit('a.txt', 'one\n', 'first');
+    const hook = join(repo.root, '.git', 'slow-fsmonitor.sh');
+    writeFileSync(hook, '#!/bin/sh\nsleep 20\n');
+    chmodSync(hook, 0o755);
+    repo.git(['config', 'core.fsmonitor', hook]);
+    const started = Date.now();
+    expect(() => runGitHistory(repo.root, { subcommand: 'diff' }, { timeoutMs: 300 })).toThrow(
+      /timed out/,
+    );
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+});
+
+describe('council_git tool description', () => {
+  it('states that revision-less blame/diff read the live working tree, not the snapshot', () => {
+    expect(councilGitTool.description).toMatch(/working tree/);
+    expect(councilGitTool.description).toMatch(/snapshot/);
   });
 });

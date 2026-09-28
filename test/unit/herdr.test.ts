@@ -1,11 +1,14 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   __resetHerdrNoticeForTests,
+  HERDR_COMMAND_TIMEOUT_MS,
   handoffToAgent,
   isHerdrEnv,
   notifyComplete,
@@ -15,6 +18,12 @@ import {
 
 let dir: string;
 let logFile: string;
+
+// The source module, loaded directly by a child `node` (type stripping, Node >= 22.18) for the
+// one test that must observe a real process's exit. herdr.ts imports only `node:` builtins.
+const HERDR_MODULE_URL = pathToFileURL(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'herdr.ts'),
+).href;
 
 /**
  * Writes a stub `herdr` binary that logs every argv it receives (one JSON array per line, to
@@ -37,6 +46,30 @@ if (fail) {
     process.stderr.write('stub: simulated failure\\n');
     process.exit(1);
   }
+}
+
+const hang = process.env.HERDR_STUB_HANG;
+if (hang && hang.split(',').every((p, i) => args[i] === p)) {
+  // Never answers: proves the caller bounds every synchronous herdr call.
+  setInterval(() => {}, 1000);
+  return;
+}
+
+const sig = process.env.HERDR_STUB_SIGNAL;
+if (sig && sig.split(',').every((p, i) => args[i] === p)) {
+  process.kill(process.pid, 'SIGTERM');
+  setInterval(() => {}, 1000);
+  return;
+}
+
+if (args[0] === 'pane' && args[1] === 'split' && process.env.HERDR_STUB_SPLIT_NO_ID === '1') {
+  process.stdout.write('{}');
+  process.exit(0);
+}
+
+if (args[0] === 'agent' && args[1] === 'get' && process.env.HERDR_STUB_GET_BROKEN === '1') {
+  process.stderr.write('stub: socket unavailable\\n');
+  process.exit(1);
 }
 
 if (args[0] === 'agent' && args[1] === 'prompt') {
@@ -104,6 +137,10 @@ const ENV_KEYS = [
   'HERDR_STUB_FAIL',
   'HERDR_STUB_PROMPT_DELAY_MS',
   'HERDR_STUB_PROMPT_DONE_FILE',
+  'HERDR_STUB_HANG',
+  'HERDR_STUB_SIGNAL',
+  'HERDR_STUB_SPLIT_NO_ID',
+  'HERDR_STUB_GET_BROKEN',
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -119,6 +156,10 @@ beforeEach(() => {
   delete process.env.COUNCIL_HERDR_DELEGATED;
   delete process.env.HERDR_STUB_FAIL;
   delete process.env.HERDR_STUB_PROMPT_DELAY_MS;
+  delete process.env.HERDR_STUB_HANG;
+  delete process.env.HERDR_STUB_SIGNAL;
+  delete process.env.HERDR_STUB_SPLIT_NO_ID;
+  delete process.env.HERDR_STUB_GET_BROKEN;
 
   __resetHerdrNoticeForTests();
 });
@@ -152,7 +193,10 @@ describe('outside a herdr environment', () => {
     const promptPath = path.join(dir, 'handoff.md');
     fs.writeFileSync(promptPath, 'reproduce each finding before fixing it', 'utf8');
 
-    expect(splitPaneAndRun(['node', 'cli.js', 'review'])).toEqual({ attempted: false });
+    expect(splitPaneAndRun(['node', 'cli.js', 'review'])).toEqual({
+      attempted: false,
+      delegated: false,
+    });
     expect(setPaneTitle('Council review · 4 models')).toEqual({ attempted: false });
     expect(notifyComplete('done', false)).toEqual({ attempted: false });
     expect(handoffToAgent('reviewer', promptPath)).toEqual({ attempted: false });
@@ -195,7 +239,7 @@ describe('inside a herdr environment: splitPaneAndRun', () => {
 
   it('splits in the default direction and runs argv in the new pane, without stealing focus', () => {
     const result = splitPaneAndRun(['node', 'cli.js', 'review']);
-    expect(result).toEqual({ attempted: true });
+    expect(result).toEqual({ attempted: true, delegated: true });
 
     const calls = readCalls();
     expect(calls[0]).toEqual([
@@ -233,19 +277,74 @@ describe('inside a herdr environment: splitPaneAndRun', () => {
   it('does not split again when already running inside a delegated pane', () => {
     process.env.COUNCIL_HERDR_DELEGATED = '1';
     const result = splitPaneAndRun(['node', 'cli.js', 'review']);
-    expect(result).toEqual({ attempted: false });
+    expect(result).toEqual({ attempted: false, delegated: false });
     expect(readCalls()).toEqual([]);
   });
 
-  it('degrades to a warning, without throwing, when the split command fails', () => {
+  // A failed delegation must never read as a delegated one: the caller treats `delegated` as
+  // "the review is running elsewhere" and exits 0, so any false positive reviews nothing.
+  it('degrades to a warning, without throwing, and reports not delegated when the split command fails', () => {
     process.env.HERDR_STUB_FAIL = 'pane,split';
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const result = splitPaneAndRun(['node', 'cli.js', 'review']);
 
-    expect(result).toEqual({ attempted: true });
+    expect(result).toEqual({ attempted: true, delegated: false });
     expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('herdr warning'))).toBe(true);
+    expect(readCalls().some((c) => c[0] === 'pane' && c[1] === 'run')).toBe(false);
   });
+
+  it('reports not delegated when the split returns no pane id', () => {
+    process.env.HERDR_STUB_SPLIT_NO_ID = '1';
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = splitPaneAndRun(['node', 'cli.js', 'review']);
+
+    expect(result).toEqual({ attempted: true, delegated: false });
+    expect(readCalls().some((c) => c[0] === 'pane' && c[1] === 'run')).toBe(false);
+  });
+
+  it('reports not delegated, naming the orphaned pane, when pane run fails after a split', () => {
+    process.env.HERDR_STUB_FAIL = 'pane,run';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = splitPaneAndRun(['node', 'cli.js', 'review']);
+
+    expect(result).toEqual({ attempted: true, delegated: false });
+    expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('stub:pane:new'))).toBe(true);
+  });
+
+  it('treats a signal-killed herdr as a failed call, not a success', () => {
+    process.env.HERDR_STUB_SIGNAL = 'pane,run';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = splitPaneAndRun(['node', 'cli.js', 'review']);
+
+    expect(result).toEqual({ attempted: true, delegated: false });
+    expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('SIGTERM'))).toBe(true);
+  });
+
+  it('treats a pane run that times out as delegated, so the review is never run twice', () => {
+    process.env.HERDR_STUB_HANG = 'pane,run';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = splitPaneAndRun(['node', 'cli.js', 'review']);
+
+    expect(result).toEqual({ attempted: true, delegated: true });
+    expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('--no-pane'))).toBe(true);
+  }, 20_000);
+
+  it('bounds a herdr call that never answers, instead of blocking forever', () => {
+    process.env.HERDR_STUB_HANG = 'pane,split';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const start = Date.now();
+    const result = splitPaneAndRun(['node', 'cli.js', 'review']);
+
+    expect(result).toEqual({ attempted: true, delegated: false });
+    expect(Date.now() - start).toBeLessThan(HERDR_COMMAND_TIMEOUT_MS + 10_000);
+    expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('herdr warning'))).toBe(true);
+  }, 20_000);
 
   it('degrades to a warning, without throwing, when the herdr binary is absent', () => {
     process.env.COUNCIL_HERDR_BIN = path.join(dir, 'does-not-exist-herdr');
@@ -392,7 +491,49 @@ describe('inside a herdr environment: handoffToAgent', () => {
 
     expect(() => handoffToAgent('reviewer', promptPath)).not.toThrow();
     expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('herdr warning'))).toBe(true);
+    // herdr being unreachable is not the same as the agent not existing.
+    expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('was not found'))).toBe(false);
   });
+
+  it('distinguishes a failed agent lookup from an unknown agent', () => {
+    process.env.HERDR_STUB_GET_BROKEN = '1';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    handoffToAgent('reviewer', promptPath);
+
+    const messages = errorSpy.mock.calls.map(([msg]) => String(msg));
+    expect(messages.some((m) => m.includes('could not look up herdr agent "reviewer"'))).toBe(true);
+    expect(messages.some((m) => m.includes('socket unavailable'))).toBe(true);
+    expect(messages.some((m) => m.includes('was not found'))).toBe(false);
+  });
+
+  it('does not hold the calling process open while delivery is still running', () => {
+    // Runs handoffToAgent in a real child process and measures how long that
+    // process takes to exit while the stub's delivery sleeps for 5s. A plain, non-detached,
+    // ref'd child would keep the caller alive for the full 5s; a detached, unref'd one does not.
+    const script = [
+      `import { handoffToAgent } from ${JSON.stringify(HERDR_MODULE_URL)};`,
+      `handoffToAgent('reviewer', ${JSON.stringify(promptPath)});`,
+    ].join('\n');
+    const doneFile = path.join(dir, 'prompt-done.marker');
+
+    const start = Date.now();
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      env: {
+        ...process.env,
+        HERDR_STUB_PROMPT_DELAY_MS: '5000',
+        HERDR_STUB_PROMPT_DONE_FILE: doneFile,
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(child.status).toBe(0);
+    // The caller exited while delivery was still pending -- an event ordering, not a margin.
+    expect(fs.existsSync(doneFile)).toBe(false);
+    expect(elapsed).toBeLessThan(5_000);
+  }, 20_000);
 });
 
 describe('exit codes and artifacts are unaffected by herdr, present or absent', () => {
@@ -413,7 +554,7 @@ describe('exit codes and artifacts are unaffected by herdr, present or absent', 
     const promptPath = path.join(dir, 'handoff.md');
     fs.writeFileSync(promptPath, 'x', 'utf8');
 
-    expect(splitPaneAndRun(['x'])).toEqual({ attempted: false });
+    expect(splitPaneAndRun(['x'])).toEqual({ attempted: false, delegated: false });
     expect(setPaneTitle('t')).toEqual({ attempted: false });
     expect(notifyComplete('m', false)).toEqual({ attempted: false });
     expect(handoffToAgent('a', promptPath)).toEqual({ attempted: false });
