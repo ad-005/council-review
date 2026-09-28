@@ -13,11 +13,15 @@
  *   - worktree: tracked files plus untracked-not-ignored files, copied from disk as they exist
  *     at run start. The candidate list comes from git's own listing (`git ls-files -c -o
  *     --exclude-standard`), which is what makes ignored-path exclusion structural rather than a
- *     deny rule this module would have to maintain.
- *   - staged: the index, materialised exactly, via `git show :<path>` per file -- the index's
- *     stage-0 blob, never the working-tree content.
- *   - range / revision: the tree at the range's end revision, via `git show <rev>:<path>` per
- *     file.
+ *     deny rule this module would have to maintain. Paths with no file content on disk
+ *     (unstaged deletions, submodule checkouts, paths beyond a symlinked directory) are skipped.
+ *   - staged: the index, materialised exactly -- each stage-0 blob listed by `git ls-files -s`,
+ *     never the working-tree content.
+ *   - range / revision: the tree at the range's end revision, listed by `git ls-tree -r`.
+ *
+ *   Both git-sourced builders skip gitlinks and fetch every blob by sha through one
+ *   `git cat-file --batch` process. `Snapshot.files` and the tree hash cover exactly the paths
+ *   written.
  *
  * No git worktree is ever created, and nothing here mutates the real repository's index, HEAD,
  * refs or working tree -- every git invocation is read-only plumbing, run with argument arrays,
@@ -28,8 +32,16 @@
  * (Section 9), not from permission bits. Freezing exists so that every reviewer reads one
  * immutable photograph and line numbers mean the same thing to all of them and to the merge step.
  */
-import { execFile } from 'node:child_process';
-import { chmodSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile, spawn } from 'node:child_process';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { mkdir, copyFile, lstat, readlink, writeFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
@@ -96,7 +108,8 @@ const LIVENESS_MARKER = '.council-run.pid';
 
 const execFileAsync = promisify(execFile);
 
-// A single `git show <rev>:<path>` call must not be truncated by Node's default 1MB buffer.
+// A whole-tree listing (`ls-files` / `ls-tree`) must not be truncated by Node's default 1MB
+// buffer. Blob content never goes through this limit: it is streamed (see `readBlobs`).
 const GIT_MAX_BUFFER = 1024 * 1024 * 256;
 
 // ---------------------------------------------------------------------------------------------
@@ -182,7 +195,11 @@ export async function buildSnapshot(
     // reviewed tree.
     writeFileSync(join(root, LIVENESS_MARKER), String(process.pid), 'utf8');
 
-    const candidates = await listCandidates(repoRoot, scope);
+    // Worktree candidates come from disk; the git-sourced modes list blob entries (path -> sha),
+    // which is what lets them skip gitlinks and fetch content by object id, never by a
+    // `<rev>:<path>` spec a file name could be misparsed inside.
+    const blobs = scope.mode === 'worktree' ? null : await listBlobs(repoRoot, scope);
+    const candidates = blobs ? [...blobs.keys()] : await listWorktreeCandidates(repoRoot);
     // The CLI-built index owns `<root>/.codegraph/`: a `.codegraph/` path coming from the
     // reviewed tree (tracked, or untracked-but-not-ignored) is dropped here -- after
     // narrowing, so even a patch file touching that directory cannot force it back in --
@@ -196,14 +213,11 @@ export async function buildSnapshot(
       scope.files,
     ).filter((f) => f !== CODEGRAPH_INDEX_DIR && !f.startsWith(`${CODEGRAPH_INDEX_DIR}/`));
 
-    if (scope.mode === 'worktree') {
-      await materializeWorktree(repoRoot, root, narrowed);
-    } else if (scope.mode === 'staged') {
-      await materializeFromGit(repoRoot, root, narrowed, ':');
-    } else {
-      // 'range' | 'revision': resolveScope guarantees endRevision is set for both.
-      await materializeFromGit(repoRoot, root, narrowed, `${scope.endRevision}:`);
-    }
+    // Only what was actually written is hashed and exposed as `files`: a narrowed path with no
+    // content to copy (an unstaged deletion, a submodule, a path beyond a symlink) is absent.
+    const written = blobs
+      ? await materializeBlobs(repoRoot, root, narrowed, blobs)
+      : await materializeWorktree(repoRoot, root, narrowed);
 
     // Index after materialisation, before the freeze: the index must cover exactly the
     // files above, and the freeze that follows would deny the indexer its own writes. Never
@@ -223,7 +237,7 @@ export async function buildSnapshot(
       removeCodegraphDir(root);
     }
 
-    const treeHash = computeTreeHash(root, narrowed);
+    const treeHash = computeTreeHash(root, written);
 
     // Freeze last, immediately before this snapshot becomes visible to any caller -- nothing
     // after this point may write into the tree, except the read-only-queryable index dir below.
@@ -253,7 +267,7 @@ export async function buildSnapshot(
 
     return {
       root,
-      files: [...narrowed].sort(),
+      files: [...written].sort(),
       identity: { head: scope.head, dirty: scope.dirty, treeHash },
       codegraph,
       cleanup,
@@ -361,25 +375,46 @@ export function sweepOrphans(
 // Candidate listing
 // ---------------------------------------------------------------------------------------------
 
-async function listCandidates(repoRoot: string, scope: ResolvedScope): Promise<string[]> {
-  if (scope.mode === 'worktree') {
-    // Tracked (-c) plus untracked-not-ignored (-o --exclude-standard): the same structural
-    // exclusion the design calls for, derived from git's own listing rather than a deny rule.
-    return listNulSeparated(repoRoot, ['ls-files', '-z', '-c', '-o', '--exclude-standard']);
-  }
+async function listWorktreeCandidates(repoRoot: string): Promise<string[]> {
+  // Tracked (-c) plus untracked-not-ignored (-o --exclude-standard): the same structural
+  // exclusion the design calls for, derived from git's own listing rather than a deny rule.
+  return listNulSeparated(repoRoot, ['ls-files', '-z', '-c', '-o', '--exclude-standard']);
+}
+
+// A gitlink (submodule commit pointer): no content of its own in this repository to snapshot.
+const GITLINK_MODE = '160000';
+
+/**
+ * Lists the blob entries of the index (staged) or of the end revision's tree (range/revision) as
+ * path -> blob sha, in git's own order. Gitlinks are dropped, and for the index only stage-0
+ * entries count: an unmerged path has no single staged content, exactly as `git show :<path>`
+ * would refuse it.
+ */
+async function listBlobs(repoRoot: string, scope: ResolvedScope): Promise<Map<string, string>> {
+  const blobs = new Map<string, string>();
   if (scope.mode === 'staged') {
-    // No options: `ls-files` defaults to the cached (indexed) listing -- every path git currently
-    // considers staged, deletions-from-worktree included, since we read from the index, not disk.
-    return listNulSeparated(repoRoot, ['ls-files', '-z']);
+    // `<mode> SP <sha> SP <stage> TAB <path>`, deletions-from-worktree included, since we read
+    // from the index, not disk.
+    for (const entry of await listNulSeparated(repoRoot, ['ls-files', '-s', '-z'])) {
+      const tab = entry.indexOf('\t');
+      const [mode, sha, stage] = entry.slice(0, tab).split(' ');
+      if (mode !== GITLINK_MODE && stage === '0') blobs.set(entry.slice(tab + 1), sha as string);
+    }
+    return blobs;
   }
-  // 'range' | 'revision'
-  return listNulSeparated(repoRoot, [
+  // 'range' | 'revision' -- `<mode> SP <type> SP <sha> TAB <path>`; resolveScope guarantees
+  // endRevision is set for both.
+  for (const entry of await listNulSeparated(repoRoot, [
     'ls-tree',
     '-r',
-    '--name-only',
     '-z',
     scope.endRevision as string,
-  ]);
+  ])) {
+    const tab = entry.indexOf('\t');
+    const [mode, type, sha] = entry.slice(0, tab).split(' ');
+    if (mode !== GITLINK_MODE && type === 'blob') blobs.set(entry.slice(tab + 1), sha as string);
+  }
+  return blobs;
 }
 
 async function listNulSeparated(repoRoot: string, args: string[]): Promise<string[]> {
@@ -422,21 +457,54 @@ function narrowCandidates(
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Copies from the real working tree. A tracked-but-deleted-on-disk path (an unstaged delete)
- * is skipped rather than failing the build: it has no content to snapshot, and the patch itself
- * already records the deletion.
+ * Copies from the real working tree and returns the paths actually written. A path with no file
+ * content to snapshot is skipped rather than failing the build, and is absent from the result:
+ * a tracked-but-deleted-on-disk path (an unstaged delete -- the patch itself already records the
+ * deletion), a directory (a submodule checkout listed by `ls-files -c`, or an untracked embedded
+ * repository `ls-files -o` names with a trailing `/`), or any other non-regular file.
+ *
+ * A path whose parent directories are not all real directories inside `repoRoot` -- one reached
+ * through a symlinked directory -- is skipped too, which is what keeps a tracked `conf/app.yml`
+ * from being copied out of `~/secrets` once `conf/` is replaced by a symlink there. This is
+ * git's own rule (a path "beyond a symbolic link" counts as deleted), so the snapshot agrees
+ * with the patch, which records exactly that deletion.
  *
  * A symlink is stored the same way git itself would store it -- as a regular file whose content
  * is the link target text -- rather than dereferenced, so that all three builders agree on what
- * "the content of a symlink path" means (`git show` on a tracked symlink returns exactly this;
- * the working tree has no other analogue available without picking one arbitrarily).
+ * "the content of a symlink path" means (a tracked symlink's blob is exactly this; the working
+ * tree has no other analogue available without picking one arbitrarily).
  */
-async function materializeWorktree(repoRoot: string, root: string, files: string[]): Promise<void> {
-  for (const f of files) {
-    const src = join(repoRoot, f);
-    const dest = join(root, f);
-    await mkdir(dirname(dest), { recursive: true });
+async function materializeWorktree(
+  repoRoot: string,
+  root: string,
+  files: string[],
+): Promise<string[]> {
+  const written: string[] = [];
+  const realDirs = new Map<string, Promise<boolean>>();
+  // Whether every component of `relDir` is a real (non-symlink) directory under `repoRoot`.
+  // Memoised per directory, so each ancestor is lstat'ed once however many files it holds.
+  const isRealDir = (relDir: string): Promise<boolean> => {
+    if (relDir === '.') return Promise.resolve(true);
+    let cached = realDirs.get(relDir);
+    if (cached === undefined) {
+      cached = isRealDir(dirname(relDir)).then(async (parentOk) => {
+        if (!parentOk) return false;
+        try {
+          return (await lstat(join(repoRoot, relDir))).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+      realDirs.set(relDir, cached);
+    }
+    return cached;
+  };
 
+  for (const f of files) {
+    if (f.endsWith('/')) continue; // an untracked directory git did not descend into
+    if (!(await isRealDir(dirname(f)))) continue;
+
+    const src = join(repoRoot, f);
     let st;
     try {
       st = await lstat(src);
@@ -445,35 +513,47 @@ async function materializeWorktree(repoRoot: string, root: string, files: string
       throw err;
     }
 
+    const dest = join(root, f);
     if (st.isSymbolicLink()) {
+      await mkdir(dirname(dest), { recursive: true });
       const target = await readlink(src);
       await writeFile(dest, target, 'utf8');
+      written.push(f);
       continue;
     }
+    if (!st.isFile()) continue;
 
+    await mkdir(dirname(dest), { recursive: true });
     try {
       await copyFile(src, dest);
     } catch (err) {
       if (isEnoent(err)) continue;
       throw err;
     }
+    written.push(f);
   }
+  return written;
 }
 
-/** Materialises from git plumbing (`git show <refPrefix><path>`): `:` for the index (staged),
- *  or `<rev>:` for a range/revision's end tree. */
-async function materializeFromGit(
+/**
+ * Materialises blobs from the object database by sha (see `listBlobs`) through a single
+ * `git cat-file --batch` process -- raw blob content, the same bytes `git show` prints for a
+ * blob -- and returns the paths written. Every path in `files` is a key of `blobs` by
+ * construction: narrowing only ever selects from the candidates, which are those keys.
+ */
+async function materializeBlobs(
   repoRoot: string,
   root: string,
   files: string[],
-  refPrefix: string,
-): Promise<void> {
-  for (const f of files) {
-    const dest = join(root, f);
-    await mkdir(dirname(dest), { recursive: true });
-    const content = await execFileBuffer(repoRoot, ['show', `${refPrefix}${f}`]);
-    await writeFile(dest, content);
-  }
+  blobs: ReadonlyMap<string, string>,
+): Promise<string[]> {
+  const shas = files.map((f) => blobs.get(f) as string);
+  await readBlobs(repoRoot, shas, (index, content) => {
+    const dest = join(root, files[index] as string);
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, content);
+  });
+  return [...files];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -586,20 +666,97 @@ async function runGit(repoRoot: string, args: string[]): Promise<string> {
   }
 }
 
-function execFileBuffer(repoRoot: string, args: string[]): Promise<Buffer> {
+/**
+ * Streams each of `shas` through one `git cat-file --batch` process, calling `onBlob` with the
+ * request's index and the blob's raw content, strictly in request order. Output is parsed
+ * incrementally (`<sha> SP blob SP <size> LF <content> LF` per object), so no single buffer ever
+ * holds more than one object plus a pipe chunk. `onBlob` must be synchronous: anything it throws,
+ * and any object that is missing or not a blob, fails the whole read with a `SnapshotError`.
+ */
+function readBlobs(
+  repoRoot: string,
+  shas: readonly string[],
+  onBlob: (index: number, content: Buffer) => void,
+): Promise<void> {
+  if (shas.length === 0) return Promise.resolve();
   return new Promise((resolvePromise, reject) => {
-    execFile(
-      'git',
-      args,
-      { cwd: repoRoot, maxBuffer: GIT_MAX_BUFFER, encoding: 'buffer' },
-      (err, stdout) => {
-        if (err) {
-          reject(new SnapshotError(`git ${args.join(' ')} failed: ${errorMessage(err)}`));
-        } else {
-          resolvePromise(stdout as unknown as Buffer);
+    const child = spawn('git', ['cat-file', '--batch'], {
+      cwd: repoRoot,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const stderr: Buffer[] = [];
+    let failure: unknown = null;
+    const fail = (err: unknown): void => {
+      if (failure !== null) return;
+      failure = err;
+      child.kill();
+    };
+
+    let chunks: Buffer[] = [];
+    let buffered = 0;
+    let bodySize = -1; // -1 while awaiting the next header
+    let index = 0;
+    const joined = (): Buffer => {
+      const all = chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, buffered);
+      chunks = [all];
+      return all;
+    };
+    const consume = (n: number): Buffer => {
+      const all = joined();
+      const rest = all.subarray(n);
+      chunks = rest.length > 0 ? [rest] : [];
+      buffered = rest.length;
+      return all.subarray(0, n);
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failure !== null) return;
+      chunks.push(chunk);
+      buffered += chunk.length;
+      try {
+        for (;;) {
+          if (bodySize < 0) {
+            if (buffered === 0) break;
+            const nl = joined().indexOf(0x0a);
+            if (nl < 0) break;
+            const header = consume(nl + 1)
+              .subarray(0, nl)
+              .toString('utf8');
+            const [, type, size] = header.split(' ');
+            if (type !== 'blob' || size === undefined || !/^\d+$/.test(size)) {
+              throw new SnapshotError(`git cat-file --batch: expected a blob, got "${header}"`);
+            }
+            bodySize = Number(size);
+          } else {
+            if (buffered < bodySize + 1) break; // content plus its trailing LF
+            const content = consume(bodySize + 1).subarray(0, bodySize);
+            bodySize = -1;
+            onBlob(index, content);
+            index += 1;
+          }
         }
-      },
-    );
+      } catch (err) {
+        fail(err);
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+    child.on('error', fail);
+    child.stdin.on('error', fail); // EPIPE when git exits early; `close` below reports why
+
+    child.on('close', (code) => {
+      const detail = Buffer.concat(stderr).toString('utf8').trim();
+      if (failure !== null) {
+        reject(failure); // `buildSnapshot` wraps anything that is not already a SnapshotError
+      } else if (code !== 0) {
+        reject(new SnapshotError(`git cat-file --batch failed: ${detail || `exit ${code}`}`));
+      } else if (index !== shas.length) {
+        reject(new SnapshotError(`git cat-file --batch returned ${index} of ${shas.length} blobs`));
+      } else {
+        resolvePromise();
+      }
+    });
+
+    child.stdin.end(`${shas.join('\n')}\n`);
   });
 }
 

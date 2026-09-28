@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -20,7 +22,7 @@ import {
   type Snapshot,
 } from '../../src/snapshot.js';
 import { resolveScope, type ResolvedScope } from '../../src/scope.js';
-import { createTestRepo } from '../helpers/git-repo.js';
+import { createTestRepo, TestRepo } from '../helpers/git-repo.js';
 
 /**
  * A fresh, isolated scratch base directory for one test's own `buildSnapshot`/`sweepOrphans`
@@ -39,6 +41,9 @@ function makeScratchDir(): { dir: string; cleanup: () => void } {
 function assertReadOnly(root: string): void {
   const st = statSync(root);
   expect(st.mode & 0o222).toBe(0);
+  // Root bypasses permission bits entirely, so the write probe below only means something for an
+  // ordinary user; the mode bits above are still checked either way.
+  if (process.getuid?.() === 0) return;
   if (st.isDirectory()) {
     // Read-only in practice: attempting to create a new file under it fails.
     expect(() => writeFileSync(join(root, '__probe__'), 'x')).toThrow();
@@ -459,6 +464,201 @@ describe('buildSnapshot: no git worktree is created', () => {
 
       const after = repo.git(['worktree', 'list']);
       expect(after).toBe(before);
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+
+/** Initialises a separate repository at `dir` inside another test repo (an embedded repo, or the
+ *  checkout behind a gitlink), with the same local-only identity `createTestRepo` configures. */
+function createEmbeddedRepo(dir: string): TestRepo {
+  mkdirSync(dir, { recursive: true });
+  const repo = new TestRepo(dir);
+  repo.git(['init', '--quiet', '-b', 'main']);
+  repo.git(['config', 'user.name', 'Council Review Test']);
+  repo.git(['config', 'user.email', 'council-review-test@example.invalid']);
+  repo.git(['config', 'commit.gpgsign', 'false']);
+  return repo;
+}
+
+/** Records `path` (which must already hold a repo with a commit) as a gitlink in `repo`'s index. */
+function addGitlink(repo: TestRepo, path: string): void {
+  repo.git(['-c', 'advice.addEmbeddedRepo=false', 'add', '--', path]);
+}
+
+describe('buildSnapshot: paths with no file content to copy', () => {
+  it('skips an unstaged deletion instead of failing, and never lists it', async () => {
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('a.txt', 'a\n', 'c1');
+      repo.writeAndCommit('b.txt', 'b\n', 'c2');
+      rmSync(join(repo.root, 'b.txt')); // unstaged delete: still in `ls-files -c`
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      expect(scope.files).toContain('b.txt');
+      const snapshot = await buildSnapshot(repo.root, scope);
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.files).toEqual(['a.txt']);
+        expect(existsSync(join(snapshot.root, 'b.txt'))).toBe(false);
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('worktree scope skips a submodule checkout and an untracked embedded repository', async () => {
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('a.txt', 'a\n', 'c1');
+      createEmbeddedRepo(join(repo.root, 'sub')).writeAndCommit('s.txt', 's\n', 's');
+      addGitlink(repo, 'sub');
+      repo.commit('add gitlink');
+      // Untracked embedded repo: `ls-files -o` names it `nested/`, without descending into it.
+      createEmbeddedRepo(join(repo.root, 'nested')).writeAndCommit('n.txt', 'n\n', 'n');
+      repo.writeFile('a.txt', 'changed\n');
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope);
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.files).toEqual(['a.txt']);
+        expect(existsSync(join(snapshot.root, 'sub'))).toBe(false);
+        expect(existsSync(join(snapshot.root, 'nested'))).toBe(false);
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('staged scope skips a gitlink and reads a file named like an index stage spec', async () => {
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('x', 'plain x\n', 'c1');
+      createEmbeddedRepo(join(repo.root, 'sub')).writeAndCommit('s.txt', 's\n', 's');
+      addGitlink(repo, 'sub');
+      repo.commit('add gitlink');
+      // `:0:x` is git's spelling of "stage 0 of x", so fetching this file by `:<path>` would
+      // silently return `x`'s content instead.
+      repo.writeFile('0:x', 'the file named 0:x\n');
+      repo.add(['0:x']);
+
+      const scope = await resolveScope(repo.root, { staged: true }, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope);
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.files).toEqual(['0:x', 'x']);
+        expect(readFileSync(join(snapshot.root, '0:x'), 'utf8')).toBe('the file named 0:x\n');
+        expect(readFileSync(join(snapshot.root, 'x'), 'utf8')).toBe('plain x\n');
+        expect(existsSync(join(snapshot.root, 'sub'))).toBe(false);
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('revision scope skips a gitlink in the end tree', async () => {
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('a.txt', 'a\n', 'c1');
+      createEmbeddedRepo(join(repo.root, 'sub')).writeAndCommit('s.txt', 's\n', 's');
+      addGitlink(repo, 'sub');
+      const c2 = repo.commit('add gitlink');
+
+      const scope = await resolveScope(repo.root, { revision: c2 }, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope);
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.files).toEqual(['a.txt']);
+        expect(readFileSync(join(snapshot.root, 'a.txt'), 'utf8')).toBe('a\n');
+        expect(existsSync(join(snapshot.root, 'sub'))).toBe(false);
+      });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('git-sourced scopes materialise many files, symlinks and empty blobs exactly', async () => {
+    const repo = createTestRepo();
+    try {
+      for (let i = 0; i < 50; i++) repo.writeFile(`dir${i % 5}/f${i}.txt`, `content ${i}\n`);
+      repo.writeFile('empty.txt', '');
+      repo.writeFile('bin.dat', '\0\n\0binary\n');
+      symlinkSync('dir0/f0.txt', join(repo.root, 'link'));
+      repo.add();
+      const c1 = repo.commit('many');
+
+      const revScope = await resolveScope(repo.root, { revision: c1 }, { baseBranch: 'main' });
+      const stagedScope = await resolveScope(repo.root, { staged: true }, { baseBranch: 'main' });
+      const worktreeScope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const rev = await buildSnapshot(repo.root, revScope);
+      const staged = await buildSnapshot(repo.root, stagedScope);
+      const worktree = await buildSnapshot(repo.root, worktreeScope);
+      try {
+        expect(rev.files).toHaveLength(53);
+        expect(readFileSync(join(rev.root, 'dir3/f13.txt'), 'utf8')).toBe('content 13\n');
+        expect(readFileSync(join(rev.root, 'empty.txt'), 'utf8')).toBe('');
+        expect(readFileSync(join(rev.root, 'bin.dat'), 'utf8')).toBe('\0\n\0binary\n');
+        expect(readFileSync(join(rev.root, 'link'), 'utf8')).toBe('dir0/f0.txt');
+        // All three builders agree on the whole tree, symlink-as-target-text included.
+        expect(staged.files).toEqual(rev.files);
+        expect(worktree.files).toEqual(rev.files);
+        expect(staged.identity.treeHash).toBe(rev.identity.treeHash);
+        expect(worktree.identity.treeHash).toBe(rev.identity.treeHash);
+      } finally {
+        rev.cleanup();
+        staged.cleanup();
+        worktree.cleanup();
+      }
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+
+describe('buildSnapshot: security -- never copies from outside the repository', () => {
+  it('skips a tracked file whose parent directory was replaced by a symlink leaving the repo', async () => {
+    const repo = createTestRepo();
+    const outside = mkdtempSync(join(tmpdir(), 'council-review-test-outside-'));
+    try {
+      writeFileSync(join(outside, 'app.yml'), 'SECRET_TOKEN=do-not-leak\n');
+      repo.writeAndCommit('conf/app.yml', 'public: true\n', 'c1');
+      // Ignoring the symlink itself keeps it out of `ls-files -o`, so nothing else in the listing
+      // collides with `conf/` and the only thing standing between the copy and the secret is the
+      // parent-directory check.
+      repo.writeAndCommit('.gitignore', '/conf\n', 'c2');
+      // `conf/app.yml` stays in `ls-files -c`, but the path now resolves through the symlink.
+      rmSync(join(repo.root, 'conf'), { recursive: true, force: true });
+      symlinkSync(outside, join(repo.root, 'conf'));
+
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope);
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.files).not.toContain('conf/app.yml');
+        expect(existsSync(join(snapshot.root, 'conf', 'app.yml'))).toBe(false);
+        for (const f of snapshot.files) {
+          expect(readFileSync(join(snapshot.root, f), 'utf8')).not.toContain('do-not-leak');
+        }
+      });
+    } finally {
+      repo.cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a path beyond an in-repo directory symlink as git does: absent, not copied', async () => {
+    const repo = createTestRepo();
+    try {
+      repo.writeAndCommit('real/x.txt', 'real\n', 'c1');
+      repo.writeAndCommit('alias/x.txt', 'alias\n', 'c2');
+      rmSync(join(repo.root, 'alias'), { recursive: true, force: true });
+      symlinkSync('real', join(repo.root, 'alias'));
+
+      // git itself reports `alias/x.txt` deleted ("beyond a symbolic link") and `alias` as a new
+      // untracked symlink; the snapshot must depict that same end state.
+      const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+      const snapshot = await buildSnapshot(repo.root, scope);
+      await withSnapshot(snapshot, () => {
+        expect(snapshot.files).toEqual(['alias', 'real/x.txt']);
+        expect(readFileSync(join(snapshot.root, 'alias'), 'utf8')).toBe('real');
+      });
     } finally {
       repo.cleanup();
     }

@@ -16,7 +16,9 @@ import { promisify } from 'node:util';
 /** Index layout the real binary produces inside the indexed root: `<root>/.codegraph/codegraph.db`.
  *  The reviewer-side gate in `reviewer-tools.ts` probes this same path (it cannot import this
  *  module -- the extension may only import `node:` builtins -- so the literal is duplicated
- *  there); `snapshot.ts` imports these constants so the CLI side agrees by construction. */
+ *  there). `snapshot.ts` imports `CODEGRAPH_INDEX_DIR` to keep a repo-supplied `.codegraph/` out
+ *  of the snapshot, and `hasIndexArtifact` below probes `codegraphDbPath`, so the CLI side agrees
+ *  by construction. */
 export const CODEGRAPH_INDEX_DIR = '.codegraph';
 export const CODEGRAPH_DB_NAME = 'codegraph.db';
 
@@ -52,6 +54,8 @@ export interface EnsureSnapshotIndexOptions {
   bin?: string;
   enabled?: boolean;
   timeoutSeconds?: number;
+  /** Output cap before the indexer is killed (default `INDEX_MAX_BUFFER`); a test seam only. */
+  maxBufferBytes?: number;
 }
 
 /**
@@ -77,7 +81,7 @@ export async function ensureSnapshotIndex(
   try {
     await execFileAsync(bin, ['init', snapshotRoot], {
       timeout: timeoutSeconds * 1000,
-      maxBuffer: INDEX_MAX_BUFFER,
+      maxBuffer: opts.maxBufferBytes ?? INDEX_MAX_BUFFER,
       // SIGKILL, not the default SIGTERM: a timed-out indexer must actually be dead before
       // the caller freezes the tree and reviewers start querying it -- a child that ignores
       // SIGTERM (or one whose workers outlive it) would otherwise keep mutating the index
@@ -113,6 +117,10 @@ function isEnoent(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT';
 }
 
+/** `killed` is also set when Node kills a child for overflowing `maxBuffer`; that is an index
+ *  failure (runaway output), not a timeout, and Node marks it with its own error code. */
 function isTimeout(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && (err as { killed?: unknown }).killed === true;
+  if (typeof err !== 'object' || err === null) return false;
+  const { killed, code } = err as { killed?: unknown; code?: unknown };
+  return killed === true && code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
 }
