@@ -212,7 +212,7 @@ Vendor is derived in this order:
 
 ### Vendor-independence guard
 
-At the end of selection and again immediately before launch, the panel must
+At the end of selection, which is the exact panel that launches, the panel must
 contain at least 3 models resolving to at least 3 distinct vendors. Otherwise
 the run refuses with exit 4 and prints the collapsed grouping.
 `--allow-correlated` overrides both the vendor count and the 3-model minimum,
@@ -305,7 +305,8 @@ From the JSON stream the runner keeps:
   manifest, so a reviewer that never opened a file is visibly not equal to one
   that read twelve.
 
-Per-reviewer timeout (default 600s) and an output-token ceiling. Breaching
+Per-reviewer timeout (default 10800s) and an output-token ceiling, each
+covering the reviewer as a whole, repair attempt included. Breaching
 either marks that reviewer `timeout` or `over-budget`; the run continues and
 the report is marked degraded.
 
@@ -462,14 +463,15 @@ council-review [scope] [panel] [run] [herdr]
 council-review init [--pick]
 council-review models
 council-review show [<run-id>|last]
-council-review ignore <finding-id> [--reason <text>] [--run <run-id>]
+council-review ignore <finding-id> [--reason <text>] [--run <run-id>|last]
 council-review gc [--keep <n>]
 
 Scope   --staged  --range <A..B>  --paths <glob>...  --base <branch>
 Panel   --models <spec>[,…]  --pick  --thinking <level>  --allow-correlated
 Run     --timeout <s>  --max-tokens <n>  --since <last|run-id>
         --fail-on <severity|none>  --no-suppress  --json
-herdr   --pane [right|down]  --no-pane  --handoff <agent>  --no-notify
+herdr   --pane  --direction <horizontal|vertical>  --no-pane  --handoff <agent>
+        --no-notify
 ```
 
 ## Testing
