@@ -12,15 +12,16 @@
  *                                        text file. The run id is the resolved link's basename.
  *
  * `reviewsDir` is the container directory for all runs (`RunDir.reviewsDir` in the report.ts
- * contract), not one run's own directory.
+ * contract), not one run's own directory. report.ts owns that layout, so every read of it here
+ * goes through report.ts's `listRunIds`, `resolveLastRunId` and `readRunFindings`.
  *
  * This module never calls a model, never touches the network, and never reads the wall clock —
  * a diff is a pure function of the two finding sets it is given.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 
 import type { MergedFinding } from './merge.js';
+import { listRunIds, readRunFindings, resolveLastRunId } from './report.js';
 
 export type ResolutionState = 'resolved' | 'still-present' | 'new';
 
@@ -51,73 +52,43 @@ function findingsFile(reviewsDir: string, runId: string): string {
   return path.join(reviewsDir, runId, 'findings.json');
 }
 
-function lastPointerFile(reviewsDir: string): string {
-  return path.join(reviewsDir, 'last');
-}
-
 /**
- * Resolves the `last` symlink to the run id it points at. `fs.realpathSync` both follows the
- * symlink and fails exactly when it should be treated as absent: a missing `last` entry and a
- * `last` that points at a run directory that no longer exists (e.g. one `gc` has since removed)
- * both raise ENOENT here, and both collapse to the same "no baseline available" outcome via the
- * `null` return — deliberately not distinguished, per the findings-merge spec's requirement that
- * the no-previous-run case proceed rather than error.
- */
-function resolveLastPointer(reviewsDir: string): string | null {
-  let resolved: string;
-  try {
-    resolved = fs.realpathSync(lastPointerFile(reviewsDir));
-  } catch {
-    return null;
-  }
-  return path.basename(resolved);
-}
-
-/** Reads and parses `file` as a JSON array of `MergedFinding`. Returns `null` on any failure —
- * missing file, unreadable file, invalid JSON, or JSON that is not an array — rather than
- * throwing, so callers can decide what a given failure means for their `ref`. */
-function readFindingsFile(file: string): MergedFinding[] | null {
-  let text: string;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return null;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  return Array.isArray(parsed) ? (parsed as MergedFinding[]) : null;
-}
-
-/**
- * Resolves `ref` to a previous run's merged findings.
+ * Resolves `ref` to a previous run's merged findings. Reads only the previous run, never the
+ * current one, so the CLI calls it before creating the new run directory or launching any
+ * reviewer: a bad `--since` then fails fast instead of after a paid panel has run, and the
+ * loaded baseline is handed to `diffAgainstBaseline` once merging is done.
  *
  * - `ref === 'last'`: resolves the `last` symlink and loads that run's findings. Any failure
  *   along this path — no `last` symlink, because no run has ever completed; a dangling `last`
- *   pointing at a run directory that no longer exists; or a resolved run whose findings file is
- *   missing or unreadable — is treated as "no previous run exists" and returns `null`. This is
+ *   pointing at a run directory that no longer exists; a `last` that is not a symlink at all; or
+ *   a resolved run whose findings file is missing, unreadable or malformed — is treated as "no previous run exists" and returns `null`. This is
  *   not an error: it is the "No previous run exists" scenario, and the caller proceeds without
  *   resolution marking.
- * - `ref` is a specific run id: that run is expected to exist and be readable. Any failure is
- *   the "Unknown or unreadable previous run" scenario and throws `ResolveError` naming the run.
+ * - `ref` is a specific run id: it must be one of the run ids `listRunIds` lists (so `.`, `..`,
+ *   a nested path or any other string that is not a run directory's own name is rejected before
+ *   anything is read), and that run must be readable. Any failure is the "Unknown or unreadable
+ *   previous run" scenario and throws `ResolveError` naming the run.
  */
 export function loadPreviousFindings(
   reviewsDir: string,
   ref: 'last' | string,
 ): { runId: string; findings: MergedFinding[] } | null {
   if (ref === 'last') {
-    const runId = resolveLastPointer(reviewsDir);
+    const runId = resolveLastRunId(reviewsDir);
     if (runId === null) return null;
 
-    const findings = readFindingsFile(findingsFile(reviewsDir, runId));
+    const findings = readRunFindings(reviewsDir, runId);
     if (findings === null) return null;
     return { runId, findings };
   }
 
-  const findings = readFindingsFile(findingsFile(reviewsDir, ref));
+  if (!listRunIds(reviewsDir).includes(ref)) {
+    throw new ResolveError(
+      `Cannot diff against previous run "${ref}": no such run under ${reviewsDir} ` +
+        '(expected "last" or the id of a run directory there).',
+    );
+  }
+  const findings = readRunFindings(reviewsDir, ref);
   if (findings === null) {
     throw new ResolveError(
       `Cannot diff against previous run "${ref}": its merged findings could not be found or ` +
@@ -127,13 +98,28 @@ export function loadPreviousFindings(
   return { runId: ref, findings };
 }
 
+/** Every fingerprint a finding can be matched on: its own plus each cluster member's. A
+ * baseline written before `memberFingerprints` existed (or a malformed one) contributes only its
+ * own fingerprint. */
+function matchKeys(f: MergedFinding): string[] {
+  const members: unknown = (f as Partial<MergedFinding>).memberFingerprints;
+  const extra = Array.isArray(members)
+    ? members.filter((m): m is string => typeof m === 'string')
+    : [];
+  return [f.fingerprint, ...extra];
+}
+
 /**
  * Marks each of `current`'s findings `still-present` or `new` against `baseline`, and collects
- * every baseline finding absent from `current` as `resolved`. Matching is by fingerprint only —
+ * every baseline finding absent from `current` as `resolved`. Two findings match when their
+ * fingerprint sets — each one's own fingerprint plus its `memberFingerprints` — intersect,
+ * mirroring how suppression matches (merge.ts `isSuppressed`): a cluster's own fingerprint is
+ * its representative member's, and the representative can change between runs (e.g. the
+ * reviewer whose wording was chosen fails next time) without the defect changing. Matching is
  * never by id, which is reassigned on every merge, and never by line, which fingerprints
  * deliberately exclude so a suppression or a match survives a refactor. The accepted trade-off:
- * a reviewer that rewords a claim substantially between runs presents as one `resolved` plus
- * one `new`, because its fingerprint genuinely changed.
+ * a defect whose every reviewer rewords its claim substantially between runs presents as one
+ * `resolved` plus one `new`, because no fingerprint survived.
  *
  * When `baseline` is `null` there is nothing to compare against, and the run proceeds *without*
  * resolution marking — not with every finding marked `'new'`, which would itself be a marking,
@@ -157,16 +143,16 @@ export function diffAgainstBaseline(
     };
   }
 
-  const baselineFingerprints = new Set(baseline.findings.map((f) => f.fingerprint));
-  const currentFingerprints = new Set(current.map((f) => f.fingerprint));
+  const baselineKeys = new Set(baseline.findings.flatMap(matchKeys));
+  const currentKeys = new Set(current.flatMap(matchKeys));
 
   const markedCurrent: MarkedFinding[] = current.map((f) => ({
     ...f,
-    resolution: baselineFingerprints.has(f.fingerprint) ? 'still-present' : 'new',
+    resolution: matchKeys(f).some((k) => baselineKeys.has(k)) ? 'still-present' : 'new',
   }));
 
   const resolved: MarkedFinding[] = baseline.findings
-    .filter((f) => !currentFingerprints.has(f.fingerprint))
+    .filter((f) => !matchKeys(f).some((k) => currentKeys.has(k)))
     .map((f) => ({ ...f, resolution: 'resolved' }));
 
   const counts = {
@@ -176,4 +162,33 @@ export function diffAgainstBaseline(
   };
 
   return { baselineRunId: baseline.runId, current: markedCurrent, resolved, counts };
+}
+
+/**
+ * The findings document to persist (`findings.json`) and emit (`--json`) for a run: the merged
+ * findings as-is when no diff was requested (`resolution === null`), and otherwise the same
+ * findings, in the same order, each carrying its `resolution` field (`null` throughout when
+ * `--since` found no baseline). Resolved findings — absent from this run by definition — are
+ * never included: they belong to the report and the manifest, and a later `--since` reading this
+ * file must not see them as present.
+ */
+export function findingsWithResolution(
+  findings: readonly MergedFinding[],
+  resolution: null,
+): readonly MergedFinding[];
+export function findingsWithResolution(
+  findings: readonly MergedFinding[],
+  resolution: ResolutionOutcome,
+): MarkedFinding[];
+export function findingsWithResolution(
+  findings: readonly MergedFinding[],
+  resolution: ResolutionOutcome | null,
+): readonly MergedFinding[];
+export function findingsWithResolution(
+  findings: readonly MergedFinding[],
+  resolution: ResolutionOutcome | null,
+): readonly MergedFinding[] | MarkedFinding[] {
+  if (resolution === null) return findings;
+  const byId = new Map(resolution.current.map((f) => [f.id, f.resolution]));
+  return findings.map((f) => ({ ...f, resolution: byId.get(f.id) ?? null }));
 }

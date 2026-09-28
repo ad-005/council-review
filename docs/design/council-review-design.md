@@ -325,34 +325,51 @@ appended to the conversation. Still invalid and the reviewer is marked
 
 ## Merge
 
-Fingerprint: `sha256(normalizedPath + "\0" + normalizeClaim(claim))`, where
-normalization lowercases, strips punctuation and collapses whitespace and
-stopwords. Stable across line moves, which is what lets suppression survive a
-refactor.
+Fingerprint: `sha256(normalizePath(file) + "\0" + normalizeClaim(claim))`.
+Claim normalization lowercases, strips punctuation, collapses whitespace and
+drops stopwords. Path normalization (`normaliseFindingPath`, shared with
+clustering and snapshot verification) trims, folds backslashes, `./` segments,
+duplicate and trailing slashes, but preserves case: `src/Foo.ts` and
+`src/foo.ts` are different files. Stable across line moves, which is what lets
+suppression survive a refactor.
 
-Clustering is union-find within a file. Two findings merge when all three hold:
+Clustering is union-find within one normalized path. Two findings merge when
+all three hold:
 
-1. line ranges overlap or lie within `mergeWindow` (default 8) lines;
-2. categories are equal;
-3. claim token Jaccard similarity >= `claimSimilarity` (default 0.45).
+1. line ranges overlap or lie within `mergeWindow` (default 10) lines;
+2. categories are compatible: equal (case-insensitive), or both in the
+   `security`/`correctness` pair, which independent reviewers routinely split
+   on for one defect;
+3. claim-token overlap coefficient (|A∩B| / min(|A|, |B|)) >=
+   `claimSimilarity` (default 0.6). Two claims with no content tokens at all
+   match only if their text is the same.
 
 Condition 3 is what prevents two unrelated findings on the same line from
-collapsing into one.
+collapsing into one. The overlap coefficient replaced Jaccard because it does
+not penalize one reviewer simply being more verbose than another.
 
-This is a heuristic, and the design treats it as one: `raw/` is kept verbatim,
-and every merged finding lists the source finding ids it was built from, so the
-consuming agent can always check the merge.
+This is a heuristic, and the design treats it as one: `reviewers/` keeps every
+reviewer's output verbatim, and every merged finding lists the source finding
+ids it was built from, so the consuming agent can always check the merge.
 
-Merged finding fields: `id`, `file`, `line`, `severity` (max of members),
-`severities` (per model), `category`, `claim`, `failure`, `raised_by`,
-`agreement`, `of`, `evidence[]`, `sources[]`, `fingerprint`.
+Within a cluster, members are ordered by reviewer id then finding index; the
+first supplies `claim` and `impact` (and so the fingerprint). `category` comes
+from the highest-severity member, ties broken by that member's fingerprint and
+then the category text — never by reviewer id.
 
-`of` is the number of reviewers that returned schema-valid findings, not the
-number launched. A panel of three where one timed out yields `of: 2`, so an
-agreement score is never silently deflated by a reviewer that never reported.
-The manifest carries the launched-versus-reported counts.
+Merged finding fields: `id`, `fingerprint`, `file` (normalized), `line`,
+`endLine`, `severity` (max of members), `perReviewerSeverity`, `category`,
+`claim`, `impact`, `evidence[]`, `suggestions[]`, `raisedBy`, `sources[]`,
+`agreement` (`raisers` of `reporting`), `unverifiable`, `memberFingerprints`.
 
-Sort by agreement desc, severity desc, path asc, line asc. Ids `F01…` are
+`agreement.reporting` is the number of reviewers that returned schema-valid
+findings, not the number launched. A panel of three where one timed out yields
+`reporting: 2`, so an agreement score is never silently deflated by a reviewer
+that never reported. The manifest carries the launched-versus-reported counts.
+
+Sort by agreement desc, severity desc, path asc, line asc, then fingerprint,
+category, end line and sources asc, which makes the order total. Every string
+comparison is by UTF-16 code unit, never locale collation. Ids `F001…` are
 assigned after sorting so they are stable for a given input.
 
 Suppression: a cluster is dropped if its fingerprint, or any member's, matches

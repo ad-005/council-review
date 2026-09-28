@@ -37,10 +37,18 @@ export type ExtractResult = { ok: true; findings: RawFinding[] } | { ok: false; 
 // mistake a repair attempt can fix, so it must surface as a validation error rather than be
 // silently dropped. `unverifiable` is not part of this schema — a reviewer never emits it; it is
 // attached afterwards by `markUnverifiable` once findings are checked against the snapshot.
+//
+// Required text fields must contain at least one non-whitespace character (`NON_BLANK`), not
+// merely be non-empty: a whitespace-only file, category or claim is as useless downstream as a
+// missing one, and rejecting it here is what lets the repair retry fix it. The one cross-field
+// rule the schema language cannot express — `endLine >= line` — is checked separately by
+// `rangeErrors`, and its errors are reported together with the schema's own.
+
+const NON_BLANK = { minLength: 1, pattern: '\\S' } as const;
 
 const FindingSchema = Type.Object(
   {
-    file: Type.String({ minLength: 1 }),
+    file: Type.String(NON_BLANK),
     line: Type.Integer({ minimum: 1 }),
     endLine: Type.Optional(Type.Integer({ minimum: 1 })),
     severity: Type.Union([
@@ -49,9 +57,9 @@ const FindingSchema = Type.Object(
       Type.Literal('medium'),
       Type.Literal('low'),
     ]),
-    category: Type.String({ minLength: 1 }),
-    claim: Type.String({ minLength: 1 }),
-    impact: Type.String({ minLength: 1 }),
+    category: Type.String(NON_BLANK),
+    claim: Type.String(NON_BLANK),
+    impact: Type.String(NON_BLANK),
     evidence: Type.Optional(Type.String()),
     suggestion: Type.Optional(Type.String()),
     confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
@@ -213,7 +221,8 @@ function describeValueError(err: ValueError): string {
     case ValueErrorType.Union:
       return `${loc} must be one of critical, high, medium, low ${got()}`;
     case ValueErrorType.StringMinLength:
-      return `${loc} must not be empty`;
+    case ValueErrorType.StringPattern:
+      return `${loc} must not be empty or blank`;
     case ValueErrorType.String:
       return `${loc} must be a string ${got()}`;
     case ValueErrorType.Integer:
@@ -252,6 +261,29 @@ function formatValidationErrors(rawErrors: Iterable<ValueError>): string[] {
 }
 
 /**
+ * The `endLine >= line` rule, checked on every element whose two fields are both integers (a
+ * non-integer is already reported by the schema). Phrased like the schema's own messages so a
+ * repair attempt can act on it.
+ */
+function rangeErrors(findings: readonly unknown[]): string[] {
+  const errors: string[] = [];
+  findings.forEach((f, i) => {
+    if (typeof f !== 'object' || f === null) return;
+    const { line, endLine } = f as { line?: unknown; endLine?: unknown };
+    if (
+      Number.isInteger(line) &&
+      Number.isInteger(endLine) &&
+      (endLine as number) < (line as number)
+    ) {
+      errors.push(
+        `finding[${i}].endLine must be >= line (got endLine ${String(endLine)}, line ${String(line)})`,
+      );
+    }
+  });
+  return errors;
+}
+
+/**
  * Locates a reviewer's findings block within its final text, parses it, and validates it
  * against the findings schema. A valid, empty findings list (`[]`) is a successful report, not
  * a failure. Never throws: invalid model output is reported through the `ok: false` branch.
@@ -280,12 +312,13 @@ export function extractFindings(text: string): ExtractResult {
     };
   }
 
-  if (!Value.Check(FindingsSchema, parsed.value)) {
-    return {
-      ok: false,
-      errors: formatValidationErrors(Value.Errors(FindingsSchema, parsed.value)),
-    };
-  }
+  const errors = [
+    ...(Value.Check(FindingsSchema, parsed.value)
+      ? []
+      : formatValidationErrors(Value.Errors(FindingsSchema, parsed.value))),
+    ...rangeErrors(parsed.value),
+  ];
+  if (errors.length > 0) return { ok: false, errors };
 
   return { ok: true, findings: parsed.value as RawFinding[] };
 }
@@ -349,9 +382,26 @@ Rules for this block:
 - Every finding requires: "file" (path relative to the repository root), "line" (integer,
   1-based), "severity" (one of "critical", "high", "medium", "low"), "category", "claim", and
   "impact".
-- "endLine" (integer), "evidence" (string), "suggestion" (string) and "confidence" (a number
-  between 0 and 1) are optional. Do not include any field not listed here.
+- "endLine" (integer, no smaller than "line"), "evidence" (string), "suggestion" (string) and
+  "confidence" (a number between 0 and 1) are optional. Do not include any field not listed here.
 `.trim();
+
+// --- Path normalisation -------------------------------------------------------------------------
+
+/**
+ * The one normalisation applied to a finding's `file` wherever it is compared: snapshot
+ * verification (`markUnverifiable`), clustering, the fingerprint, and the path a merged finding
+ * carries. Surrounding whitespace is trimmed, backslashes fold to forward slashes, `.` segments
+ * (a leading `./`, an inner `/./`) and repeated slashes collapse, and a trailing slash is
+ * dropped — spelling variations of one repository-relative path. Case is deliberately
+ * preserved: `src/Foo.ts` and `src/foo.ts` are distinct files in a git tree.
+ */
+export function normaliseFindingPath(file: string): string {
+  let p = file.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+  while (p.includes('/./')) p = p.replace('/./', '/');
+  while (p.startsWith('./')) p = p.slice(2);
+  return p.replace(/\/$/, '');
+}
 
 // --- Snapshot verification (task 12.5) ----------------------------------------------------------
 
@@ -359,15 +409,16 @@ Rules for this block:
  * Flags findings whose `file` is absent from the reviewed snapshot's file list as unverifiable
  * against the reviewed tree. Findings are never dropped — every input finding appears exactly
  * once in the output, in the same order, with `unverifiable` set to an explicit boolean (never
- * left `undefined`) rather than mutated in place.
+ * left `undefined`) rather than mutated in place. Both sides are compared through
+ * `normaliseFindingPath`, so `./src/a.ts` verifies against `src/a.ts`.
  */
 export function markUnverifiable(
   findings: readonly RawFinding[],
   snapshotFiles: readonly string[],
 ): RawFinding[] {
-  const present = new Set(snapshotFiles);
+  const present = new Set(snapshotFiles.map(normaliseFindingPath));
   return findings.map((finding) => ({
     ...finding,
-    unverifiable: !present.has(finding.file),
+    unverifiable: !present.has(normaliseFindingPath(finding.file)),
   }));
 }
