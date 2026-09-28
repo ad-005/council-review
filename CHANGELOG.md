@@ -16,6 +16,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `COUNCIL_NO_PI_UPDATE=1` or `PI_OFFLINE=1` is set. The host version in effect is now
   recorded as `hostVersion` in each run's `manifest.json` (previously always null).
 
+### Changed
+
+- Fingerprints no longer lowercase the file path: `src/Foo.ts` and `src/foo.ts` are distinct
+  files in a git tree and now fingerprint (and cluster) separately. Fingerprints of findings on
+  mixed-case paths therefore change once, so an `.council/ignore.json` entry for such a finding
+  must be re-added, and a `--since` diff across this upgrade shows it as one resolved plus one
+  new. All-lowercase paths are unaffected.
+- `--since <run-id>` must name a run directory listed under `.council/reviews/` (or `last`);
+  anything else, including `.` and `..`, is rejected.
+- Findings reporting `endLine` before `line`, or a whitespace-only `file`, `category`, `claim` or
+  `impact`, now fail validation and go through the repair retry.
+
+### Fixed
+
+- Merge ordering no longer follows the locale (`localeCompare`): finding ids and even cluster
+  representatives, hence fingerprints, could differ between machines with different `LANG`.
+- Finding ids no longer depend on reviewer input order when two clusters tie on every documented
+  sort key, and a mixed-category cluster's category no longer depends on reviewer id.
+- `./src/a.ts` and `src/a.ts` now cluster together and verify against the snapshot; merged
+  findings carry the normalised path.
+- Claims with no content words (punctuation or stopwords only) no longer all cluster together.
+- `--since` now matches a finding through any cluster member's fingerprint, so an unchanged
+  defect whose representative reviewer changed is `still-present`, not resolved plus new.
+- A malformed baseline `findings.json` (e.g. `[null]`) is reported as unreadable instead of
+  crashing or rendering `undefined:undefined`.
+- `REPORT.md` escapes reviewer-supplied text: newlines in one-line fields are collapsed, code
+  spans and fences are longer than any backtick run inside them, and a finding's metadata lines
+  render as a list.
+
 ## [0.2.0] - 2026-09-20
 
 ### Added

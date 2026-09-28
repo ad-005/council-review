@@ -244,6 +244,8 @@ export interface ManifestInput {
   codegraph: CodegraphIndexStatus;
   /** Optional so pre-step callers keep compiling; omitted from the manifest when absent. */
   blastRadius?: BlastRadiusStatus;
+  /** The `--since` diff, when one was requested; omitted from the manifest when absent/null. */
+  resolution?: ResolutionOutcome | null;
 }
 
 /**
@@ -291,6 +293,15 @@ export function writeManifest(i: ManifestInput): string {
               callers: i.blastRadius.stats.callers,
               tests: i.blastRadius.stats.tests,
             },
+          },
+        }
+      : {}),
+    ...(i.resolution != null
+      ? {
+          resolution: {
+            baselineRunId: i.resolution.baselineRunId, // null: requested, but no baseline
+            counts: i.resolution.counts,
+            resolvedFingerprints: i.resolution.resolved.map((f) => f.fingerprint),
           },
         }
       : {}),
@@ -349,6 +360,56 @@ export function writeManifest(i: ManifestInput): string {
 // REPORT.md (task 15.6)
 // -------------------------------------------------------------------------------------------
 
+// Every string a reviewer controls (claim, impact, category, file, evidence, suggestion — and a
+// reviewer's error text) goes through one of the three helpers below before it reaches the
+// report, so none of it can restructure the document: a newline in a one-line field cannot
+// start a fake heading or list, a backtick cannot break out of a code span, and a fence line
+// inside evidence cannot swallow the rest of the report.
+
+/** Collapses every whitespace run (newlines included) to one space, for one-line fields. */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function longestBacktickRun(text: string): number {
+  return Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+}
+
+/** A CommonMark code span whose delimiter is longer than any backtick run inside it, padded
+ * with a space when the content starts or ends with a backtick (the padding is stripped when
+ * rendered). */
+function codeSpan(text: string): string {
+  const content = oneLine(text);
+  const delimiter = '`'.repeat(longestBacktickRun(content) + 1);
+  const pad = content.startsWith('`') || content.endsWith('`') ? ' ' : '';
+  return `${delimiter}${pad}${content}${pad}${delimiter}`;
+}
+
+/** A fenced code block whose fence is longer than any backtick run inside, so no line of the
+ * content can close it early. */
+function fencedBlock(text: string): string[] {
+  const content = text.replace(/\r\n?/g, '\n');
+  const fence = '`'.repeat(Math.max(3, longestBacktickRun(content) + 1));
+  return [fence, ...content.split('\n'), fence];
+}
+
+/** Renders evidence or suggestion entries: a one-line entry as a list item, and anything
+ * multi-line — or containing a fence marker, which would open a code block inside a list item —
+ * as a fenced block of its own. */
+function renderFreeTextEntries(entries: readonly string[]): string[] {
+  const lines: string[] = [];
+  for (const entry of entries) {
+    if (/[\r\n]|```|~~~/.test(entry)) {
+      if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('');
+      lines.push(...fencedBlock(entry), '');
+    } else {
+      lines.push(`- ${oneLine(entry)}`);
+    }
+  }
+  if (lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
 function formatThinking(t: ResolvedThinking): string {
   if (!t.applicable) return 'n/a';
   if (t.effective === null) return 'none';
@@ -381,8 +442,9 @@ function renderResolutionSection(resolution: ResolutionOutcome): string[] {
     return [
       '## Resolution',
       '',
-      'No baseline run was available for comparison, so findings below carry no resolution ' +
-        'marking. This is the first run to be diffed, not a run with zero new findings.',
+      'No baseline run was available for comparison — there is no previous run, or its merged ' +
+        'findings could not be read — so findings below carry no resolution marking. This is ' +
+        'not a run with zero new findings.',
       '',
     ];
   }
@@ -391,14 +453,14 @@ function renderResolutionSection(resolution: ResolutionOutcome): string[] {
   const lines = [
     '## Resolution',
     '',
-    `Compared against run \`${resolution.baselineRunId}\`: ${resolved} resolved, ` +
+    `Compared against run ${codeSpan(resolution.baselineRunId)}: ${resolved} resolved, ` +
       `${stillPresent} still present, ${newCount} new.`,
     '',
   ];
   if (resolution.resolved.length > 0) {
     lines.push('Resolved since the baseline run:', '');
     for (const f of resolution.resolved) {
-      lines.push(`- \`${f.file}:${f.line}\` — ${f.claim}`);
+      lines.push(`- ${codeSpan(`${f.file}:${f.line}`)} — ${oneLine(f.claim)}`);
     }
     lines.push('');
   }
@@ -407,19 +469,19 @@ function renderResolutionSection(resolution: ResolutionOutcome): string[] {
 
 function renderFinding(
   f: MergedFinding,
-  resolutionByFingerprint: Map<string, ResolutionState | null> | null,
+  resolutionById: Map<string, ResolutionState | null> | null,
 ): string[] {
-  const marker = resolutionByFingerprint?.get(f.fingerprint) ?? null;
+  const marker = resolutionById?.get(f.id) ?? null;
   const markerText = marker ? ` [${marker}]` : '';
   const location = f.endLine !== null ? `${f.file}:${f.line}-${f.endLine}` : `${f.file}:${f.line}`;
 
   const lines = [
-    `### ${f.id} — ${f.severity.toUpperCase()} · ${f.category}${markerText}`,
+    `### ${f.id} — ${f.severity.toUpperCase()} · ${oneLine(f.category)}${markerText}`,
     '',
-    `**Location:** \`${location}\``,
-    `**Agreement:** ${f.agreement.raisers}/${f.agreement.reporting} reviewers (${f.raisedBy.join(', ')})`,
-    `**Claim:** ${f.claim}`,
-    `**Impact:** ${f.impact}`,
+    `- **Location:** ${codeSpan(location)}`,
+    `- **Agreement:** ${f.agreement.raisers}/${f.agreement.reporting} reviewers (${oneLine(f.raisedBy.join(', '))})`,
+    `- **Claim:** ${oneLine(f.claim)}`,
+    `- **Impact:** ${oneLine(f.impact)}`,
   ];
   if (f.unverifiable) {
     lines.push(
@@ -428,12 +490,10 @@ function renderFinding(
     );
   }
   if (f.evidence.length > 0) {
-    lines.push('', '**Evidence:**');
-    for (const e of f.evidence) lines.push(`- ${e}`);
+    lines.push('', '**Evidence:**', '', ...renderFreeTextEntries(f.evidence));
   }
   if (f.suggestions.length > 0) {
-    lines.push('', '**Suggestions:**');
-    for (const s of f.suggestions) lines.push(`- ${s}`);
+    lines.push('', '**Suggestions:**', '', ...renderFreeTextEntries(f.suggestions));
   }
   lines.push('');
   return lines;
@@ -479,12 +539,12 @@ export function writeReport(
   if (findings.length === 0) {
     lines.push('No findings were raised.', '');
   } else {
-    const resolutionByFingerprint =
-      resolution !== null
-        ? new Map(resolution.current.map((f) => [f.fingerprint, f.resolution]))
-        : null;
+    // Keyed by id, not fingerprint: two distinct findings can share a fingerprint (same file
+    // and claim, incompatible categories) yet carry different resolutions.
+    const resolutionById =
+      resolution !== null ? new Map(resolution.current.map((f) => [f.id, f.resolution])) : null;
     for (const f of findings) {
-      lines.push(...renderFinding(f, resolutionByFingerprint));
+      lines.push(...renderFinding(f, resolutionById));
     }
   }
 
@@ -505,7 +565,7 @@ export function writeReport(
     const detail = degradedReviewers
       .map(
         (r) =>
-          `${r.reviewer.provider}/${r.reviewer.model} (${r.state}${r.error ? `: ${r.error}` : ''})`,
+          `${r.reviewer.provider}/${r.reviewer.model} (${r.state}${r.error ? `: ${oneLine(r.error)}` : ''})`,
       )
       .join('; ');
     lines.push(`- Degraded (${degradedReviewers.length}): ${detail}`);
@@ -516,9 +576,7 @@ export function writeReport(
   const costSuffix = i.outcome.costIncomplete
     ? ' (incomplete — one or more reviewers had no cost data)'
     : '';
-  lines.push(
-    `- Total cost: ${i.outcome.totalCost === null ? 'unknown' : `$${i.outcome.totalCost.toFixed(4)}`}${costSuffix}`,
-  );
+  lines.push(`- Total cost: ${formatCost(i.outcome.totalCost)}${costSuffix}`);
   lines.push('');
 
   const dest = path.join(run.path, 'REPORT.md');
@@ -586,12 +644,13 @@ export function writeHandoff(run: RunDir, findingsPath: string): string {
 // Reading and pruning past runs (tasks feeding the `show` and `gc` CLI commands)
 // -------------------------------------------------------------------------------------------
 
-/** Every run directory under `<projectRoot>/.council/reviews`, newest first. Lexicographic sort
- * is chronological sort, per `createRunDir`'s id format. Returns `[]` when no run has ever been
- * written (the reviews directory does not exist yet), rather than throwing. */
-export function listRuns(projectRoot: string): RunDir[] {
-  const reviewsDir = reviewsDirPath(projectRoot);
-
+/** Every run id under `reviewsDir` (the `.council/reviews` container), newest first.
+ * Lexicographic sort is chronological sort, per `createRunDir`'s id format. Only real
+ * directory entries count: never `last`, never a dot-entry (the `.last.tmp-*` rename staging
+ * link, `.`/`..`), so a caller validating a user-supplied run id against this list can never be
+ * steered outside the run directories. Returns `[]` when no run has ever been written (the
+ * reviews directory does not exist yet), rather than throwing. */
+export function listRunIds(reviewsDir: string): string[] {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(reviewsDir, { withFileTypes: true });
@@ -599,7 +658,7 @@ export function listRuns(projectRoot: string): RunDir[] {
     return [];
   }
 
-  const ids = entries
+  return entries
     .filter((e) => e.name !== 'last' && !e.name.startsWith('.'))
     .map((e) => e.name)
     .filter((name) => {
@@ -611,18 +670,70 @@ export function listRuns(projectRoot: string): RunDir[] {
     })
     .sort()
     .reverse();
-
-  return ids.map((id) => ({ id, path: path.join(reviewsDir, id), reviewsDir }));
 }
 
-/** Resolves the `last` symlink to the run id it points at, or `null` if it is absent, dangling, or
- * not a symlink at all. Mirrors `resolve.ts`'s own reading of this pointer. */
-function resolveLastRunId(reviewsDir: string): string | null {
+/** Every run directory under `<projectRoot>/.council/reviews`, newest first — `listRunIds` as
+ * `RunDir`s. */
+export function listRuns(projectRoot: string): RunDir[] {
+  const reviewsDir = reviewsDirPath(projectRoot);
+  return listRunIds(reviewsDir).map((id) => ({ id, path: path.join(reviewsDir, id), reviewsDir }));
+}
+
+/**
+ * The one reader of the most-recent pointer: resolves the `last` symlink to the run id it points
+ * at, or `null` when there is no usable pointer. `null` covers every way the pointer can fail to
+ * name a run: absent (no run has completed yet), dangling (its run was removed), not a symlink at
+ * all (a real file or directory named `last` is not the pointer this module writes, and is never
+ * mistaken for a run called "last"), or pointing at anything other than a directory directly
+ * inside `reviewsDir`.
+ */
+export function resolveLastRunId(reviewsDir: string): string | null {
+  const lastPath = path.join(reviewsDir, 'last');
   try {
-    return path.basename(fs.realpathSync(path.join(reviewsDir, 'last')));
+    if (!fs.lstatSync(lastPath).isSymbolicLink()) return null;
+    const target = fs.realpathSync(lastPath);
+    if (path.dirname(target) !== fs.realpathSync(reviewsDir)) return null;
+    if (!fs.statSync(target).isDirectory()) return null;
+    return path.basename(target);
   } catch {
     return null;
   }
+}
+
+/** A `findings.json` element is usable only if it carries every field the readers of a past
+ * run rely on: `id` (for `ignore`), `fingerprint` (for `--since` matching and `ignore`), and
+ * `file`/`line`/`claim` (to render a resolved finding). `memberFingerprints` is optional here —
+ * runs written before it existed lack it — and is ignored unless it is an array of strings. */
+function isStoredFinding(v: unknown): v is MergedFinding {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const f = v as Record<string, unknown>;
+  return (
+    typeof f.id === 'string' &&
+    typeof f.fingerprint === 'string' &&
+    typeof f.file === 'string' &&
+    typeof f.line === 'number' &&
+    typeof f.claim === 'string'
+  );
+}
+
+/**
+ * The one safe reader of a past run's `<reviewsDir>/<runId>/findings.json`. Returns `null` —
+ * never throws — when the file is missing or unreadable, is not valid JSON, is not a top-level
+ * array, or holds any element that is not a stored finding (see `isStoredFinding`). A partly
+ * malformed file is rejected whole rather than filtered: silently dropping an entry would
+ * misreport its counterpart as new (or its absence as resolved). Callers decide what `null`
+ * means for them. `runId` is joined as-is; validate a user-supplied id against `listRunIds`
+ * first.
+ */
+export function readRunFindings(reviewsDir: string, runId: string): MergedFinding[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(reviewsDir, runId, 'findings.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isStoredFinding)) return null;
+  return parsed;
 }
 
 /**

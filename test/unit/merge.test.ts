@@ -643,3 +643,154 @@ describe('mergeFindings: no model call', () => {
     expect(outcome).not.toBeInstanceOf(Promise);
   });
 });
+
+describe('mergeFindings: locale- and order-independence', () => {
+  it('orders by code unit, never by locale collation, for ids and for the representative', () => {
+    // localeCompare collates case-insensitively first under en-US ('a.ts' < 'B.ts'), and
+    // differently again under other locales (da_DK sorts 'aa' after 'z'); code-unit order is
+    // 'B' < 'a' on every machine.
+    const outcome = mergeFindings(
+      [
+        {
+          reviewerId: 'r',
+          findings: [
+            finding({ file: 'a.ts', line: 1, claim: 'Alpha defect in the parser.' }),
+            finding({ file: 'B.ts', line: 1, claim: 'Beta defect in the lexer.' }),
+          ],
+        },
+      ],
+      DEFAULT_OPTIONS,
+    );
+    expect(outcome.findings.map((f) => f.file)).toEqual(['B.ts', 'a.ts']);
+
+    const rep = mergeFindings(
+      [
+        {
+          reviewerId: 'alpha/m',
+          findings: [
+            finding({ file: 'x.ts', line: 3, claim: 'Cache never invalidated after write.' }),
+          ],
+        },
+        {
+          reviewerId: 'Zeta/m',
+          findings: [
+            finding({
+              file: 'x.ts',
+              line: 3,
+              claim: 'The cache is never invalidated after a write!',
+            }),
+          ],
+        },
+      ],
+      DEFAULT_OPTIONS,
+    );
+    expect(rep.findings).toHaveLength(1);
+    expect(rep.findings[0]!.claim).toBe('The cache is never invalidated after a write!');
+    expect(rep.findings[0]!.sources.map((s) => s.reviewer)).toEqual(['Zeta/m', 'alpha/m']);
+  });
+
+  it('assigns the same ids regardless of reviewer input order when clusters tie on every documented key', () => {
+    // Identical file, line, severity, raiser count and claim (so identical fingerprint), but
+    // incompatible categories: two clusters the documented sort keys cannot tell apart.
+    const style: ReviewerFindings = {
+      reviewerId: 'r1',
+      findings: [finding({ file: 'x.ts', line: 5, category: 'style', claim: 'Unsafe name here.' })],
+    };
+    const security: ReviewerFindings = {
+      reviewerId: 'r2',
+      findings: [
+        finding({ file: 'x.ts', line: 5, category: 'security', claim: 'Unsafe name here.' }),
+      ],
+    };
+    const one = mergeFindings([style, security], DEFAULT_OPTIONS);
+    const two = mergeFindings([security, style], DEFAULT_OPTIONS);
+    expect(one.findings).toHaveLength(2);
+    expect(JSON.stringify(one)).toBe(JSON.stringify(two));
+    expect(one.findings.map((f) => f.category)).toEqual(['security', 'style']);
+  });
+
+  it('breaks a severity-and-fingerprint tie on category text, never on reviewer id', () => {
+    const claim = 'Loose equality in the token comparison.';
+    function build(securityId: string, correctnessId: string): ReviewerFindings[] {
+      return [
+        {
+          reviewerId: securityId,
+          findings: [finding({ file: 'x.ts', line: 5, category: 'security', claim })],
+        },
+        {
+          reviewerId: correctnessId,
+          findings: [finding({ file: 'x.ts', line: 5, category: 'correctness', claim })],
+        },
+      ];
+    }
+    const a = mergeFindings(build('aaa', 'zzz'), DEFAULT_OPTIONS);
+    const b = mergeFindings(build('zzz', 'aaa'), DEFAULT_OPTIONS);
+    expect(a.findings).toHaveLength(1);
+    expect(a.findings[0]!.category).toBe('correctness');
+    expect(b.findings[0]!.category).toBe('correctness');
+  });
+
+  it('does not cluster two different claims that both normalise to nothing', () => {
+    const outcome = mergeFindings(
+      [
+        { reviewerId: 'a', findings: [finding({ file: 'x.ts', line: 5, claim: '???' })] },
+        { reviewerId: 'b', findings: [finding({ file: 'x.ts', line: 5, claim: 'It is.' })] },
+      ],
+      DEFAULT_OPTIONS,
+    );
+    expect(outcome.findings).toHaveLength(2);
+
+    const same = mergeFindings(
+      [
+        { reviewerId: 'a', findings: [finding({ file: 'x.ts', line: 5, claim: '???' })] },
+        { reviewerId: 'b', findings: [finding({ file: 'x.ts', line: 5, claim: '???' })] },
+      ],
+      DEFAULT_OPTIONS,
+    );
+    expect(same.findings).toHaveLength(1);
+  });
+});
+
+describe('mergeFindings: path normalisation', () => {
+  it('clusters "./src/a.ts" with "src//a.ts" and emits the normalised path', () => {
+    const outcome = mergeFindings(
+      [
+        {
+          reviewerId: 'a',
+          findings: [finding({ file: './src/a.ts', line: 5, claim: 'Cache never invalidated.' })],
+        },
+        {
+          reviewerId: 'b',
+          findings: [finding({ file: 'src//a.ts', line: 5, claim: 'Cache never invalidated.' })],
+        },
+      ],
+      DEFAULT_OPTIONS,
+    );
+    expect(outcome.findings).toHaveLength(1);
+    expect(outcome.findings[0]!.file).toBe('src/a.ts');
+    expect(outcome.findings[0]!.agreement.raisers).toBe(2);
+    expect(outcome.findings[0]!.fingerprint).toBe(
+      fingerprint('src/a.ts', 'Cache never invalidated.'),
+    );
+  });
+
+  it('keeps paths that differ only in case distinct, in clustering and in the fingerprint', () => {
+    expect(fingerprint('src/Foo.ts', 'Same claim.')).not.toBe(
+      fingerprint('src/foo.ts', 'Same claim.'),
+    );
+    const outcome = mergeFindings(
+      [
+        {
+          reviewerId: 'a',
+          findings: [finding({ file: 'src/Foo.ts', line: 5, claim: 'Same claim.' })],
+        },
+        {
+          reviewerId: 'b',
+          findings: [finding({ file: 'src/foo.ts', line: 5, claim: 'Same claim.' })],
+        },
+      ],
+      DEFAULT_OPTIONS,
+    );
+    expect(outcome.findings).toHaveLength(2);
+  });
+});

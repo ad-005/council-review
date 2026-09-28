@@ -76,6 +76,46 @@ describe('extractFindings', () => {
     }
   });
 
+  it('rejects an endLine before line with a repair-actionable message', () => {
+    const finding = { ...VALID_FINDING, line: 20, endLine: 14 };
+    const result = extractFindings(block(JSON.stringify([VALID_FINDING, finding])));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain(
+        'finding[1].endLine must be >= line (got endLine 14, line 20)',
+      );
+    }
+  });
+
+  it('reports an endLine before line alongside other schema errors, so one repair fixes both', () => {
+    const finding = { ...VALID_FINDING, line: 20, endLine: 14, severity: 'informational' };
+    const result = extractFindings(block(JSON.stringify([finding])));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.includes('finding[0].severity'))).toBe(true);
+      expect(result.errors.some((e) => e.includes('finding[0].endLine must be >= line'))).toBe(
+        true,
+      );
+    }
+  });
+
+  it('accepts endLine equal to line', () => {
+    const result = extractFindings(block(JSON.stringify([{ ...VALID_FINDING, endLine: 12 }])));
+    expect(result.ok).toBe(true);
+  });
+
+  for (const field of ['file', 'category', 'claim', 'impact'] as const) {
+    it(`rejects a whitespace-only "${field}"`, () => {
+      const result = extractFindings(
+        block(JSON.stringify([{ ...VALID_FINDING, [field]: ' \n\t' }])),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.errors).toContain(`finding[0].${field} must not be empty or blank`);
+      }
+    });
+  }
+
   it('rejects an unrecognised field, naming it', () => {
     const finding = { ...VALID_FINDING, cvss: 9.8 };
     const text = block(JSON.stringify([finding]));
@@ -259,6 +299,20 @@ describe('markUnverifiable', () => {
     expect(marked[0]?.unverifiable).toBe(false);
     expect(marked[1]?.file).toBe('absent.ts');
     expect(marked[1]?.unverifiable).toBe(true);
+  });
+
+  it('verifies a path spelled with a leading "./" or doubled slashes, but not a case variant', () => {
+    const marked = markUnverifiable(
+      [
+        { ...VALID_FINDING, file: './src/foo.ts' },
+        { ...VALID_FINDING, file: 'src//foo.ts' },
+        { ...VALID_FINDING, file: 'src/Foo.ts' },
+      ],
+      ['src/foo.ts'],
+    );
+    expect(marked.map((f) => f.unverifiable)).toEqual([false, false, true]);
+    // The reviewer's own spelling is left untouched here; merge.ts emits the normalised path.
+    expect(marked[0]?.file).toBe('./src/foo.ts');
   });
 
   it('does not mutate the input findings array', () => {
