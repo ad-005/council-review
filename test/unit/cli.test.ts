@@ -1584,6 +1584,39 @@ describe('show / ignore / gc', () => {
 // shell / CI run (HERDR_ENV unset) is unaffected by the herdr-related flags being present.
 // -------------------------------------------------------------------------------------------
 
+describe('--pane when herdr cannot split a pane', () => {
+  it('runs the review in this process instead of reporting a delegation that never happened', async () => {
+    useFixtures({ defaultFixture: 'valid-findings' }); // one "high" finding: exit 1 when reviewed
+    writeConfigFile();
+    makeWorkingChange();
+
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'council-herdr-stub-'));
+    const herdrStub = path.join(binDir, 'herdr');
+    fs.writeFileSync(herdrStub, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const saved = { HERDR_ENV: process.env.HERDR_ENV, bin: process.env.COUNCIL_HERDR_BIN };
+    process.env.HERDR_ENV = '1';
+    process.env.COUNCIL_HERDR_BIN = herdrStub;
+
+    const stdout = captureStream(process.stdout);
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    try {
+      code = await runCli(['--pane', '--no-notify']);
+    } finally {
+      stdout.restore();
+      stderr.restore();
+      if (saved.HERDR_ENV === undefined) delete process.env.HERDR_ENV;
+      else process.env.HERDR_ENV = saved.HERDR_ENV;
+      if (saved.bin === undefined) delete process.env.COUNCIL_HERDR_BIN;
+      else process.env.COUNCIL_HERDR_BIN = saved.bin;
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+    expect(code).toBe(1);
+    expect(stdout.text()).not.toContain('delegated');
+    expect(stdout.text()).toContain('report written to');
+  });
+});
+
 describe('herdr flags outside a herdr environment', () => {
   it('--no-notify and --handoff do not change the review outcome outside herdr', async () => {
     useFixtures({ defaultFixture: 'unparseable-lines' });

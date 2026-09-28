@@ -38,7 +38,7 @@ import {
   enforceIndependence,
   type Reviewer,
 } from './panel.js';
-import { pickPanel, type PickerIO } from './picker.js';
+import { defaultPickerIO, pickPanel, type PickerIO } from './picker.js';
 import { findRepoRoot, resolveScope, checkScopeSelectors, type ScopeSelectors } from './scope.js';
 import { buildSnapshot, writePatch, sweepOrphans, type Snapshot } from './snapshot.js';
 import { computeBlastRadius } from './blast-radius.js';
@@ -624,7 +624,7 @@ async function cmdStatus(args: readonly string[]): Promise<number> {
 // -------------------------------------------------------------------------------------------
 
 async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined): Promise<number> {
-  const { values } = callParseArgs('review', () =>
+  const { values, tokens } = callParseArgs('review', () =>
     parseArgs({
       args: args as string[],
       options: {
@@ -651,6 +651,7 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       },
       allowPositionals: false,
       strict: true,
+      tokens: true,
     }),
   );
 
@@ -729,7 +730,11 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
   if (values.models !== undefined) {
     reviewers = resolveSpecPanel(values.models, catalog, cfg, thinkingFlag);
   } else if (values.pick) {
-    reviewers = await pickPanel(catalog, pickerIO);
+    // The picker's prompts go to stderr under --json, so stdout carries only the findings.
+    reviewers = await pickPanel(
+      catalog,
+      pickerIO ?? defaultPickerIO(jsonMode ? process.stderr : process.stdout),
+    );
     persistNewPanel = true;
   } else {
     if (cfg.panel.length === 0) {
@@ -755,14 +760,24 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
   }
 
   if (values.pane && !values['no-pane']) {
-    const delegateArgv = [process.argv[0]!, process.argv[1]!, ...args];
-    const { attempted } = splitPaneAndRun(delegateArgv, direction);
-    if (attempted) {
+    // `--pick` is dropped from the delegated argv: this process has already run the picker and
+    // saved the panel, so the child must not prompt a second time. Located by token, so a
+    // `--pick` that is another flag's value is kept.
+    const pickArgIndices = new Set(
+      tokens.filter((t) => t.kind === 'option' && t.name === 'pick').map((t) => t.index),
+    );
+    const delegateArgv = [
+      process.argv[0]!,
+      process.argv[1]!,
+      ...args.filter((_, i) => !pickArgIndices.has(i)),
+    ];
+    const { delegated } = splitPaneAndRun(delegateArgv, direction);
+    if (delegated) {
       out(jsonMode, 'council-review: review delegated to a new pane.\n');
       return 0;
     }
-    // Not attempted (outside herdr, or already running inside a delegated pane): fall through
-    // and run the review in this process.
+    // Not delegated (outside herdr, already inside a delegated pane, or the split or run
+    // failed): fall through and run the review in this process.
   }
 
   // Only the process that actually runs the review titles its pane: a delegating parent would

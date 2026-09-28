@@ -31,6 +31,7 @@ export * from './merge.js';
 export * from './resolve.js';
 export * from './report.js';
 export {
+  HERDR_COMMAND_TIMEOUT_MS,
   isHerdrEnv,
   splitPaneAndRun,
   setPaneTitle,
