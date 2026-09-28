@@ -381,6 +381,11 @@ interface AttemptState {
   everCompletedAssistant: boolean;
   partialText: string;
   completedFinalText: string | null;
+  /** `stopReason` / `errorMessage` of the most recent completed assistant message. The host
+   *  reports a provider failure (auth, quota, network) as an assistant message with stopReason
+   *  `error` (or `aborted`) and empty content -- a completed stream, but not a review. */
+  lastStopReason: string | null;
+  lastErrorMessage: string | null;
   killReason: KillReason | null;
   kill: () => void;
   /** Notified with the running cumulative usage-so-far on every usage-bearing event, so progress
@@ -457,6 +462,12 @@ function handleLine(raw: string, state: AttemptState): void {
       state.everCompletedAssistant = true;
       state.hasOpenAssistantMessage = false;
       state.completedFinalText = extractAssistantText((message as { content?: unknown }).content);
+      const { stopReason, errorMessage } = message as {
+        stopReason?: unknown;
+        errorMessage?: unknown;
+      };
+      state.lastStopReason = typeof stopReason === 'string' ? stopReason : null;
+      state.lastErrorMessage = typeof errorMessage === 'string' ? errorMessage : null;
       const usage = parseUsage((message as { usage?: unknown }).usage);
       if (usage) {
         state.usageTotal = {
@@ -493,7 +504,24 @@ function handleLine(raw: string, state: AttemptState): void {
 // -------------------------------------------------------------------------------------------
 
 type AttemptOutcome =
-  'completed' | 'timeout' | 'over-budget' | 'truncated' | 'interrupted' | 'spawn-error';
+  | 'completed'
+  | 'timeout'
+  | 'over-budget'
+  | 'truncated'
+  | 'interrupted'
+  | 'spawn-error'
+  | 'host-error';
+
+/** Host stop reasons meaning the final assistant turn failed rather than finished. */
+const FAILED_STOP_REASONS: ReadonlySet<string> = new Set(['error', 'aborted']);
+
+/** How long a killed host gets to exit on SIGTERM before it is sent SIGKILL. A host that traps
+ *  or ignores SIGTERM must not turn `timeoutSeconds` (or Ctrl-C) into an unbounded wait. */
+const KILL_GRACE_MS = 5000;
+
+/** `setTimeout` stores its delay as a signed 32-bit millisecond count; anything larger is
+ *  silently replaced by 1ms, which would time every reviewer out immediately. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 interface AttemptResult {
   text: string;
@@ -516,7 +544,8 @@ interface AttemptOptions {
   includeContextFiles: boolean;
   snapshotRoot: string;
   repoRoot: string;
-  timeoutSeconds: number;
+  /** Wall-clock budget for this attempt alone -- the reviewer's remaining time, not its total. */
+  timeoutMs: number;
   maxOutputTokens: number | null;
   hostBin: string;
   signal: AbortSignal | undefined;
@@ -557,6 +586,20 @@ function buildAttemptEnv(snapshotRoot: string, repoRoot: string): NodeJS.Process
  */
 function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
   const startedAt = Date.now();
+  const unstarted = (outcome: AttemptOutcome, errorMessage?: string): AttemptResult => ({
+    text: '',
+    usage: { input: 0, output: 0 },
+    toolCalls: [],
+    rawTrace: [],
+    outcome,
+    errorMessage,
+    startedAt,
+    endedAt: Date.now(),
+  });
+
+  // An 'abort' listener added to an already-aborted signal never fires, so a run interrupted
+  // before this point (e.g. during snapshot or blast-radius) must not launch a host at all.
+  if (o.signal?.aborted) return Promise.resolve(unstarted('interrupted'));
 
   const argv = buildReviewerArgv({
     extensionPath: o.extensionPath,
@@ -573,17 +616,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
   try {
     child = childProcessModule.spawn(o.hostBin, argv, { cwd, env });
   } catch (err) {
-    const endedAt = Date.now();
-    return Promise.resolve({
-      text: '',
-      usage: { input: 0, output: 0 },
-      toolCalls: [],
-      rawTrace: [],
-      outcome: 'spawn-error',
-      errorMessage: describeSpawnError(err),
-      startedAt,
-      endedAt,
-    });
+    return Promise.resolve(unstarted('spawn-error', describeSpawnError(err)));
   }
 
   try {
@@ -593,6 +626,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
   }
   child.stderr.resume(); // drain so a chatty stderr never applies backpressure to the process
 
+  let killEscalationTimer: NodeJS.Timeout | undefined;
   const state: AttemptState = {
     startedAt,
     maxOutputTokens: o.maxOutputTokens,
@@ -604,8 +638,13 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
     everCompletedAssistant: false,
     partialText: '',
     completedFinalText: null,
+    lastStopReason: null,
+    lastErrorMessage: null,
     killReason: null,
-    kill: () => child.kill('SIGTERM'),
+    kill: () => {
+      child.kill('SIGTERM');
+      killEscalationTimer ??= setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+    },
     onUsage: o.onUsage,
   };
 
@@ -616,11 +655,14 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
     let spawnErrored = false;
     let spawnErrorMessage: string | undefined;
 
-    const timeoutTimer = setTimeout(() => {
-      if (state.killReason) return;
-      state.killReason = 'timeout';
-      state.kill();
-    }, o.timeoutSeconds * 1000);
+    const timeoutTimer = setTimeout(
+      () => {
+        if (state.killReason) return;
+        state.killReason = 'timeout';
+        state.kill();
+      },
+      Math.min(o.timeoutMs, MAX_TIMER_MS),
+    );
 
     const onAbort = () => {
       if (state.killReason) return;
@@ -653,6 +695,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
       if (!rlClosed || !childClosed) return;
       settled = true;
       clearTimeout(timeoutTimer);
+      clearTimeout(killEscalationTimer);
       o.signal?.removeEventListener('abort', onAbort);
 
       const endedAt = Date.now();
@@ -682,18 +725,19 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
 
       let outcome: AttemptOutcome;
       let text: string;
-      if (state.killReason === 'timeout') {
-        outcome = 'timeout';
-        text = state.hasOpenAssistantMessage ? state.partialText : (state.completedFinalText ?? '');
-      } else if (state.killReason === 'over-budget') {
-        outcome = 'over-budget';
-        text = state.hasOpenAssistantMessage ? state.partialText : (state.completedFinalText ?? '');
-      } else if (state.killReason === 'interrupted') {
-        outcome = 'interrupted';
+      let errorMessage: string | undefined;
+      if (state.killReason) {
+        outcome = state.killReason;
         text = state.hasOpenAssistantMessage ? state.partialText : (state.completedFinalText ?? '');
       } else if (state.hasOpenAssistantMessage || !state.everCompletedAssistant) {
         outcome = 'truncated';
         text = state.partialText;
+      } else if (state.lastStopReason !== null && FAILED_STOP_REASONS.has(state.lastStopReason)) {
+        outcome = 'host-error';
+        text = state.completedFinalText ?? '';
+        errorMessage =
+          `host ended the review with stopReason "${state.lastStopReason}"` +
+          (state.lastErrorMessage ? `: ${state.lastErrorMessage}` : '');
       } else {
         outcome = 'completed';
         text = state.completedFinalText ?? '';
@@ -705,7 +749,7 @@ function runAttempt(o: AttemptOptions): Promise<AttemptResult> {
         toolCalls: state.toolCalls,
         rawTrace: state.rawTrace,
         outcome,
-        errorMessage: undefined,
+        errorMessage,
         startedAt,
         endedAt,
       });
@@ -799,41 +843,56 @@ function attemptErrorMessage(
       return 'stream ended without a terminal assistant message';
     case 'spawn-error':
       return attempt.errorMessage ?? 'failed to spawn the reviewer process';
+    case 'host-error':
+      return attempt.errorMessage ?? 'the host reported a failed final turn';
     default:
       return undefined;
   }
 }
 
+/** The reviewer state an attempt outcome ends the reviewer in, or `null` for a completed attempt
+ *  whose output still has to be validated. */
+function terminalState(outcome: AttemptOutcome): ReviewerState | null {
+  switch (outcome) {
+    case 'completed':
+      return null;
+    case 'timeout':
+    case 'over-budget':
+      return outcome;
+    default:
+      return 'failed';
+  }
+}
+
 async function runReviewer(o: ReviewerRunOptions): Promise<ReviewerResult> {
-  const attempt1 = await runAttempt({
-    reviewer: o.reviewer,
-    promptArg: o.initialPromptArg,
-    extensionPath: o.extensionPath,
-    includeContextFiles: o.includeContextFiles,
-    snapshotRoot: o.snapshot.root,
-    repoRoot: o.repoRoot,
-    timeoutSeconds: o.timeoutSeconds,
-    maxOutputTokens: o.maxOutputTokens,
-    hostBin: o.hostBin,
-    signal: o.signal,
-    onUsage: o.onUsage,
-  });
+  // The timeout and the output ceiling bound the reviewer as a whole, repair attempt included:
+  // a reviewer that needs a repair gets what its first attempt left, not a fresh allowance.
+  const deadline = Date.now() + o.timeoutSeconds * 1000;
+  const attempt = (promptArg: string, maxOutputTokens: number | null): Promise<AttemptResult> =>
+    runAttempt({
+      reviewer: o.reviewer,
+      promptArg,
+      extensionPath: o.extensionPath,
+      includeContextFiles: o.includeContextFiles,
+      snapshotRoot: o.snapshot.root,
+      repoRoot: o.repoRoot,
+      timeoutMs: Math.max(0, deadline - Date.now()),
+      maxOutputTokens,
+      hostBin: o.hostBin,
+      signal: o.signal,
+      onUsage: o.onUsage,
+    });
 
-  const budgetOrTimeoutOrInterrupt: ReviewerState | null =
-    attempt1.outcome === 'timeout'
-      ? 'timeout'
-      : attempt1.outcome === 'over-budget'
-        ? 'over-budget'
-        : null;
+  const attempt1 = await attempt(o.initialPromptArg, o.maxOutputTokens);
 
-  // A budget/timeout breach or an interruption on the first attempt ends the reviewer's run
-  // there: no repair attempt is spawned for a process we deliberately killed, or that was killed
-  // out from under it by the user interrupting the whole run.
-  if (budgetOrTimeoutOrInterrupt || attempt1.outcome === 'interrupted') {
-    const state: ReviewerState = budgetOrTimeoutOrInterrupt ?? 'failed';
+  // A budget/timeout breach, an interruption, a truncated stream, a spawn failure or a host-side
+  // error ends the reviewer's run there: a repair prompt only helps output that exists but is
+  // malformed, never a process we killed or one that never produced a review.
+  const state1 = terminalState(attempt1.outcome);
+  if (state1 !== null) {
     return buildResult(
       o.reviewer,
-      state,
+      state1,
       null,
       attempt1,
       null,
@@ -841,20 +900,6 @@ async function runReviewer(o: ReviewerRunOptions): Promise<ReviewerResult> {
     );
   }
 
-  if (attempt1.outcome === 'truncated' || attempt1.outcome === 'spawn-error') {
-    // "Truncated stream" scenario: marked failed directly, no repair attempt for a process that
-    // never produced a terminal message to validate in the first place.
-    return buildResult(
-      o.reviewer,
-      'failed',
-      null,
-      attempt1,
-      null,
-      attemptErrorMessage(attempt1.outcome, o, attempt1),
-    );
-  }
-
-  // attempt1.outcome === 'completed'
   const extracted1 = extractFindings(attempt1.text);
   if (extracted1.ok) {
     const findings = markUnverifiable(extracted1.findings, o.snapshot.files);
@@ -872,6 +917,20 @@ async function runReviewer(o: ReviewerRunOptions): Promise<ReviewerResult> {
     );
   }
 
+  const remainingTokens =
+    o.maxOutputTokens === null ? null : o.maxOutputTokens - attempt1.usage.output;
+  if (deadline - Date.now() <= 0 || (remainingTokens !== null && remainingTokens <= 0)) {
+    const exhausted = deadline - Date.now() <= 0 ? 'timeout' : 'over-budget';
+    return buildResult(
+      o.reviewer,
+      exhausted,
+      null,
+      attempt1,
+      null,
+      attemptErrorMessage(exhausted, o, attempt1),
+    );
+  }
+
   // Exactly one repair attempt: a second, independent process spawn, given only the validation
   // errors and this reviewer's own prior output. That prior output can itself be large (a
   // reviewer's own full first-attempt output, up to its token ceiling), so it goes through the
@@ -883,48 +942,13 @@ async function runReviewer(o: ReviewerRunOptions): Promise<ReviewerResult> {
     `repair-${randomUUID()}.txt`,
     buildRepairPrompt(extracted1.errors, attempt1.text),
   );
-  const attempt2 = await runAttempt({
-    reviewer: o.reviewer,
-    promptArg: repairPromptArg,
-    extensionPath: o.extensionPath,
-    includeContextFiles: o.includeContextFiles,
-    snapshotRoot: o.snapshot.root,
-    repoRoot: o.repoRoot,
-    timeoutSeconds: o.timeoutSeconds,
-    maxOutputTokens: o.maxOutputTokens,
-    hostBin: o.hostBin,
-    signal: o.signal,
-    onUsage: o.onUsage,
-  });
+  const attempt2 = await attempt(repairPromptArg, remainingTokens);
 
-  if (attempt2.outcome === 'timeout') {
+  const state2 = terminalState(attempt2.outcome);
+  if (state2 !== null) {
     return buildResult(
       o.reviewer,
-      'timeout',
-      null,
-      attempt1,
-      attempt2,
-      attemptErrorMessage('timeout', o, attempt2),
-    );
-  }
-  if (attempt2.outcome === 'over-budget') {
-    return buildResult(
-      o.reviewer,
-      'over-budget',
-      null,
-      attempt1,
-      attempt2,
-      attemptErrorMessage('over-budget', o, attempt2),
-    );
-  }
-  if (
-    attempt2.outcome === 'truncated' ||
-    attempt2.outcome === 'spawn-error' ||
-    attempt2.outcome === 'interrupted'
-  ) {
-    return buildResult(
-      o.reviewer,
-      'failed',
+      state2,
       null,
       attempt1,
       attempt2,
@@ -1064,6 +1088,30 @@ class ProgressReporter {
 // runPanel
 // -------------------------------------------------------------------------------------------
 
+/** The `AbortError`-named rejection `runPanel` reports an interruption with, after cleanup. */
+function interruptedError(snapshot: Snapshot): Error {
+  snapshot.cleanup();
+  const err = new Error('council-review run interrupted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function unexpectedFailure(reviewer: Reviewer, err: unknown): ReviewerResult {
+  const now = Date.now();
+  const attempt: AttemptResult = {
+    text: '',
+    usage: { input: 0, output: 0 },
+    toolCalls: [],
+    rawTrace: [],
+    outcome: 'spawn-error',
+    errorMessage: undefined,
+    startedAt: now,
+    endedAt: now,
+  };
+  const message = err instanceof Error ? err.message : String(err);
+  return buildResult(reviewer, 'failed', null, attempt, null, `reviewer run failed: ${message}`);
+}
+
 /**
  * Runs the whole panel: every reviewer launched in parallel, none waiting on another, each
  * receiving the same task/prompt/patch and nothing produced by any other reviewer.
@@ -1072,9 +1120,10 @@ class ProgressReporter {
  * snapshot, and rejects with an `AbortError`-named `Error` -- the standard shape for an aborted
  * operation -- rather than resolving with a partial `RunPanelOutcome`. A run that completed
  * without every reviewer succeeding, including one where every reviewer failed, still resolves
- * normally: the caller (Section 16) maps `reporting === 0` to exit code 3.
+ * normally: the caller maps `degraded` (any reviewer not `ok`) to exit code 3.
  */
 export async function runPanel(o: RunPanelOptions): Promise<RunPanelOutcome> {
+  if (o.signal?.aborted) throw interruptedError(o.snapshot);
   const hostBin = resolveHostBin(process.env);
   const patchContent = readFileSync(o.patchPath, 'utf8');
   const initialPrompt = buildInitialPrompt(o.prompt, patchContent, o.blastRadiusBlock);
@@ -1095,6 +1144,9 @@ export async function runPanel(o: RunPanelOptions): Promise<RunPanelOutcome> {
   const results: Array<ReviewerResult | undefined> = new Array(o.reviewers.length);
 
   const runOne = async (reviewer: Reviewer, idx: number): Promise<void> => {
+    // Never let one reviewer's unexpected throw (e.g. a failed repair-prompt write) reject the
+    // `Promise.all` below while its siblings' host processes are still running: it becomes
+    // that reviewer's own failure, and the panel still waits for everyone else.
     const result = await runReviewer({
       reviewer,
       initialPromptArg,
@@ -1108,7 +1160,7 @@ export async function runPanel(o: RunPanelOptions): Promise<RunPanelOutcome> {
       hostBin,
       signal: o.signal,
       onUsage: (usage) => progress.tick(idx, usage),
-    });
+    }).catch((err: unknown) => unexpectedFailure(reviewer, err));
     results[idx] = result;
     progress.complete(idx, result);
     o.onProgress?.(results.filter((r): r is ReviewerResult => r !== undefined));
@@ -1119,12 +1171,7 @@ export async function runPanel(o: RunPanelOptions): Promise<RunPanelOutcome> {
   // (see `runAttempt`'s own note on why that matters for tests).
   await Promise.all(o.reviewers.map((reviewer, idx) => runOne(reviewer, idx)));
 
-  if (o.signal?.aborted) {
-    o.snapshot.cleanup();
-    const err = new Error('council-review run interrupted');
-    err.name = 'AbortError';
-    throw err;
-  }
+  if (o.signal?.aborted) throw interruptedError(o.snapshot);
 
   const finished = results as ReviewerResult[]; // every slot is filled: Promise.all resolved above
 

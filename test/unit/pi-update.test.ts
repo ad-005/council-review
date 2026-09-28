@@ -93,6 +93,10 @@ describe('parsePiVersion', () => {
     expect(parsePiVersion('1.0.0-beta.1\n')).toBe('1.0.0-beta.1');
   });
 
+  it('keeps a pre-release suffix followed by build metadata', () => {
+    expect(parsePiVersion('1.2.3-beta.1+build.5\n')).toBe('1.2.3-beta.1+build.5');
+  });
+
   it('finds the version among banner lines', () => {
     expect(parsePiVersion('[Some Extension] tools registered\n0.87.1\n')).toBe('0.87.1');
   });

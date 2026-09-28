@@ -85,7 +85,7 @@ export interface PiUpdateOptions {
  */
 export function parsePiVersion(output: string): string | null {
   for (const line of output.split('\n')) {
-    const match = line.match(/^\s*v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\s*$/);
+    const match = line.match(/^\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\s*$/);
     if (match) return match[1]!;
   }
   return null;

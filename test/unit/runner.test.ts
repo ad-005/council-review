@@ -510,6 +510,84 @@ describe('exactly one repair retry', () => {
   });
 });
 
+describe('budgets bound the reviewer as a whole, repair included', () => {
+  it('gives the repair attempt only the output ceiling the first attempt left', async () => {
+    // invalid-findings spends 75 output tokens; valid-findings climbs to 124. Each fits a
+    // 150-token ceiling alone, but not together.
+    Object.assign(process.env, sequenceEnv(['invalid-findings', 'valid-findings']));
+    const reviewer = makeReviewer({ id: 'model-a', provider: 'prov-a' });
+
+    const outcome = await runPanel(baseOptions({ reviewers: [reviewer], maxOutputTokens: 150 }));
+    const result = outcome.results[0]!;
+
+    expect(result.state).toBe('over-budget');
+    expect(result.usage.outputTokens).toBeGreaterThan(75);
+    expect(result.repairText).not.toBeNull();
+  });
+});
+
+/** Writes an executable node script that stands in for the host, for behaviours no recorded
+ *  fixture models (a provider error, a host that ignores SIGTERM). */
+function writeScriptHost(body: string): string {
+  const dir = mkdtempSync(join(baseDir, 'script-host-'));
+  const hostPath = join(dir, 'host.mjs');
+  writeFileSync(hostPath, `#!/usr/bin/env node\n${body}\n`, 'utf8');
+  chmodSync(hostPath, 0o755);
+  return hostPath;
+}
+
+describe('host-reported failures', () => {
+  it('fails the reviewer with the host error, without a repair attempt, on stopReason "error"', async () => {
+    const events = [
+      { type: 'agent_start' },
+      { type: 'message_start', message: { role: 'assistant', content: [], stopReason: 'pending' } },
+      {
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: '401 Unauthorized',
+          usage: { input: 0, output: 0 },
+        },
+      },
+      { type: 'agent_end' },
+    ];
+    process.env.COUNCIL_PI_BIN = writeScriptHost(
+      `for (const e of ${JSON.stringify(events)}) process.stdout.write(JSON.stringify(e) + '\\n');\n` +
+        'process.exitCode = 1;',
+    );
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    const outcome = await runPanel(
+      baseOptions({ reviewers: [makeReviewer({ id: 'model-a', provider: 'prov-a' })] }),
+    );
+    const result = outcome.results[0]!;
+
+    expect(result.state).toBe('failed');
+    expect(result.error).toContain('401 Unauthorized');
+    expect(result.repairText).toBeNull();
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('escalates to SIGKILL when a timed-out host ignores SIGTERM', async () => {
+    process.env.COUNCIL_PI_BIN = writeScriptHost(
+      "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);",
+    );
+
+    const started = Date.now();
+    const outcome = await runPanel(
+      baseOptions({
+        reviewers: [makeReviewer({ id: 'model-a', provider: 'prov-a' })],
+        timeoutSeconds: 1,
+      }),
+    );
+
+    expect(outcome.results[0]!.state).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(12_000);
+  }, 20_000);
+});
+
 // ---------------------------------------------------------------------------------------------
 // No cross-contamination
 // ---------------------------------------------------------------------------------------------
@@ -950,6 +1028,29 @@ describe('interruption', () => {
 
     expect(snapshot.cleanup).toHaveBeenCalledTimes(1);
   }, 15_000);
+});
+
+describe('interruption before launch', () => {
+  it('spawns nothing and rejects with AbortError when the signal has already fired', async () => {
+    setFixture('never-ends');
+    const snapshot = makeSnapshot();
+    const controller = new AbortController();
+    controller.abort();
+    const spawnSpy = vi.spyOn(cp, 'spawn');
+
+    await expect(
+      runPanel(
+        baseOptions({
+          reviewers: [makeReviewer({ id: 'model-a', provider: 'prov-a' })],
+          snapshot,
+          signal: controller.signal,
+        }),
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(snapshot.cleanup).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
