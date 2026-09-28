@@ -35,10 +35,18 @@ function makeScratchDir(): { dir: string; cleanup: () => void } {
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
+/**
+ * Root bypasses file-mode permission checks, so a write probe run as root succeeds against a
+ * correctly frozen tree. The mode-bit assertion below holds for every user; the behavioural probe
+ * only means something for an unprivileged one (containers and some CI images run tests as root).
+ */
+const RUNNING_AS_ROOT = process.getuid?.() === 0;
+
 /** Asserts every file and directory under `root` (root included) has no write bit set. */
 function assertReadOnly(root: string): void {
   const st = statSync(root);
   expect(st.mode & 0o222).toBe(0);
+  if (RUNNING_AS_ROOT) return;
   if (st.isDirectory()) {
     // Read-only in practice: attempting to create a new file under it fails.
     expect(() => writeFileSync(join(root, '__probe__'), 'x')).toThrow();
