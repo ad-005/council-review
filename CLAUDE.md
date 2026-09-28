@@ -74,8 +74,8 @@ Invariants that are not obvious from any single file:
   `index.ts`), may import **only** `node:` builtins (enforced by an eslint `no-restricted-imports`
   rule and by `test/security/reviewer-spawn.test.ts`), and registers exactly five tools:
   `council_read`, `council_grep`, `council_list`, `council_git`, `council_codegraph`.
-- **Two roots, never confused.** `COUNCIL_SNAPSHOT_ROOT` is the frozen tree the three read tools
-  are contained within; `COUNCIL_REPO_ROOT` is the real repository, reachable only through
+- **Two roots, never confused.** `COUNCIL_SNAPSHOT_ROOT` is the frozen tree the read tools (and
+  `council_codegraph`'s index) are contained within; `COUNCIL_REPO_ROOT` is the real repository, reachable only through
   `council_git`'s read-only subcommand allowlist with literal arguments.
 - **The reviewer environment is an allowlist, not a denylist** (`buildReviewerEnv`). No
   `*_API_KEY`-shaped variable reaches a reviewer; a reviewer authenticates only through the host's

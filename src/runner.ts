@@ -445,7 +445,13 @@ function handleLine(raw: string, state: AttemptState): void {
   }
 
   if (type === 'message_update') {
-    const usage = parseUsage((evt as { usage?: unknown }).usage);
+    // Usage as the recorded streams carry it (top level), or on the partial assistant message
+    // the event also carries: either keeps the output ceiling enforced mid-message rather than
+    // only at `message_end`.
+    const { usage: topUsage, message } = evt as { usage?: unknown; message?: unknown };
+    const usage =
+      parseUsage(topUsage) ??
+      (isAssistantMessage(message) ? parseUsage((message as { usage?: unknown }).usage) : null);
     if (usage) state.pendingTurnUsage = usage;
     const ame = (evt as { assistantMessageEvent?: unknown }).assistantMessageEvent;
     if (isTextDeltaEvent(ame)) {

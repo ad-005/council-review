@@ -570,6 +570,33 @@ describe('host-reported failures', () => {
     expect(spawnSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('enforces the output ceiling from usage carried on the partial message', async () => {
+    const events = [
+      { type: 'message_start', message: { role: 'assistant', content: [] } },
+      ...[5, 50, 500].map((output) => ({
+        type: 'message_update',
+        message: { role: 'assistant', content: [], usage: { input: 10, output } },
+        assistantMessageEvent: { type: 'text_delta', delta: 'x' },
+      })),
+      {
+        type: 'message_end',
+        message: { role: 'assistant', content: [], usage: { input: 10, output: 500 } },
+      },
+    ];
+    process.env.COUNCIL_PI_BIN = writeScriptHost(
+      `for (const e of ${JSON.stringify(events)}) process.stdout.write(JSON.stringify(e) + '\\n');`,
+    );
+
+    const outcome = await runPanel(
+      baseOptions({
+        reviewers: [makeReviewer({ id: 'model-a', provider: 'prov-a' })],
+        maxOutputTokens: 20,
+      }),
+    );
+    expect(outcome.results[0]!.state).toBe('over-budget');
+    expect(outcome.results[0]!.usage.outputTokens).toBe(50);
+  });
+
   it('escalates to SIGKILL when a timed-out host ignores SIGTERM', async () => {
     process.env.COUNCIL_PI_BIN = writeScriptHost(
       "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);",
