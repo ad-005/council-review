@@ -366,14 +366,16 @@ describe('collectStatus: stored runs', () => {
     expect(report.runs).toEqual({ count: 0, last: null });
   });
 
-  it('falls back to the newest run when the "last" symlink is absent', async () => {
+  it('reports no last run when the "last" symlink is absent, as show and --since do', async () => {
+    // A run directory without the pointer is one an interrupted or failed run left behind
+    // (often holding only patch.diff), so it is counted but never reported as the last run.
     const reviewsDir = reviewsDirPath(repo.root);
     fs.mkdirSync(path.join(reviewsDir, '20260101T000000000Z'), { recursive: true });
     fs.mkdirSync(path.join(reviewsDir, '20260103T000000000Z'), { recursive: true });
 
     const report = await collectStatus(repo.root, { verify: false });
     expect(report.runs.count).toBe(2);
-    expect(report.runs.last?.id).toBe('20260103T000000000Z');
+    expect(report.runs.last).toBeNull();
   });
 });
 
@@ -500,6 +502,19 @@ describe('collectStatus: --verify', () => {
     const missing = report.panel.find((p) => p.model === 'no-such-model');
     expect(missing?.ready).toBe(false);
     expect(missing?.readyReason).toContain('absent from the catalog');
+  });
+
+  it('reports every entry not-ready, rather than throwing, when model discovery fails', async () => {
+    const homeDir = mkScratchDir('council-status-test-home-'); // no models-store.json at all
+    process.env.HOME = homeDir;
+    process.env.COUNCIL_PI_BIN = path.join(homeDir, 'no-such-pi');
+    writeConfig(repo.root, baseConfig({ panel: [{ provider: 'minimax', model: 'MiniMax-M2.7' }] }));
+
+    const report = await collectStatus(repo.root, { verify: true });
+    expect(report.verified).toBe(true);
+    expect(report.configured).toBe(true);
+    expect(report.panel[0]?.ready).toBe(false);
+    expect(report.panel[0]?.readyReason).toContain('model discovery failed');
   });
 
   it('is a no-op (verified=false) against an unconfigured project', async () => {

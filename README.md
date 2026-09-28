@@ -34,7 +34,7 @@ A read-only, multi-vendor code review panel over local git state.
 and merges their findings in deterministic code, never through another model. Reviewers cannot
 write anything: every host built-in is removed, the repository under review cannot load its own
 extensions, skills or context files into the process reviewing it, and a reviewer's whole tool
-surface is four read-only tools scoped to a frozen, non-writable copy of your tree. That is not
+surface is five read-only tools scoped to a frozen, non-writable copy of your tree. That is not
 container or VM isolation, and third-party models do read your source — see
 [`HOST-VERSION.md`](./HOST-VERSION.md) and the
 [design doc](./docs/design/council-review-design.md) for what was actually verified, and re-verify

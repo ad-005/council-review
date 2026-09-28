@@ -19,10 +19,11 @@ import {
   ConfigError,
   CONFIG_DEFAULTS,
   BLAST_RADIUS_DEFAULTS,
-  CODEGRAPH_DEFAULTS,
   configPath,
   ignorePath,
   loadConfig,
+  defaultConfig,
+  readConfigDocument,
   writeConfig,
   loadIgnore,
   appendIgnore,
@@ -61,7 +62,12 @@ import {
   type ManifestInput,
 } from './report.js';
 import { splitPaneAndRun, setPaneTitle, notifyComplete, handoffToAgent } from './herdr.js';
-import { collectStatus, formatStatusText, gitignoreExcludesReviews } from './status.js';
+import {
+  collectStatus,
+  readPackageVersion,
+  formatStatusText,
+  gitignoreExcludesReviews,
+} from './status.js';
 
 // -------------------------------------------------------------------------------------------
 // CLI-level errors
@@ -152,7 +158,7 @@ Environment flags:
   --no-notify                    Suppress the herdr completion notification
 
 Exit codes: 0 clean, 1 findings at/above --fail-on, 2 config/usage error, 3 degraded panel
-(outranks 1), 4 vendor-independence guard refusal.
+(outranks 1), 4 vendor-independence guard refusal, 130 interrupted.
 `;
 
 const SUBCOMMAND_HELP: Record<string, string> = {
@@ -170,12 +176,12 @@ Lists discovered, ready models: provider, model id, derived vendor, context wind
 cost rates and supported thinking levels. Makes no model call and never prompts, even without a
 terminal attached.
 `,
-  show: `council-review show [run-id]
+  show: `council-review show [run-id|last]
 
 Renders a stored run's REPORT.md. Defaults to the most recent run when no run-id is given. Makes
 no model call and incurs no cost.
 `,
-  ignore: `council-review ignore <finding-id> [--reason <text>] [--run <run-id>]
+  ignore: `council-review ignore <finding-id> [--reason <text>] [--run <run-id|last>]
 
 Resolves <finding-id> against the referenced run's merged findings (default: the most recent
 run), and appends its fingerprint to .council/ignore.json, with an optional reason. Idempotent:
@@ -221,17 +227,6 @@ function printHelp(
 // Small shared helpers
 // -------------------------------------------------------------------------------------------
 
-function readPackageVersion(): string {
-  try {
-    const here = path.dirname(fileURLToPath(import.meta.url));
-    const pkgPath = path.join(here, '..', 'package.json');
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: unknown };
-    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
-
 function resolveExtensionPath(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), 'reviewer-tools.js');
 }
@@ -256,6 +251,20 @@ function resolveLastRunId(reviewsDir: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** A stored run named on the command line: an id `listRuns` knows, or `last` / nothing for the
+ *  run the `last` pointer resolves to. */
+function resolveRunArg(command: string, repoRoot: string, raw: string | undefined): string {
+  if (raw === undefined || raw === 'last') {
+    const lastId = resolveLastRunId(reviewsDirPath(repoRoot));
+    if (lastId === null) throw new UsageError(`${command}: no runs found; run a review first`);
+    return lastId;
+  }
+  if (!listRuns(repoRoot).some((r) => r.id === raw)) {
+    throw new UsageError(`${command}: unknown run "${raw}"`);
+  }
+  return raw;
 }
 
 function panelEntriesFrom(reviewers: readonly Reviewer[]): {
@@ -309,12 +318,12 @@ function ensureGitignoreEntry(repoRoot: string): void {
   fs.writeFileSync(file, `${content}${needsNewline ? '\n' : ''}${GITIGNORE_ENTRY}\n`, 'utf8');
 }
 
+/** Plain decimal digits only: `Number()` alone also accepts '', ' ', '0x10' and '1e1'. */
 function parsePositiveInt(flag: string, raw: string): number {
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n <= 0) {
+  if (!/^[1-9]\d*$/.test(raw)) {
     throw new UsageError(`${flag} must be a positive integer, got "${raw}"`);
   }
-  return n;
+  return Number(raw);
 }
 
 const FAIL_ON_LEVELS = ['critical', 'high', 'medium', 'low', 'none'] as const;
@@ -359,24 +368,6 @@ function breachesThreshold(
   if (failOn === 'none') return false;
   const min = SEVERITY_RANK[failOn];
   return findings.some((f) => SEVERITY_RANK[f.severity] >= min);
-}
-
-/**
- * Redirects `process.stdout.write` to `process.stderr.write` for the duration of `fn`, so that
- * `runner.ts`'s own progress output (which writes directly to `process.stdout` and takes no
- * stream parameter) does not contaminate stdout while `--json` mode is active. Restored in a
- * `finally`, and a no-op (calls `fn` directly) when `active` is false.
- */
-async function withStdoutRedirectedToStderr<T>(active: boolean, fn: () => Promise<T>): Promise<T> {
-  if (!active) return fn();
-  const original = process.stdout.write.bind(process.stdout);
-  process.stdout.write = ((...args: Parameters<typeof process.stdout.write>): boolean =>
-    process.stderr.write(...args)) as typeof process.stdout.write;
-  try {
-    return await fn();
-  } finally {
-    process.stdout.write = original;
-  }
 }
 
 /** The task instructions every reviewer receives. Exported (rather than kept module-private)
@@ -428,6 +419,8 @@ async function cmdInit(args: readonly string[], pickerIO: PickerIO | undefined):
   // same effect.
 
   const repoRoot = findRepoRoot(process.cwd());
+  // Malformed JSON would only surface in `writeConfig`, after the whole interactive picker.
+  readConfigDocument(repoRoot);
   const existing = tryLoadConfig(repoRoot);
 
   process.stderr.write('council-review: discovering models...\n');
@@ -438,6 +431,9 @@ async function cmdInit(args: readonly string[], pickerIO: PickerIO | undefined):
   persistPanel(repoRoot, reviewers);
   ensureIgnoreFile(repoRoot);
   ensureGitignoreEntry(repoRoot);
+  // `init` rewrites only the panel keys; any other invalid key survives the merge. Report it
+  // now rather than let the next review fail on a config `init` said it wrote.
+  loadConfig(repoRoot);
 
   process.stdout.write(`council-review: initialized with ${reviewers.length} reviewer(s):\n`);
   for (const r of reviewers) {
@@ -499,20 +495,7 @@ async function cmdShow(args: readonly string[]): Promise<number> {
 
   const repoRoot = findRepoRoot(process.cwd());
   const reviewsDir = reviewsDirPath(repoRoot);
-
-  let runId: string;
-  if (positionals.length === 1) {
-    runId = positionals[0]!;
-    if (!listRuns(repoRoot).some((r) => r.id === runId)) {
-      throw new UsageError(`show: unknown run "${runId}"`);
-    }
-  } else {
-    const lastId = resolveLastRunId(reviewsDir);
-    if (lastId === null) {
-      throw new UsageError('show: no runs found; run a review first');
-    }
-    runId = lastId;
-  }
+  const runId = resolveRunArg('show', repoRoot, positionals[0]);
 
   const reportFile = path.join(reviewsDir, runId, 'REPORT.md');
   let content: string;
@@ -545,20 +528,7 @@ async function cmdIgnore(args: readonly string[]): Promise<number> {
 
   const repoRoot = findRepoRoot(process.cwd());
   const reviewsDir = reviewsDirPath(repoRoot);
-
-  let runId: string;
-  if (values.run !== undefined) {
-    runId = values.run;
-    if (!listRuns(repoRoot).some((r) => r.id === runId)) {
-      throw new UsageError(`ignore: unknown run "${runId}"`);
-    }
-  } else {
-    const lastId = resolveLastRunId(reviewsDir);
-    if (lastId === null) {
-      throw new UsageError('ignore: no runs found; run a review first');
-    }
-    runId = lastId;
-  }
+  const runId = resolveRunArg('ignore', repoRoot, values.run);
 
   const findingsFile = path.join(reviewsDir, runId, 'findings.json');
   let findings: MergedFinding[];
@@ -601,11 +571,11 @@ async function cmdGc(args: readonly string[]): Promise<number> {
   const cfg = tryLoadConfig(repoRoot);
   let keep = cfg?.retain ?? CONFIG_DEFAULTS.retain!;
   if (values.keep !== undefined) {
-    const n = Number(values.keep);
-    if (!Number.isInteger(n) || n < 0) {
+    // Digits only: `Number('')` is 0, so `--keep=` would otherwise prune every run but `last`.
+    if (!/^\d+$/.test(values.keep)) {
       throw new UsageError(`gc: --keep must be a non-negative integer, got "${values.keep}"`);
     }
-    keep = n;
+    keep = Number(values.keep);
   }
 
   const { removed } = gcRuns(repoRoot, keep);
@@ -730,24 +700,26 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
 
   let cfg: CouncilConfig;
   if (!configExists && havePanelOverride) {
-    cfg = {
-      version: CONFIG_DEFAULTS.version!,
-      baseBranch: CONFIG_DEFAULTS.baseBranch!,
-      panel: [],
-      includeContextFiles: CONFIG_DEFAULTS.includeContextFiles!,
-      timeoutSeconds: CONFIG_DEFAULTS.timeoutSeconds!,
-      maxOutputTokens: CONFIG_DEFAULTS.maxOutputTokens!,
-      mergeWindow: CONFIG_DEFAULTS.mergeWindow!,
-      claimSimilarity: CONFIG_DEFAULTS.claimSimilarity!,
-      failOn: CONFIG_DEFAULTS.failOn!,
-      retain: CONFIG_DEFAULTS.retain!,
-      codegraph: { ...CODEGRAPH_DEFAULTS },
-    };
+    cfg = defaultConfig();
   } else {
     // Missing config with no override throws here, its message already directing to `init`
     // (config.ts's own wording satisfies the "Review without configuration" scenario verbatim).
     cfg = loadConfig(repoRoot);
   }
+
+  // Every remaining input a run depends on is validated here, before discovery, the snapshot
+  // or any reviewer: a usage or config error found after the panel ran would discard paid output.
+  const timeoutSeconds =
+    values.timeout !== undefined
+      ? parsePositiveInt('--timeout', values.timeout)
+      : cfg.timeoutSeconds;
+  const maxOutputTokens =
+    values['max-tokens'] !== undefined
+      ? parsePositiveInt('--max-tokens', values['max-tokens'])
+      : cfg.maxOutputTokens;
+  const failOn = values['fail-on'] !== undefined ? validateFailOn(values['fail-on']) : cfg.failOn;
+  // --no-suppress never reads the ignore file, so a broken one cannot block that run.
+  const ignoreFile: IgnoreFile = noSuppress ? { version: 1, entries: [] } : loadIgnore(repoRoot);
 
   const catalog = await loadCatalog({ vendorOverrides: cfg.vendorOverrides ?? {} });
 
@@ -774,8 +746,6 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
     persistPanel(repoRoot, reviewers);
   }
 
-  setPaneTitle(`council-review: ${reviewers.length} models`);
-
   const scope = await resolveScope(repoRoot, selectors, { baseBranch: cfg.baseBranch });
 
   if (scope.empty) {
@@ -793,6 +763,10 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
     // Not attempted (outside herdr, or already running inside a delegated pane): fall through
     // and run the review in this process.
   }
+
+  // Only the process that actually runs the review titles its pane: a delegating parent would
+  // otherwise retitle the user's own pane.
+  setPaneTitle(`council-review: ${reviewers.length} models`);
 
   // Centralized host self-update: exactly once per review run, in this process -- never
   // in a reviewer -- and before any reviewer launches, so every reviewer in the panel
@@ -818,9 +792,6 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
   // 'skipped' (explicit opt-out or offline) stays silent: nothing was attempted, so there
   // is nothing to report.
 
-  // Guard #2: immediately before launch, so a hand-edited config panel is checked too.
-  enforceIndependence(reviewers, allowCorrelated);
-
   const run = createRunDir(repoRoot);
   const patchPath = writePatch(run.path, scope);
 
@@ -844,15 +815,6 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       codegraph: cfg.codegraph,
     });
 
-    const timeoutSeconds =
-      values.timeout !== undefined
-        ? parsePositiveInt('--timeout', values.timeout)
-        : cfg.timeoutSeconds;
-    const maxOutputTokens =
-      values['max-tokens'] !== undefined
-        ? parsePositiveInt('--max-tokens', values['max-tokens'])
-        : cfg.maxOutputTokens;
-
     const activeSnapshot = snapshot;
 
     // Deterministic blast-radius step, computed once per run after the snapshot index is
@@ -870,23 +832,23 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
 
     let outcome: RunPanelOutcome;
     try {
-      outcome = await withStdoutRedirectedToStderr(jsonMode, () =>
-        runPanel({
-          reviewers,
-          snapshot: activeSnapshot,
-          repoRoot,
-          patchPath,
-          prompt: TASK_PROMPT,
-          blastRadiusBlock: blastRadius.available
-            ? `${BLAST_RADIUS_FRAMING}\n\n${blastRadius.block}`
-            : undefined,
-          extensionPath: resolveExtensionPath(),
-          includeContextFiles: cfg.includeContextFiles,
-          timeoutSeconds,
-          maxOutputTokens,
-          signal: controller.signal,
-        }),
-      );
+      outcome = await runPanel({
+        reviewers,
+        snapshot: activeSnapshot,
+        repoRoot,
+        patchPath,
+        prompt: TASK_PROMPT,
+        blastRadiusBlock: blastRadius.available
+          ? `${BLAST_RADIUS_FRAMING}\n\n${blastRadius.block}`
+          : undefined,
+        extensionPath: resolveExtensionPath(),
+        includeContextFiles: cfg.includeContextFiles,
+        timeoutSeconds,
+        maxOutputTokens,
+        signal: controller.signal,
+        // Progress is the only thing the runner writes; keep it off a --json stdout.
+        progressStream: jsonMode ? process.stderr : undefined,
+      });
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
         out(jsonMode, 'council-review: run interrupted.\n');
@@ -907,7 +869,6 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       reviewerId: `${r.reviewer.provider}/${r.reviewer.model}`,
       findings: r.findings,
     }));
-    const ignoreFile = loadIgnore(repoRoot);
     const mergeOutcome = mergeFindings(reviewerFindings, {
       mergeWindow: cfg.mergeWindow,
       claimSimilarity: cfg.claimSimilarity,
@@ -958,7 +919,6 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
       process.stdout.write(`council-review: report written to ${reportPath}\n`);
     }
 
-    const failOn = values['fail-on'] !== undefined ? validateFailOn(values['fail-on']) : cfg.failOn;
     const breached = breachesThreshold(mergeOutcome.findings, failOn);
 
     // Exit-code taxonomy (cli spec's "Exit-code taxonomy" requirement): a degraded panel outranks

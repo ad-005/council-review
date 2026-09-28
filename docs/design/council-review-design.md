@@ -485,7 +485,7 @@ herdr   --pane [right|down]  --no-pane  --handoff <agent>  --no-notify
   two unrelated findings on one line; suppression matching; resolution
   diffing; vendor mapping and the independence guard; scope resolution and
   snapshot building against temp git repos.
-- **Security.** Path-escape rejection in all four reviewer tools: `..`
+- **Security.** Path-escape rejection in every path-taking reviewer tool: `..`
   traversal, absolute paths, and symlinks pointing out of the snapshot. Plus a
   test asserting the spawn argv contains `-nbt` and no path that would
   re-enable a built-in.

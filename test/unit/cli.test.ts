@@ -849,6 +849,28 @@ describe('review run exit codes', () => {
     expect(code).toBe(1);
   });
 
+  it('rejects a bad --fail-on, --timeout or --max-tokens before any run directory or reviewer', async () => {
+    useFixtures({ defaultFixture: 'valid-findings' });
+    writeConfigFile();
+    makeWorkingChange();
+
+    for (const args of [
+      ['--fail-on', 'bogus'],
+      ['--timeout', 'abc'],
+      ['--max-tokens', ''],
+    ]) {
+      const stderr = captureStream(process.stderr);
+      let code: number;
+      try {
+        code = await runCli(args);
+      } finally {
+        stderr.restore();
+      }
+      expect(code).toBe(2);
+    }
+    expect(fs.existsSync(path.join(repo.root, '.council', 'reviews'))).toBe(false);
+  });
+
   it('fail-on none never breaches the threshold', async () => {
     useFixtures({ defaultFixture: 'valid-findings' });
     writeConfigFile({ failOn: 'none' });
@@ -1404,6 +1426,37 @@ describe('show / ignore / gc', () => {
       /* no capture needed */
     }
     expect(unknownCode).toBe(2);
+  });
+
+  it('show last renders the same run as show with no argument', async () => {
+    await runOneReview();
+    const stdout = captureStream(process.stdout);
+    let code: number;
+    try {
+      code = await runCli(['show', 'last']);
+    } finally {
+      stdout.restore();
+    }
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain('Council Review');
+  });
+
+  it('gc rejects an empty or non-decimal --keep instead of pruning every run', async () => {
+    await runOneReview();
+    const reviewsDir = path.join(repo.root, '.council', 'reviews');
+    const before = fs.readdirSync(reviewsDir).sort();
+
+    for (const keep of ['--keep=', '--keep=0x1', '--keep=1e1']) {
+      const stderr = captureStream(process.stderr);
+      let code: number;
+      try {
+        code = await runCli(['gc', keep]);
+      } finally {
+        stderr.restore();
+      }
+      expect(code).toBe(2);
+    }
+    expect(fs.readdirSync(reviewsDir).sort()).toEqual(before);
   });
 
   it('ignore suppresses a finding idempotently; an unknown id exits 2 and leaves the file unchanged', async () => {

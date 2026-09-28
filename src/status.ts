@@ -97,12 +97,11 @@ export interface StatusReport {
 }
 
 // -------------------------------------------------------------------------------------------
-// Small helpers, duplicated deliberately rather than exported from their real owners
+// Small helpers
 // -------------------------------------------------------------------------------------------
 
-/** Mirrors `cli.ts`'s own `readPackageVersion` -- not shared, since neither file is the other's
- * dependency and this is three lines of no real complexity to keep in sync. */
-function readPackageVersion(): string {
+/** This package's own version, from its `package.json`; `0.0.0` if that cannot be read. */
+export function readPackageVersion(): string {
   try {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const pkgPath = path.join(here, '..', 'package.json');
@@ -123,14 +122,23 @@ function resolveLastRunId(reviewsDir: string): string | null {
 }
 
 /** Patterns that exclude the reviews directory itself: the exact entry `init` appends,
- * its no-trailing-slash twin (identical meaning for a directory), and `.council/*`, the
- * "commit the config, ignore everything generated" form -- `*` matches the `reviews` component,
- * so the directory is excluded the same way. */
-const GITIGNORE_REVIEWS_PATTERNS = ['.council/reviews', '.council/reviews/', '.council/*'];
+ * its no-trailing-slash twin (identical meaning for a directory), their `**`-prefixed
+ * any-depth forms, `.council/reviews/**` (everything inside it), and `.council/*` /
+ * `.council/**`, the "commit the config, ignore everything generated" forms -- they match the
+ * `reviews` component, so the directory is excluded the same way. */
+const GITIGNORE_REVIEWS_PATTERNS = [
+  '.council/reviews',
+  '.council/reviews/',
+  '.council/reviews/**',
+  '**/.council/reviews',
+  '**/.council/reviews/',
+  '.council/*',
+  '.council/**',
+];
 
 /** Patterns that exclude the whole `.council` tree: git never lists paths under an excluded
  * directory, so these exclude `.council/reviews/` without naming it. */
-const GITIGNORE_COUNCIL_PARENT_PATTERNS = ['.council', '.council/'];
+const GITIGNORE_COUNCIL_PARENT_PATTERNS = ['.council', '.council/', '**/.council', '**/.council/'];
 
 /**
  * Parses one raw `.gitignore` line for the reviews-exclusion check. Returns null for blank and
@@ -217,7 +225,14 @@ async function verifyPanelEntries(
   base: readonly StatusPanelEntry[],
   cfg: CouncilConfig,
 ): Promise<StatusPanelEntry[]> {
-  const catalog = await loadCatalog({ vendorOverrides: cfg.vendorOverrides ?? {} });
+  let catalog: Awaited<ReturnType<typeof loadCatalog>>;
+  try {
+    catalog = await loadCatalog({ vendorOverrides: cfg.vendorOverrides ?? {} });
+  } catch (err) {
+    // Discovery failing is a verification result, not a reason to lose the whole report.
+    const reason = `model discovery failed: ${err instanceof Error ? err.message : String(err)}`;
+    return base.map((entry) => ({ ...entry, ready: false, readyReason: reason }));
+  }
 
   return base.map((entry) => {
     const model = findModel(catalog, entry.provider, entry.model);
@@ -309,13 +324,13 @@ export async function collectStatus(cwd: string, opts: { verify: boolean }): Pro
     };
 
     settings = {
-      baseBranch: activeCfg.baseBranch ?? CONFIG_DEFAULTS.baseBranch!,
-      failOn: activeCfg.failOn ?? CONFIG_DEFAULTS.failOn!,
-      timeoutSeconds: activeCfg.timeoutSeconds ?? CONFIG_DEFAULTS.timeoutSeconds!,
-      maxOutputTokens: activeCfg.maxOutputTokens ?? CONFIG_DEFAULTS.maxOutputTokens!,
-      mergeWindow: activeCfg.mergeWindow ?? CONFIG_DEFAULTS.mergeWindow!,
-      claimSimilarity: activeCfg.claimSimilarity ?? CONFIG_DEFAULTS.claimSimilarity!,
-      includeContextFiles: activeCfg.includeContextFiles ?? CONFIG_DEFAULTS.includeContextFiles!,
+      baseBranch: activeCfg.baseBranch,
+      failOn: activeCfg.failOn,
+      timeoutSeconds: activeCfg.timeoutSeconds,
+      maxOutputTokens: activeCfg.maxOutputTokens,
+      mergeWindow: activeCfg.mergeWindow,
+      claimSimilarity: activeCfg.claimSimilarity,
+      includeContextFiles: activeCfg.includeContextFiles,
       retain: activeCfg.retain ?? CONFIG_DEFAULTS.retain!,
     };
   }
@@ -347,7 +362,9 @@ export async function collectStatus(cwd: string, opts: { verify: boolean }): Pro
   } else {
     const allRuns = listRuns(repoRoot); // newest first
     const reviewsDir = reviewsDirPath(repoRoot);
-    const lastId = resolveLastRunId(reviewsDir) ?? allRuns[0]?.id ?? null;
+    // Only the `last` pointer names a completed run: the newest directory may be one an
+    // interrupted or failed run left with nothing but its patch.
+    const lastId = resolveLastRunId(reviewsDir);
     const last =
       lastId === null
         ? null
