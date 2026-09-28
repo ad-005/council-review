@@ -95,39 +95,142 @@ function compareSymbols(a: ChangedSymbol, b: ChangedSymbol): number {
 // 1.1 Patch-hunk parser
 // -------------------------------------------------------------------------------------------
 
-export type PatchFileStatus = 'modified' | 'added' | 'deleted' | 'renamed';
+export type PatchFileStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied';
 
+/**
+ * One contiguous run of changed lines inside a `@@` hunk, in new-file (+ side) line numbers.
+ * Not the hunk itself: a hunk's surrounding context lines (3 by default) are excluded, and a
+ * hunk whose changes are separated by context yields one entry per run, so a change to one
+ * function is never attributed to the neighbour whose tail sits in the leading context.
+ */
 export interface PatchHunk {
-  /** 1-based start line on the new-file (+) side. 0 for a pure context-less deletion hunk
-   *  (`+0,0`), which maps to no end-state symbol. */
+  /** 1-based first new-side line of the run. For a pure deletion (no `+` lines), the new-side
+   *  line the deleted lines followed: 0 when they were at the top of the file, which maps to no
+   *  end-state symbol. */
   start: number;
-  /** Number of new-side lines in the hunk (0 for deletion-only hunks). */
-  count: number;
+  /** 1-based last new-side line of the run, inclusive; equal to `start` for a pure deletion. */
+  end: number;
 }
 
 export interface PatchFile {
   /** Post-image path, or the pre-image path for deleted files. */
   path: string;
-  /** Pre-image path. */
+  /** Pre-image path (the source, for a copy). */
   oldPath: string;
   status: PatchFileStatus;
   hunks: PatchHunk[];
 }
 
-const HUNK_HEADER_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+const HUNK_HEADER_RE = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
-/** Strips git's `a/`/`b/` prefix and one layer of C-style double quotes (plain paths with
- *  spaces; full octal-escape decoding is out of scope — such paths still map consistently
- *  because the same spelling flows to both the index query and the rendered block). */
+const C_ESCAPES: Readonly<Record<string, number>> = {
+  a: 7,
+  b: 8,
+  t: 9,
+  n: 10,
+  v: 11,
+  f: 12,
+  r: 13,
+  '"': 34,
+  '\\': 92,
+};
+
+/** Reads one git C-quoted path starting at `s[from]` (which must be `"`): backslash escapes
+ *  and `\ooo` octal bytes are decoded, and the bytes read as UTF-8 (`"\303\251.txt"` is
+ *  `é.txt`). Returns the decoded value and the index just past the closing quote, or null
+ *  when no well-formed quoted string starts there. */
+function readQuoted(s: string, from: number): { value: string; next: number } | null {
+  if (s[from] !== '"') return null;
+  const bytes: number[] = [];
+  let i = from + 1;
+  while (i < s.length) {
+    const ch = s[i] as string;
+    if (ch === '"') {
+      return { value: Buffer.from(bytes).toString('utf8'), next: i + 1 };
+    }
+    if (ch === '\\') {
+      const esc = s[i + 1] ?? '';
+      const octal = /^[0-3][0-7]{2}/.exec(s.slice(i + 1, i + 4));
+      if (octal) {
+        bytes.push(parseInt(octal[0], 8));
+        i += 4;
+      } else if (esc in C_ESCAPES) {
+        bytes.push(C_ESCAPES[esc] as number);
+        i += 2;
+      } else {
+        return null;
+      }
+      continue;
+    }
+    const cp = s.codePointAt(i) as number;
+    const char = String.fromCodePoint(cp);
+    bytes.push(...Buffer.from(char, 'utf8'));
+    i += char.length;
+  }
+  return null;
+}
+
+/** A whole-value path as git prints it after `rename from`, `copy to` etc.: decoded when it
+ *  is C-quoted, verbatim otherwise. These lines carry no `a/`/`b/` prefix. */
+function decodePath(value: string): string {
+  const quoted = readQuoted(value, 0);
+  return quoted !== null && quoted.next === value.length ? quoted.value : value;
+}
+
+/** Strips git's `a/`/`b/` prefix from an already-decoded path. */
 function stripDiffPrefix(value: string, prefix: 'a/' | 'b/'): string {
-  let v = value;
-  if (v.startsWith('"') && v.endsWith('"') && v.length >= 2) {
-    v = v.slice(1, -1);
+  return value.startsWith(prefix) ? value.slice(prefix.length) : value;
+}
+
+/** Path from a `--- ` / `+++ ` header value. Git appends a tab after an unquoted name that
+ *  contains a space (and quotes any name that contains a tab), so an unquoted value ends at
+ *  the first tab and is otherwise verbatim: leading and trailing spaces are part of the name. */
+function headerPath(value: string, prefix: 'a/' | 'b/'): string {
+  const quoted = readQuoted(value, 0);
+  const raw = quoted !== null ? quoted.value : (value.split('\t')[0] as string);
+  return raw === '/dev/null' ? raw : stripDiffPrefix(raw, prefix);
+}
+
+/**
+ * Splits the `a/<old> b/<new>` part of a `diff --git` line, the way `git apply` does. Either
+ * side may be C-quoted. When neither is, spaces in the names make the split ambiguous, so the
+ * split is taken where both halves name the same path -- the only case in which git prints no
+ * later header to correct it (a binary change, a mode-only change, an empty new file). A rename
+ * whose unquoted names differ falls back to the first space and is corrected by the
+ * `rename from`/`rename to` (or `---`/`+++`) lines that always follow it.
+ */
+function splitDiffGitPaths(rest: string): { oldPath: string; newPath: string } {
+  const oldQuoted = readQuoted(rest, 0);
+  if (oldQuoted !== null && rest[oldQuoted.next] === ' ') {
+    const newRaw = rest.slice(oldQuoted.next + 1);
+    return {
+      oldPath: stripDiffPrefix(oldQuoted.value, 'a/'),
+      newPath: stripDiffPrefix(decodePath(newRaw), 'b/'),
+    };
   }
-  if (v.startsWith(prefix)) {
-    v = v.slice(prefix.length);
+  if (rest.endsWith('"')) {
+    for (let i = rest.indexOf(' "'); i !== -1; i = rest.indexOf(' "', i + 1)) {
+      const newQuoted = readQuoted(rest, i + 1);
+      if (newQuoted !== null && newQuoted.next === rest.length) {
+        return {
+          oldPath: stripDiffPrefix(rest.slice(0, i), 'a/'),
+          newPath: stripDiffPrefix(newQuoted.value, 'b/'),
+        };
+      }
+    }
   }
-  return v;
+  let firstSpace = -1;
+  for (let i = rest.indexOf(' '); i !== -1; i = rest.indexOf(' ', i + 1)) {
+    if (firstSpace === -1) firstSpace = i;
+    const oldPath = stripDiffPrefix(rest.slice(0, i), 'a/');
+    const newPath = stripDiffPrefix(rest.slice(i + 1), 'b/');
+    if (oldPath === newPath) return { oldPath, newPath };
+  }
+  if (firstSpace === -1) return { oldPath: rest, newPath: rest };
+  return {
+    oldPath: stripDiffPrefix(rest.slice(0, firstSpace), 'a/'),
+    newPath: stripDiffPrefix(rest.slice(firstSpace + 1), 'b/'),
+  };
 }
 
 interface MutablePatchFile {
@@ -136,24 +239,74 @@ interface MutablePatchFile {
   newFile: boolean;
   deletedFile: boolean;
   renamed: boolean;
+  copied: boolean;
   /** Set once the first `@@` header is seen; `---`/`+++` lines after that point are
    *  hunk content, never path headers. */
   seenHunk: boolean;
+  /** Old-/new-side lines the current hunk still has to show, from its header; the hunk's
+   *  body ends when both reach 0. */
+  oldLeft: number;
+  newLeft: number;
+  /** New-side line number the next context or `+` line will have. */
+  newLine: number;
+  /** The run of changed lines currently open; `added` once it contains a `+` line. */
+  run: { start: number; end: number; added: boolean } | null;
   hunks: PatchHunk[];
+}
+
+function closeRun(current: MutablePatchFile): void {
+  if (current.run === null) return;
+  current.hunks.push({ start: current.run.start, end: current.run.end });
+  current.run = null;
+}
+
+/** Consumes one line of a hunk body, advancing the line counters and the open run. */
+function consumeHunkLine(current: MutablePatchFile, line: string): void {
+  const marker = line[0];
+  if (marker === '+') {
+    if (current.run === null || !current.run.added) {
+      current.run = { start: current.newLine, end: current.newLine, added: true };
+    } else {
+      current.run.end = current.newLine;
+    }
+    current.newLine += 1;
+    current.newLeft -= 1;
+  } else if (marker === '-') {
+    // The deletion point: the last new-side line before the removed ones.
+    current.run ??= { start: current.newLine - 1, end: current.newLine - 1, added: false };
+    current.oldLeft -= 1;
+  } else if (marker === ' ' || line.length === 0) {
+    // An empty line is a context line whose leading space was dropped (`diff.suppressBlankEmpty`).
+    closeRun(current);
+    current.newLine += 1;
+    current.oldLeft -= 1;
+    current.newLeft -= 1;
+  } else if (marker !== '\\') {
+    // Not a hunk line at all (`\ No newline at end of file` is the one legal non-line):
+    // the hunk ended early, so stop counting rather than misread what follows.
+    current.oldLeft = 0;
+    current.newLeft = 0;
+  }
+  if (current.oldLeft <= 0 && current.newLeft <= 0) closeRun(current);
 }
 
 function finishPatchFile(current: MutablePatchFile | null, out: PatchFile[]): void {
   if (current === null) return;
+  closeRun(current);
   const deleted = current.deletedFile || current.newPath === '/dev/null';
   const added = !deleted && (current.newFile || current.oldPath === '/dev/null');
-  const renamed = !deleted && !added && (current.renamed || current.oldPath !== current.newPath);
+  const copied = !deleted && !added && current.copied;
+  const renamed =
+    !deleted && !added && !copied && (current.renamed || current.oldPath !== current.newPath);
   const status: PatchFileStatus = deleted
     ? 'deleted'
     : added
       ? 'added'
-      : renamed
-        ? 'renamed'
-        : 'modified';
+      : copied
+        ? 'copied'
+        : renamed
+          ? 'renamed'
+          : 'modified';
   out.push({
     path: deleted ? current.oldPath : current.newPath,
     oldPath: current.oldPath,
@@ -163,14 +316,14 @@ function finishPatchFile(current: MutablePatchFile | null, out: PatchFile[]): vo
 }
 
 /**
- * Parses a unified `git diff` into per-file paths, hunk ranges, and change kinds. Pure
+ * Parses a unified `git diff` into per-file paths, changed-line runs, and change kinds. Pure
  * function of its input. Handles new files (`--- /dev/null`), deleted files
- * (`+++ /dev/null`), renames (`rename from/to` or differing `---`/`+++` paths), binary
- * diffs (emitted with zero hunks so they still feed the `affected` query), and multi-hunk
- * files. Only headers are inspected, and `---`/`+++` path headers are only accepted
- * before the first hunk header of each file section (real headers always precede the
- * hunks, including `/dev/null` ones): a deleted `-- x` or added `++ y` content line
- * would otherwise mimic a path header once prefixed with `-`/`+` and corrupt the paths.
+ * (`+++ /dev/null`), renames and copies (`rename from/to`, `copy from/to`, or differing
+ * `---`/`+++` paths), C-quoted and space-containing paths, binary and mode-only diffs
+ * (emitted with zero hunks so they still feed the `affected` query), and multi-hunk files.
+ * Hunk bodies are consumed by the line counts in their `@@` header, so a deleted `-- x` or
+ * added `++ y` content line can never be mistaken for a `---`/`+++` path header; those are
+ * additionally only accepted before the first hunk of each file section.
  */
 export function parsePatchHunks(patch: string): PatchFile[] {
   const out: PatchFile[] = [];
@@ -179,52 +332,71 @@ export function parsePatchHunks(patch: string): PatchFile[] {
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     if (line.startsWith('diff --git ')) {
       finishPatchFile(current, out);
-      const rest = line.slice('diff --git '.length).trim();
-      // Paths may be quoted when they contain spaces; split carefully.
-      const tokens = rest.match(/"[^"]*"|\S+/g) ?? [];
-      const oldTok = tokens[0] ?? '';
-      const newTok = tokens[1] ?? '';
+      const { oldPath, newPath } = splitDiffGitPaths(line.slice('diff --git '.length));
       current = {
-        oldPath: stripDiffPrefix(oldTok, 'a/'),
-        newPath: stripDiffPrefix(newTok, 'b/'),
+        oldPath,
+        newPath,
         newFile: false,
         deletedFile: false,
         renamed: false,
+        copied: false,
         seenHunk: false,
+        oldLeft: 0,
+        newLeft: 0,
+        newLine: 0,
+        run: null,
         hunks: [],
       };
       continue;
     }
     if (current === null) continue;
+    if (current.oldLeft > 0 || current.newLeft > 0) {
+      consumeHunkLine(current, line);
+      continue;
+    }
+    if (current.seenHunk) {
+      const hunk = HUNK_HEADER_RE.exec(line);
+      if (hunk) startHunk(current, hunk);
+      continue;
+    }
     if (line.startsWith('new file mode')) {
       current.newFile = true;
     } else if (line.startsWith('deleted file mode')) {
       current.deletedFile = true;
     } else if (line.startsWith('rename from ')) {
       current.renamed = true;
-      current.oldPath = stripDiffPrefix(line.slice('rename from '.length).trim(), 'a/');
+      current.oldPath = decodePath(line.slice('rename from '.length));
     } else if (line.startsWith('rename to ')) {
       current.renamed = true;
-      current.newPath = stripDiffPrefix(line.slice('rename to '.length).trim(), 'b/');
-    } else if (line.startsWith('--- ') && !current.seenHunk) {
-      const p = stripDiffPrefix(line.slice(4).trim().split('\t')[0] as string, 'a/');
-      current.oldPath = p;
-    } else if (line.startsWith('+++ ') && !current.seenHunk) {
-      const p = stripDiffPrefix(line.slice(4).trim().split('\t')[0] as string, 'b/');
-      current.newPath = p;
+      current.newPath = decodePath(line.slice('rename to '.length));
+    } else if (line.startsWith('copy from ')) {
+      current.copied = true;
+      current.oldPath = decodePath(line.slice('copy from '.length));
+    } else if (line.startsWith('copy to ')) {
+      current.copied = true;
+      current.newPath = decodePath(line.slice('copy to '.length));
+    } else if (line.startsWith('--- ')) {
+      current.oldPath = headerPath(line.slice(4), 'a/');
+    } else if (line.startsWith('+++ ')) {
+      current.newPath = headerPath(line.slice(4), 'b/');
     } else {
       const hunk = HUNK_HEADER_RE.exec(line);
-      if (hunk) {
-        current.seenHunk = true;
-        current.hunks.push({
-          start: Number(hunk[1]),
-          count: hunk[2] === undefined ? 1 : Number(hunk[2]),
-        });
-      }
+      if (hunk) startHunk(current, hunk);
     }
   }
   finishPatchFile(current, out);
   return out;
+}
+
+function startHunk(current: MutablePatchFile, header: RegExpExecArray): void {
+  current.seenHunk = true;
+  current.oldLeft = header[1] === undefined ? 1 : Number(header[1]);
+  current.newLeft = header[3] === undefined ? 1 : Number(header[3]);
+  const start = Number(header[2]);
+  // An empty new side (`+N,0`) names the line *after which* its deletion sits; otherwise the
+  // header's start is the hunk's first new-side line.
+  current.newLine = current.newLeft === 0 ? start + 1 : start;
+  if (current.oldLeft === 0 && current.newLeft === 0) closeRun(current);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -247,6 +419,17 @@ const SYMBOLS_SECTION_RE = /^\*\*Symbols\*\*\s*$/;
 const SYMBOL_LINE_RE = /^-\s+`([^`]+)`\s+\(([^)]+)\)\s+.*—\s*:(\d+)\s*$/;
 const NOT_IN_INDEX_RE = /No indexed file matches/;
 const USED_BY_RE = /used by \d+ files?:\s*(.+?)\s*$/;
+
+/** The dependents named by a map's `used by N files: a, b` header line, or null when `line`
+ *  is not that header. */
+function parseUsedBy(line: string): string[] | null {
+  const usedBy = USED_BY_RE.exec(line);
+  if (!usedBy) return null;
+  return (usedBy[1] as string)
+    .split(',')
+    .map((dep) => dep.trim())
+    .filter((dep) => dep.length > 0);
+}
 
 /**
  * Parses `codegraph node --file <rel> --symbols-only` (text; the one subcommand with no
@@ -277,13 +460,7 @@ export function parseSymbolsOnlyMap(output: string): SymbolsOnlyParse {
       });
       continue;
     }
-    const usedBy = USED_BY_RE.exec(line);
-    if (usedBy) {
-      for (const dep of (usedBy[1] as string).split(',')) {
-        const trimmed = dep.trim();
-        if (trimmed.length > 0) dependents.push(trimmed);
-      }
-    }
+    dependents.push(...(parseUsedBy(line) ?? []));
   }
   symbols.sort((a, b) => a.startLine - b.startLine || compareStr(a.name, b.name));
   dependents.sort(compareStr);
@@ -298,10 +475,10 @@ export interface ChangedSymbol {
 }
 
 /**
- * Maps each hunk to its enclosing symbol: the last symbol with
- * `startLine <= hunk.start` in the same file (end lines are inferred positionally, so a
- * hunk above the first symbol maps to nothing). Deduped and sorted by
- * (file, startLine, name).
+ * Maps each changed-line run to every symbol it overlaps: the enclosing symbol of its first
+ * line (the last symbol with `startLine <= run.start`) plus every symbol that starts inside
+ * the run. End lines are inferred positionally, so a run above the first symbol maps to
+ * nothing. Deduped and sorted by (file, startLine, name).
  */
 export function mapHunksToSymbols(
   file: string,
@@ -311,22 +488,20 @@ export function mapHunksToSymbols(
   const sorted = [...symbols].sort((a, b) => a.startLine - b.startLine);
   const seen = new Set<string>();
   const out: ChangedSymbol[] = [];
+  const add = (sym: FileSymbol): void => {
+    const key = `${sym.startLine}\0${sym.name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ name: sym.name, kind: sym.kind, file, startLine: sym.startLine });
+  };
   for (const hunk of hunks) {
     let enclosing: FileSymbol | null = null;
     for (const sym of sorted) {
       if (sym.startLine <= hunk.start) enclosing = sym;
+      else if (sym.startLine <= hunk.end) add(sym);
       else break;
     }
-    if (enclosing === null) continue;
-    const key = `${enclosing.startLine}\0${enclosing.name}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      name: enclosing.name,
-      kind: enclosing.kind,
-      file,
-      startLine: enclosing.startLine,
-    });
+    if (enclosing !== null) add(enclosing);
   }
   out.sort(compareSymbols);
   return out;
@@ -336,13 +511,19 @@ export function mapHunksToSymbols(
 // 1.3 CLI-side argv builder (never imports reviewer-tools.ts) + JSON parsing
 // -------------------------------------------------------------------------------------------
 
-function assertArgValue(label: string, value: string): void {
+/** Non-empty and NUL-free: all a snapshot root is checked for, and the base of every other
+ *  argv value check. */
+function assertRoot(label: string, value: string): void {
   if (value.length === 0) {
     throw new Error(`${label} must not be empty`);
   }
   if (value.includes('\0')) {
     throw new Error(`${label} must not contain a NUL byte`);
   }
+}
+
+function assertArgValue(label: string, value: string): void {
+  assertRoot(label, value);
   if (value.startsWith('-')) {
     throw new Error(`${label} must not begin with '-'`);
   }
@@ -369,15 +550,6 @@ function isQueryablePath(value: string): boolean {
     return true;
   } catch {
     return false;
-  }
-}
-
-function assertRoot(label: string, value: string): void {
-  if (value.length === 0) {
-    throw new Error(`${label} must not be empty`);
-  }
-  if (value.includes('\0')) {
-    throw new Error(`${label} must not contain a NUL byte`);
   }
 }
 
@@ -470,9 +642,9 @@ function parseStringArray(value: unknown): string[] | null {
   return [...(value as string[])];
 }
 
-/** Parses `callers -j` (`{ symbol, callers: [...] }`). Unknown symbols yield `not-found`,
- *  not `malformed`. */
-export function parseCallersJson(output: string): RefsParse {
+/** Shared shape of `callers -j` and `impact -j`: a JSON object whose `key` holds the refs.
+ *  Unknown symbols yield `not-found`, not `malformed`. */
+function parseRefsJson(output: string, key: 'callers' | 'affected'): RefsParse {
   if (SYMBOL_NOT_FOUND_RE.test(output)) return { status: 'not-found' };
   let parsed: unknown;
   try {
@@ -481,24 +653,20 @@ export function parseCallersJson(output: string): RefsParse {
     return { status: 'malformed' };
   }
   if (!isRecord(parsed)) return { status: 'malformed' };
-  const refs = parseRefArray(parsed.callers);
+  const refs = parseRefArray(parsed[key]);
   if (refs === null) return { status: 'malformed' };
   return { status: 'ok', refs };
 }
 
+/** Parses `callers -j` (`{ symbol, callers: [...] }`). Unknown symbols yield `not-found`,
+ *  not `malformed`. */
+export function parseCallersJson(output: string): RefsParse {
+  return parseRefsJson(output, 'callers');
+}
+
 /** Parses `impact -j` (`{ symbol, depth, ..., affected: [...] }`). */
 export function parseImpactJson(output: string): RefsParse {
-  if (SYMBOL_NOT_FOUND_RE.test(output)) return { status: 'not-found' };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(output);
-  } catch {
-    return { status: 'malformed' };
-  }
-  if (!isRecord(parsed)) return { status: 'malformed' };
-  const refs = parseRefArray(parsed.affected);
-  if (refs === null) return { status: 'malformed' };
-  return { status: 'ok', refs };
+  return parseRefsJson(output, 'affected');
 }
 
 /** Parses `affected -j` (`{ changedFiles: [...], affectedTests: [...] }`). Unknown files
@@ -1122,15 +1290,8 @@ export async function computeBlastRadius(
  *  it does not — no throw, no partial trust beyond the one line pattern. */
 function tryParseDependents(output: string): string[] {
   for (const rawLine of output.split('\n')) {
-    const usedBy = USED_BY_RE.exec(rawLine.trim());
-    if (usedBy) {
-      const deps: string[] = [];
-      for (const dep of (usedBy[1] as string).split(',')) {
-        const trimmed = dep.trim();
-        if (trimmed.length > 0) deps.push(trimmed);
-      }
-      return [...new Set(deps)].sort(compareStr);
-    }
+    const deps = parseUsedBy(rawLine.trim());
+    if (deps !== null) return [...new Set(deps)].sort(compareStr);
   }
   return [];
 }
