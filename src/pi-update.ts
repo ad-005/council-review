@@ -19,9 +19,8 @@
  * offline. Otherwise the host binary is resolved exactly as everywhere else in this
  * package: `$COUNCIL_PI_BIN` when set, else `pi` on `PATH`.
  */
-import { spawn } from 'node:child_process';
-
 import { resolveHostBin } from './reviewer-spawn.js';
+import { runCommand } from './run-command.js';
 
 /** Set to `'1'` to skip the start-of-run Pi self-update check entirely. */
 export const PI_UPDATE_OPTOUT_VAR = 'COUNCIL_NO_PI_UPDATE';
@@ -74,6 +73,32 @@ export interface PiUpdateOptions {
   /** Per-call timeout overrides, principally a test seam. */
   versionTimeoutMs?: number;
   updateTimeoutMs?: number;
+  /** SIGTERM-to-SIGKILL escalation grace on a timeout; a test seam (see `run-command.ts`). */
+  killGraceMs?: number;
+}
+
+type CommandOutcome =
+  { ok: true; stdout: string } | { ok: false; reason: 'spawn-failed' | 'timeout' | 'exit-nonzero' };
+
+/**
+ * Runs one host command to completion via the shared bounded runner, reducing its outcome to
+ * this module's vocabulary. Stderr is ignored: version output lives on stdout, and update
+ * chatter is human-readable prose with no stable shape worth parsing. A timed-out command has
+ * been killed (SIGTERM, then SIGKILL) and has closed before this resolves, so a hung
+ * `pi update --self` is never still running when the caller goes on to launch reviewers.
+ */
+async function runPiCommand(
+  bin: string,
+  args: readonly string[],
+  timeoutMs: number,
+  killGraceMs: number | undefined,
+): Promise<CommandOutcome> {
+  const outcome = await runCommand(bin, args, { timeoutMs, killGraceMs });
+  if (outcome.kind === 'spawn-failed') return { ok: false, reason: 'spawn-failed' };
+  if (outcome.kind === 'timeout') return { ok: false, reason: 'timeout' };
+  return outcome.code === 0
+    ? { ok: true, stdout: outcome.stdout }
+    : { ok: false, reason: 'exit-nonzero' };
 }
 
 /**
@@ -89,59 +114,6 @@ export function parsePiVersion(output: string): string | null {
     if (match) return match[1]!;
   }
   return null;
-}
-
-type CommandOutcome =
-  { ok: true; stdout: string } | { ok: false; reason: 'spawn-failed' | 'timeout' | 'exit-nonzero' };
-
-/**
- * Runs one host command to completion, capturing stdout. Stderr is discarded: version
- * output lives on stdout, and update chatter is human-readable prose with no stable shape
- * worth parsing. Never rejects -- spawn failure, timeout, and non-zero exit all resolve
- * to a reasoned `ok: false`.
- */
-function runCommand(
-  bin: string,
-  args: readonly string[],
-  timeoutMs: number,
-): Promise<CommandOutcome> {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(bin, [...args], { stdio: ['ignore', 'pipe', 'ignore'] });
-    } catch {
-      resolve({ ok: false, reason: 'spawn-failed' });
-      return;
-    }
-
-    let stdout = '';
-    let settled = false;
-    const settle = (outcome: CommandOutcome): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(outcome);
-    };
-
-    const timer = setTimeout(() => {
-      child.kill();
-      settle({ ok: false, reason: 'timeout' });
-    }, timeoutMs);
-    // A runaway timer must never hold the CLI process open on its own.
-    timer.unref?.();
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-
-    child.on('error', () => {
-      settle({ ok: false, reason: 'spawn-failed' });
-    });
-
-    child.on('close', (code) => {
-      settle(code === 0 ? { ok: true, stdout } : { ok: false, reason: 'exit-nonzero' });
-    });
-  });
 }
 
 /**
@@ -170,7 +142,7 @@ async function ensurePiCurrentInner(opts: PiUpdateOptions): Promise<PiUpdateResu
   const versionTimeoutMs = opts.versionTimeoutMs ?? PI_VERSION_TIMEOUT_MS;
   const updateTimeoutMs = opts.updateTimeoutMs ?? PI_UPDATE_TIMEOUT_MS;
 
-  const pre = await runCommand(bin, PI_VERSION_ARGS, versionTimeoutMs);
+  const pre = await runPiCommand(bin, PI_VERSION_ARGS, versionTimeoutMs, opts.killGraceMs);
   if (!pre.ok) {
     const reason =
       pre.reason === 'timeout'
@@ -193,7 +165,7 @@ async function ensurePiCurrentInner(opts: PiUpdateOptions): Promise<PiUpdateResu
     };
   }
 
-  const update = await runCommand(bin, PI_SELF_UPDATE_ARGS, updateTimeoutMs);
+  const update = await runPiCommand(bin, PI_SELF_UPDATE_ARGS, updateTimeoutMs, opts.killGraceMs);
   if (!update.ok) {
     const reason =
       update.reason === 'timeout'
@@ -204,7 +176,7 @@ async function ensurePiCurrentInner(opts: PiUpdateOptions): Promise<PiUpdateResu
     return { status: 'failed', previousVersion, currentVersion: previousVersion, reason };
   }
 
-  const post = await runCommand(bin, PI_VERSION_ARGS, versionTimeoutMs);
+  const post = await runPiCommand(bin, PI_VERSION_ARGS, versionTimeoutMs, opts.killGraceMs);
   if (!post.ok) {
     return {
       status: 'failed',

@@ -204,11 +204,22 @@ Vendor is derived in this order:
 1. `provider/model` exact match in config `vendorOverrides`.
 2. For gateway providers whose ids are `vendor/model` (OpenRouter), the leading
    segment, after stripping a `~` prefix.
-3. A shipped prefix table for flat-id gateways (`kimi-*` → moonshot,
-   `glm-*` → z-ai, `deepseek-*` → deepseek, `qwen*` → alibaba,
-   `grok-*` → x-ai, `gpt-*` → openai, `minimax-*` → minimax, and so on).
+3. A shipped prefix table for flat-id gateways, matched case-insensitively,
+   longest prefix first (`kimi-*` → moonshot, `glm-*` → zhipu,
+   `deepseek-*` → deepseek, `qwen*` → qwen, `grok-*` → xai,
+   `gpt-*`/`o1`/`o3`/`o4`/`chatgpt-*` → openai, `minimax-*` → minimax,
+   `gemma*` → google, `mixtral*`/`codestral*`/`devstral*` → mistral, and so on).
 4. Otherwise `unknown`, which counts as its own distinct vendor and is flagged
    in the picker and the manifest.
+
+The guard counts distinct vendor *strings*, so every name from steps 1 and 2 is
+canonicalized to the spelling the prefix table uses: lowercased, then folded
+through a shipped alias map of gateway organisation slugs — `x-ai` → xai,
+`z-ai`/`zai`/`zai-org`/`zhipuai`/`thudm` → zhipu, `meta-llama` → meta,
+`mistralai` → mistral, `moonshotai` → moonshot, `deepseek-ai` → deepseek,
+`alibaba` → qwen, `minimaxai` → minimax. So `openrouter/x-ai/grok-4` and
+`opencode-go/grok-4.6` are one vendor, `xai`; an unaliased leading segment
+(`aion-labs`) stands as its own lowercased vendor.
 
 ### Vendor-independence guard
 
