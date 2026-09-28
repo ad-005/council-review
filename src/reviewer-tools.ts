@@ -400,6 +400,8 @@ export interface GrepOutcome {
   truncated: boolean;
   /** The search root holds more than MAX_GREP_FILES_SCANNED files; only the first were searched. */
   fileLimitReached: boolean;
+  /** The search hit its time limit after finding `matches`; the rest of the tree is unsearched. */
+  timedOut: boolean;
 }
 
 /** Collects up to `limit` real (non-symlink) files under `startAbs`. Symlinks -- whether the entry
@@ -493,19 +495,29 @@ export function grepInRoot(
     }
   };
 
+  let timedOut = false;
   try {
     runInContext('scan()', createContext({ scan }), { timeout: timeoutMs });
   } catch (err) {
-    if (errorCode(err) === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+    // Matches found before the deadline are still real: return them, marked partial. Only a
+    // search that found nothing at all reports the time limit as an error.
+    if (errorCode(err) !== 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw err;
+    if (matches.length === 0) {
       throw new Error(
         `council_grep stopped after ${timeoutMs}ms: the pattern is too expensive to evaluate (avoid nested quantifiers such as (a+)+) or the search is too broad; simplify the pattern or narrow path`,
         { cause: err },
       );
     }
-    throw err;
+    timedOut = true;
   }
 
-  return { matches, filesScanned: files.length, truncated, fileLimitReached: limitReached };
+  return {
+    matches,
+    filesScanned: files.length,
+    truncated,
+    fileLimitReached: limitReached,
+    timedOut,
+  };
 }
 
 const grepParameters = {
@@ -544,6 +556,11 @@ export const councilGrepTool: ReviewerToolDefinition = {
         ? ['no matches']
         : outcome.matches.map((m) => `${m.path}:${m.line}: ${m.text}`);
     if (outcome.truncated) lines.push('[results truncated]');
+    if (outcome.timedOut) {
+      lines.push(
+        '[search stopped at its time limit: results are partial; simplify the pattern or narrow path]',
+      );
+    }
     if (outcome.fileLimitReached) {
       lines.push(
         `[file limit reached: only the first ${outcome.filesScanned} files were searched; narrow path]`,
@@ -561,6 +578,7 @@ export const councilGrepTool: ReviewerToolDefinition = {
         filesScanned: outcome.filesScanned,
         truncated: outcome.truncated,
         fileLimitReached: outcome.fileLimitReached,
+        timedOut: outcome.timedOut,
       },
     };
   },
@@ -757,7 +775,24 @@ function assertRepoRelativePath(value: string): void {
 /** Pseudo-refs other than HEAD (case-insensitively, for case-insensitive filesystems). Each can
  *  name a commit no branch reaches: ORIG_HEAD after a `reset` that discarded an accidental commit,
  *  MERGE_AUTOSTASH a stash, AUTO_MERGE a tree of conflicted working-tree state. */
-const PSEUDO_REF = /^(?:[a-z_]+_head|auto_merge|merge_autostash)$/i;
+// git's pseudo-refs other than HEAD, matched on a ref name's last segment so a per-worktree
+// spelling (`main-worktree/ORIG_HEAD`, `worktrees/<id>/ORIG_HEAD`) is caught too. An explicit
+// list rather than a `*_HEAD` pattern: branches such as `fix_head` are legitimate history.
+const PSEUDO_REFS: ReadonlySet<string> = new Set([
+  'ORIG_HEAD',
+  'FETCH_HEAD',
+  'MERGE_HEAD',
+  'CHERRY_PICK_HEAD',
+  'REVERT_HEAD',
+  'BISECT_HEAD',
+  'REBASE_HEAD',
+  'AUTO_MERGE',
+  'MERGE_AUTOSTASH',
+]);
+
+// `@{u}` / `@{upstream}` / `@{push}` name a branch's configured remote-tracking branch, not a
+// reflog entry, so they are the one `@{...}` form a revision may keep.
+const TRACKING_SUFFIX = /@\{(?:u|upstream|push)\}/gi;
 
 /**
  * A revision may name only history a branch, tag, remote or HEAD reaches. Rejected, because each
@@ -768,7 +803,7 @@ const PSEUDO_REF = /^(?:[a-z_]+_head|auto_merge|merge_autostash)$/i;
  *  - reflog syntax (`@{`): `stash@{n}`, and `HEAD@{n}` reaching commits a `reset` discarded;
  *  - `:/<text>`: finds the youngest commit whose message matches, searched from *every* ref,
  *    `refs/stash` included (`:/untracked files on` is the stash's untracked-files commit);
- *  - pseudo-refs other than HEAD (see PSEUDO_REF).
+ *  - pseudo-refs other than HEAD (see PSEUDO_REFS).
  * Every endpoint of a `A..B`/`A...B` range and a `^A` exclusion is checked; the ref name is the
  * part before any `~`, `^` or `:` suffix. What stays reachable: a commit id, HEAD/`@`, branches,
  * tags, remote branches, ranges, and `^{/text}` (which searches only the given commit's
@@ -776,7 +811,7 @@ const PSEUDO_REF = /^(?:[a-z_]+_head|auto_merge|merge_autostash)$/i;
  * returns lists one once the names above are refused.
  */
 function assertRevisionAllowed(revision: string): void {
-  if (revision.includes('@{')) {
+  if (revision.replace(TRACKING_SUFFIX, '').includes('@{')) {
     throw new Error('revision must not use reflog syntax (@{...})');
   }
   if (revision.includes(':/')) {
@@ -784,11 +819,11 @@ function assertRevisionAllowed(revision: string): void {
   }
   for (const endpoint of revision.split(/\.\.\.?/)) {
     const name = endpoint.replace(/^\^+/, '').split(/[~^:]/, 1)[0] as string;
-    const lower = name.toLowerCase();
-    if (lower === 'stash' || lower === 'refs/stash') {
+    const lower = name.replace(TRACKING_SUFFIX, '').toLowerCase();
+    if (lower === 'stash' || lower === 'refs/stash' || lower.endsWith('/refs/stash')) {
       throw new Error('revision must not reference the stash');
     }
-    if (PSEUDO_REF.test(name)) {
+    if (PSEUDO_REFS.has((lower.split('/').pop() as string).toUpperCase())) {
       throw new Error(`revision must not reference the pseudo-ref ${name}`);
     }
   }

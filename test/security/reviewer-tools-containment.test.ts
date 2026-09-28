@@ -356,6 +356,14 @@ describe('snapshot tools: line numbering, bounded work and bounded output', () =
     expect(grepInRoot(root, { pattern: 'a!' }).matches).toHaveLength(1);
   });
 
+  it('returns the matches found before the deadline, marked partial', () => {
+    writeFileSync(join(root, 'a-first.txt'), 'needle\n');
+    writeFileSync(join(root, 'b-redos.txt'), `${'a'.repeat(35)}!\n`);
+    const outcome = grepInRoot(root, { pattern: 'needle|^(a+)+$' }, { timeoutMs: 200 });
+    expect(outcome.timedOut).toBe(true);
+    expect(outcome.matches).toEqual([{ path: 'a-first.txt', line: 1, text: 'needle' }]);
+  });
+
   it('marks a search that hit the file limit instead of silently reporting no matches', async () => {
     mkdirSync(join(root, 'many'));
     for (let i = 0; i < 5001; i++) {

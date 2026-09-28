@@ -324,6 +324,16 @@ describe('inside a herdr environment: splitPaneAndRun', () => {
     expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('SIGTERM'))).toBe(true);
   });
 
+  it('treats a pane run that times out as delegated, so the review is never run twice', () => {
+    process.env.HERDR_STUB_HANG = 'pane,run';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = splitPaneAndRun(['node', 'cli.js', 'review']);
+
+    expect(result).toEqual({ attempted: true, delegated: true });
+    expect(errorSpy.mock.calls.some(([msg]) => String(msg).includes('--no-pane'))).toBe(true);
+  }, 20_000);
+
   it('bounds a herdr call that never answers, instead of blocking forever', () => {
     process.env.HERDR_STUB_HANG = 'pane,split';
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});

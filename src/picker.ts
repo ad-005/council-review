@@ -88,14 +88,16 @@ function isCancellation(err: unknown): boolean {
 /**
  * The real-terminal IO: stdin plus `output` (stdout by default). A caller whose stdout is
  * reserved for machine-readable output (`--json`) passes `process.stderr` so the prompts render
- * there instead. Interactive only when BOTH ends are terminals — drawing prompts into a pipe or
- * file is as unusable as reading answers from one.
+ * there instead. When `output` is redirected (`init > log`, `| tee log`) but stderr is still the
+ * terminal, the prompts render on stderr, where the user can see them. Interactive only when
+ * stdin and the chosen output are both terminals.
  */
 export function defaultPickerIO(output: NodeJS.WriteStream = process.stdout): PickerIO {
+  const visible = output.isTTY === true || process.stderr.isTTY !== true ? output : process.stderr;
   return {
     input: process.stdin,
-    output,
-    isTTY: process.stdin.isTTY === true && output.isTTY === true,
+    output: visible,
+    isTTY: process.stdin.isTTY === true && visible.isTTY === true,
   };
 }
 

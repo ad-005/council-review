@@ -45,6 +45,8 @@ interface HerdrCallResult {
   ok: boolean;
   stdout: string;
   message?: string;
+  /** Killed at `HERDR_COMMAND_TIMEOUT_MS`: whether the command took effect is unknown. */
+  timedOut?: boolean;
 }
 
 /**
@@ -68,7 +70,8 @@ function runHerdrSync(args: readonly string[]): HerdrCallResult {
     return { ok: false, stdout: '', message: (err as Error).message };
   }
   if (result.error) {
-    return { ok: false, stdout: '', message: result.error.message };
+    const timedOut = (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+    return { ok: false, stdout: '', message: result.error.message, timedOut };
   }
   if (result.signal !== null) {
     // Killed (by the timeout above or by anything else): its output, if any, is incomplete.
@@ -154,6 +157,15 @@ export function splitPaneAndRun(
   // `env COUNCIL_HERDR_DELEGATED=1 <argv...>` guarantees the delegated process sees the marker
   // regardless of whether herdr's own environment propagation persists across `pane run` calls.
   const run = runHerdrSync(['pane', 'run', paneId, 'env', `${DELEGATED_MARKER}=1`, ...argv]);
+  if (!run.ok && run.timedOut) {
+    // herdr may already have started the review in that pane; running it here as well could
+    // bill the whole panel twice. Treat it as delegated and say where to look.
+    warn(
+      `herdr did not confirm the review started in pane ${paneId} within ` +
+        `${HERDR_COMMAND_TIMEOUT_MS}ms; check that pane (rerun with --no-pane if it is empty)`,
+    );
+    return { attempted: true, delegated: true };
+  }
   if (!run.ok) {
     warn(
       `could not run the review in the split pane ${paneId} (running it here instead; ` +

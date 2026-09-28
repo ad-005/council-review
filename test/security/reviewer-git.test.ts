@@ -240,8 +240,8 @@ describe('revisions that reach the stash, reflogs or pseudo-refs are refused', (
     'main...refs/stash',
     '^stash',
     'HEAD@{1}',
-    '@{u}',
     '@{-1}',
+    'main@{u}@{1}',
     ':/untracked files on',
     'HEAD..:/wip',
     'ORIG_HEAD',
@@ -251,6 +251,9 @@ describe('revisions that reach the stash, reflogs or pseudo-refs are refused', (
     'CHERRY_PICK_HEAD',
     'AUTO_MERGE',
     'MERGE_AUTOSTASH^3',
+    'main-worktree/ORIG_HEAD',
+    'worktrees/wt1/ORIG_HEAD:.env',
+    'main-worktree/refs/stash^3:.env',
   ];
   for (const revision of refused) {
     it(`rejects revision "${revision}"`, () => {
@@ -278,6 +281,11 @@ describe('revisions that reach the stash, reflogs or pseudo-refs are refused', (
     'HEAD^{/fix bug}',
     'HEAD:src/foo.ts',
     'HEAD^!',
+    '@{u}',
+    'main@{upstream}',
+    'HEAD@{push}..HEAD',
+    'fix_head',
+    'feature/my_head',
   ];
   for (const revision of accepted) {
     it(`accepts legitimate revision "${revision}"`, () => {

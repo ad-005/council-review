@@ -623,6 +623,19 @@ describe('defaultPickerIO', () => {
     expect(withStdinTTY(true, () => defaultPickerIO(fakeOutput(false)).isTTY)).toBe(false);
     expect(withStdinTTY(undefined, () => defaultPickerIO(fakeOutput(true)).isTTY)).toBe(false);
   });
+
+  it('renders on stderr when the given output is redirected but stderr is a terminal', () => {
+    const saved = Object.getOwnPropertyDescriptor(process.stderr, 'isTTY');
+    Object.defineProperty(process.stderr, 'isTTY', { value: true, configurable: true });
+    try {
+      const io = withStdinTTY(true, () => defaultPickerIO(fakeOutput(false)));
+      expect(io.output).toBe(process.stderr);
+      expect(io.isTTY).toBe(true);
+    } finally {
+      if (saved) Object.defineProperty(process.stderr, 'isTTY', saved);
+      else delete (process.stderr as { isTTY?: boolean }).isTTY;
+    }
+  });
 });
 
 describe('buildThinkingChoices — back choice', () => {

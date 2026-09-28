@@ -85,12 +85,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leading context starts in, and parses unquoted paths with spaces, C-quoted paths, and
   rename/copy headers correctly.
 - `council_grep` evaluates patterns under a time limit, so a catastrophic regex can no longer
-  hang a reviewer; line numbers in `council_read`/`council_grep` now match git's.
+  hang a reviewer (matches found before the limit are returned, marked partial); line numbers in `council_read`/`council_grep` now match git's.
 - `--pane` falls back to a local run when herdr cannot split or run the pane, instead of exiting
   0 with nothing reviewed; the delegated run no longer re-opens `--pick`, and the user's own
   pane is no longer retitled. herdr commands time out, and `--handoff` no longer holds the CLI
   open until the agent finishes.
-- `--pick --json` renders the picker on stderr; the picker exits 2 with a clear message when no
+- `--pick --json`, and a picker whose stdout is redirected, render the prompts on stderr; the picker exits 2 with a clear message when no
   provider is ready, instead of an internal error.
 - A `null` entry in the model catalog is skipped instead of crashing the run; provider auth
   checks run at most four at a time.

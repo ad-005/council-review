@@ -315,6 +315,19 @@ describe('markUnverifiable', () => {
     expect(marked[0]?.file).toBe('./src/foo.ts');
   });
 
+  it('keeps surrounding spaces and backslashes, which a real file name can contain', () => {
+    const marked = markUnverifiable(
+      [
+        { ...VALID_FINDING, file: ' lead.txt' },
+        { ...VALID_FINDING, file: 'lead.txt' },
+        { ...VALID_FINDING, file: 'a\\b.ts' },
+        { ...VALID_FINDING, file: 'a/b.ts' },
+      ],
+      [' lead.txt', 'a\\b.ts'],
+    );
+    expect(marked.map((f) => f.unverifiable)).toEqual([false, true, false, true]);
+  });
+
   it('does not mutate the input findings array', () => {
     const original: RawFinding = { ...VALID_FINDING };
     const frozen = Object.freeze({ ...original });

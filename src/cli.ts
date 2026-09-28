@@ -760,16 +760,23 @@ async function cmdReview(args: readonly string[], pickerIO: PickerIO | undefined
   }
 
   if (values.pane && !values['no-pane']) {
-    // `--pick` is dropped from the delegated argv: this process has already run the picker and
-    // saved the panel, so the child must not prompt a second time. Located by token, so a
-    // `--pick` that is another flag's value is kept.
-    const pickArgIndices = new Set(
-      tokens.filter((t) => t.kind === 'option' && t.name === 'pick').map((t) => t.index),
-    );
+    // After `--pick`, this process has already run the picker and saved the panel with the
+    // levels chosen there. The child reads that saved panel, so it gets neither `--pick` (it
+    // would prompt a second time) nor `--thinking` (which the picker ignores, but which would
+    // override every saved per-model level in the child). Located by token, so the same text
+    // as another flag's value is kept.
+    const dropped = new Set<number>();
+    if (values.pick) {
+      for (const t of tokens) {
+        if (t.kind !== 'option' || (t.name !== 'pick' && t.name !== 'thinking')) continue;
+        dropped.add(t.index);
+        if (t.name === 'thinking' && !t.inlineValue) dropped.add(t.index + 1);
+      }
+    }
     const delegateArgv = [
       process.argv[0]!,
       process.argv[1]!,
-      ...args.filter((_, i) => !pickArgIndices.has(i)),
+      ...args.filter((_, i) => !dropped.has(i)),
     ];
     const { delegated } = splitPaneAndRun(delegateArgv, direction);
     if (delegated) {

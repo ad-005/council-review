@@ -1355,6 +1355,66 @@ describe('review-time panel flags: --pick vs --models', () => {
     expect(cfg.panel.some((p) => p.provider === 'old-provider')).toBe(false);
   });
 
+  it('--pick --pane delegates without --pick or --thinking, so the child uses the saved picks', async () => {
+    writeMinimalPickerCatalog();
+    useFixtures({ defaultFixture: 'unparseable-lines' });
+    writeConfigFile({ failOn: 'none' });
+    makeWorkingChange();
+
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'council-herdr-stub-'));
+    const log = path.join(binDir, 'calls.log');
+    const herdrStub = path.join(binDir, 'herdr');
+    fs.writeFileSync(
+      herdrStub,
+      [
+        '#!/usr/bin/env node',
+        `require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+        "if (process.argv[2] === 'pane' && process.argv[3] === 'split') {",
+        "  process.stdout.write(JSON.stringify({ result: { pane: { pane_id: 'p1' } } }));",
+        '}',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const saved = { HERDR_ENV: process.env.HERDR_ENV, bin: process.env.COUNCIL_HERDR_BIN };
+    process.env.HERDR_ENV = '1';
+    process.env.COUNCIL_HERDR_BIN = herdrStub;
+
+    const term = new ScriptedTerminal();
+    const stdout = captureStream(process.stdout);
+    const stderr = captureStream(process.stderr);
+    let code: number;
+    let runArgs: string[] | undefined;
+    try {
+      const runPromise = runCli(['--pick', '--thinking', 'low', '--pane', '--fail-on', 'none'], {
+        pickerIO: term.io,
+      });
+      await driveFullPickerSelection(term);
+      code = await runPromise;
+      runArgs = fs
+        .readFileSync(log, 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as string[])
+        .find((a) => a[0] === 'pane' && a[1] === 'run');
+    } finally {
+      stdout.restore();
+      stderr.restore();
+      if (saved.HERDR_ENV === undefined) delete process.env.HERDR_ENV;
+      else process.env.HERDR_ENV = saved.HERDR_ENV;
+      if (saved.bin === undefined) delete process.env.COUNCIL_HERDR_BIN;
+      else process.env.COUNCIL_HERDR_BIN = saved.bin;
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain('delegated');
+    expect(runArgs).toBeDefined();
+    expect(runArgs).not.toContain('--pick');
+    expect(runArgs).not.toContain('--thinking');
+    expect(runArgs).not.toContain('low');
+    expect(runArgs!.slice(-3)).toEqual(['--pane', '--fail-on', 'none']);
+  });
+
   it('--models leaves an existing saved panel byte-for-byte untouched', async () => {
     useFixtures({ defaultFixture: 'unparseable-lines' });
     writeConfigFile(); // the real, resolvable PANEL from the shared catalog

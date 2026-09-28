@@ -391,13 +391,14 @@ Rules for this block:
 /**
  * The one normalisation applied to a finding's `file` wherever it is compared: snapshot
  * verification (`markUnverifiable`), clustering, the fingerprint, and the path a merged finding
- * carries. Surrounding whitespace is trimmed, backslashes fold to forward slashes, `.` segments
- * (a leading `./`, an inner `/./`) and repeated slashes collapse, and a trailing slash is
- * dropped — spelling variations of one repository-relative path. Case is deliberately
- * preserved: `src/Foo.ts` and `src/foo.ts` are distinct files in a git tree.
+ * carries. `.` segments (a leading `./`, an inner `/./`) and repeated slashes collapse, and a
+ * trailing slash is dropped: spellings no real file name can have, so they only ever vary one
+ * repository-relative path. Everything a git path can legitimately contain is kept as is --
+ * case (`src/Foo.ts` and `src/foo.ts` are distinct files), surrounding spaces and backslashes
+ * (both valid in a file name on a POSIX filesystem).
  */
 export function normaliseFindingPath(file: string): string {
-  let p = file.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+  let p = file.replace(/\/+/g, '/');
   while (p.includes('/./')) p = p.replace('/./', '/');
   while (p.startsWith('./')) p = p.slice(2);
   return p.replace(/\/$/, '');

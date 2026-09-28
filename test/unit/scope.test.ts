@@ -668,6 +668,22 @@ describe('scope', () => {
       expect(dirtyScope.dirty).toBe(true);
     });
 
+    it('ignores pathspec-mode variables in the environment', async () => {
+      repo.writeAndCommit('base.txt', 'base\n', 'base commit');
+      repo.writeFile('base.txt', 'changed\n');
+
+      for (const name of ['GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS']) {
+        process.env[name] = '1';
+        try {
+          const scope = await resolveScope(repo.root, {}, { baseBranch: 'main' });
+          expect(scope.dirty).toBe(true);
+          expect(scope.files).toEqual(['base.txt']);
+        } finally {
+          delete process.env[name];
+        }
+      }
+    });
+
     it('still reviews changes to .council/config.json and .council/ignore.json', async () => {
       // Only the run-artifact directory is excluded -- config.json and ignore.json are meant to
       // be committed, and a reviewer should still see a change to them like any other file.

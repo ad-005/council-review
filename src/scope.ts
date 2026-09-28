@@ -553,6 +553,22 @@ function chompLine(s: string): string {
   return s.endsWith('\n') ? s.slice(0, -1) : s;
 }
 
+/** Global pathspec modes a user can set in the environment. Each changes how every pathspec
+ *  below is read (`GIT_LITERAL_PATHSPECS` defeats the dirty check's exclude magic; the others
+ *  are rejected outright alongside `--literal-pathspecs`), so none reaches a git call here. */
+const PATHSPEC_ENV_VARS = [
+  'GIT_LITERAL_PATHSPECS',
+  'GIT_GLOB_PATHSPECS',
+  'GIT_NOGLOB_PATHSPECS',
+  'GIT_ICASE_PATHSPECS',
+] as const;
+
+function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...base };
+  for (const name of PATHSPEC_ENV_VARS) delete env[name];
+  return env;
+}
+
 async function runGit(
   args: readonly string[],
   opts: { cwd: string; env?: NodeJS.ProcessEnv; input?: string },
@@ -560,7 +576,7 @@ async function runGit(
   try {
     const pending = execFileAsync('git', [...GIT_GLOBAL_ARGS, ...args], {
       cwd: opts.cwd,
-      env: opts.env,
+      env: gitEnv(opts.env),
       maxBuffer: CHILD_MAX_BUFFER,
     });
     // stdin is always closed, so no git command can ever wait on it. A write error (git exited
