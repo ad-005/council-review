@@ -11,6 +11,7 @@ import {
   THINKING_BACK_VALUE,
   buildModelRows,
   buildThinkingChoices,
+  filterModels,
   groupModelsByProvider,
   modelGroupMessage,
   pickPanel,
@@ -181,6 +182,9 @@ describe('pickPanel — full staged selection', () => {
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER); // select the only provider
 
+    await term.waitFor('Filter minimax models');
+    term.send(ENTER); // empty filter shows all
+
     await term.waitFor('Select models');
     term.send(SPACE + ENTER); // select the only model
 
@@ -215,6 +219,9 @@ describe('pickPanel — full staged selection', () => {
 
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER); // one provider, opencode-go
+
+    await term.waitFor('Filter opencode-go models');
+    term.send(ENTER); // empty filter shows all
 
     await term.waitFor('Select models');
     term.send(SPACE + DOWN + SPACE + ENTER); // select both KIMI and GLM
@@ -252,6 +259,9 @@ describe('pickPanel — full staged selection', () => {
     // Providers render in catalog order: minimax, opencode-go. Select only minimax.
     term.send(SPACE + ENTER);
 
+    await term.waitFor('Filter minimax models');
+    term.send(ENTER); // empty filter shows all
+
     await term.waitFor('Select models');
     expect(term.buffer).toContain('MiniMax-M2.7');
     expect(term.buffer).not.toContain('kimi-k2.6');
@@ -280,6 +290,9 @@ describe('pickPanel — terminal width', () => {
 
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER); // select the only provider
+
+    await term.waitFor('Filter opencode models');
+    term.send(ENTER); // empty filter shows all
 
     await term.waitFor('Select models');
     // At the buggy 80-column fallback, inquirer hard-wraps mid-token and this id is split across
@@ -410,6 +423,9 @@ describe('pickPanel — model stage rendering', () => {
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER); // one provider, opencode-go
 
+    await term.waitFor('Filter opencode-go models');
+    term.send(ENTER); // empty filter shows all
+
     // The group header is the prompt message itself, so it can never scroll away with the rows.
     await term.waitFor('Select models for the panel — opencode-go (2 models):');
     expect(term.buffer).toContain('☐');
@@ -440,9 +456,13 @@ describe('pickPanel — model stage rendering', () => {
     // Providers render in catalog order: minimax, opencode-go. Select both.
     term.send(SPACE + DOWN + SPACE + ENTER);
 
+    await term.waitFor('Filter minimax models');
+    term.send(ENTER); // empty filter shows all
     await term.waitFor('Select models for the panel — minimax (1 model):');
     term.send(SPACE + ENTER); // take MiniMax-M2.7; minimax group done
 
+    await term.waitFor('Filter opencode-go models');
+    term.send(ENTER); // empty filter shows all
     await term.waitFor('Select models for the panel — opencode-go (1 model):');
     term.send(SPACE + ENTER); // take kimi-k2.6; KIMI skips thinking, MINIMAX prompts next
 
@@ -469,10 +489,17 @@ describe('pickPanel — model stage rendering', () => {
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER);
 
+    await term.waitFor('Filter minimax models');
+    term.send(ENTER); // empty filter shows all
     await term.waitFor('Select models for the panel — minimax (1 model):');
     term.send(ENTER); // confirm with nothing selected
 
     await term.waitFor('Select at least one model for the panel.');
+    // The stage re-run re-prompts the filter first; the clear makes the header wait below
+    // match only the second pass's fresh checkbox render.
+    term.buffer = '';
+    term.send(ENTER); // empty filter shows all
+    await term.waitFor('Select models for the panel — minimax (1 model):');
     term.send(SPACE + ENTER); // select the model on the second pass
 
     await term.waitFor('Thinking level for minimax/MiniMax-M2.7');
@@ -497,6 +524,9 @@ describe('pickPanel — model stage rendering', () => {
 
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER); // one provider, opencode-go
+
+    await term.waitFor('Filter opencode-go models');
+    term.send(ENTER); // empty filter shows all
 
     await term.waitFor('Select models for the panel — opencode-go (3 models):');
     // Four downs from the first row wraps past the end back onto the second row.
@@ -540,7 +570,7 @@ describe('pickPanel — interruption', () => {
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER);
 
-    await term.waitFor('Select models');
+    await term.waitFor('Filter minimax models');
     term.send(CTRL_C);
 
     try {
@@ -564,6 +594,8 @@ describe('pickPanel — interruption', () => {
 
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER);
+    await term.waitFor('Filter minimax models');
+    term.send(ENTER); // empty filter shows all
     await term.waitFor('Select models');
     term.send(SPACE + ENTER);
     await term.waitFor('Thinking level for minimax/MiniMax-M2.7');
@@ -686,6 +718,9 @@ describe('pickPanel — thinking back navigation', () => {
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER);
 
+    await term.waitFor('Filter test-gw models');
+    term.send(ENTER); // empty filter shows all
+
     await term.waitFor('Select models');
     term.send(SPACE + ENTER);
 
@@ -710,6 +745,9 @@ describe('pickPanel — thinking back navigation', () => {
 
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER);
+
+    await term.waitFor('Filter test-gw models');
+    term.send(ENTER); // empty filter shows all
 
     await term.waitFor('Select models');
     term.send(SPACE + DOWN + SPACE + ENTER); // select both models
@@ -754,6 +792,9 @@ describe('pickPanel — thinking back navigation', () => {
     await term.waitFor('Select providers');
     term.send(SPACE + ENTER);
 
+    await term.waitFor('Filter test-gw models');
+    term.send(ENTER); // empty filter shows all
+
     await term.waitFor('Select models');
     term.send(SPACE + DOWN + SPACE + DOWN + SPACE + ENTER); // select all three
 
@@ -785,5 +826,97 @@ describe('pickPanel — thinking back navigation', () => {
     });
     // Backtracking passed over model-plain a second time without re-announcing it.
     expect(term.buffer).not.toContain(announcement);
+  }, 10_000);
+});
+
+describe('filterModels — case-insensitive substring filtering', () => {
+  it('returns all models for an empty term', () => {
+    expect(filterModels([MINIMAX, KIMI, GLM], '')).toEqual([MINIMAX, KIMI, GLM]);
+  });
+
+  it('returns all models for a whitespace-only term', () => {
+    expect(filterModels([MINIMAX, KIMI], '   ')).toEqual([MINIMAX, KIMI]);
+  });
+
+  it('matches case-insensitively over the provider/id identity', () => {
+    expect(filterModels([MINIMAX, KIMI, GLM], 'MINIMAX')).toEqual([MINIMAX]);
+    expect(filterModels([MINIMAX, KIMI, GLM], 'k2.6')).toEqual([KIMI]);
+    expect(filterModels([MINIMAX, KIMI, GLM], 'opencode-go/')).toEqual([KIMI, GLM]);
+  });
+
+  it('matches the vendor even when the identity does not contain the term', () => {
+    // 'moonshot' appears in neither 'opencode-go' nor 'kimi-k2.6' — only in the vendor.
+    expect(filterModels([KIMI, GLM], 'moonshot')).toEqual([KIMI]);
+    expect(filterModels([KIMI, GLM], 'ZhiPu')).toEqual([GLM]);
+  });
+
+  it('returns no models when nothing matches', () => {
+    expect(filterModels([MINIMAX, KIMI, GLM], 'zzz-no-such-model')).toEqual([]);
+  });
+});
+
+describe('pickPanel — model filter', () => {
+  it('filters the group rows by the typed term, then checks within the filtered set', async () => {
+    const catalog = catalogOf([KIMI, GLM]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER); // one provider, opencode-go
+
+    await term.waitFor('Filter opencode-go models');
+    term.send('glm' + ENTER); // filter down to GLM only
+
+    await term.waitFor('Select models for the panel — opencode-go (2 models):');
+    expect(term.buffer).toContain('glm-5.2');
+    expect(term.buffer).not.toContain('kimi-k2.6');
+
+    term.send(SPACE + ENTER); // select the only visible row
+
+    await term.waitFor('Thinking level for opencode-go/glm-5.2');
+    term.send(ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers.map((r) => r.model)).toEqual(['glm-5.2']);
+  }, 10_000);
+
+  it('re-prompts on a filter that matches nothing; clearing the filter shows all models', async () => {
+    const catalog = catalogOf([MINIMAX]);
+    const term = new ScriptedTerminal();
+
+    const resultPromise = pickPanel(catalog, {
+      input: term.input,
+      output: term.output,
+      isTTY: true,
+    });
+
+    await term.waitFor('Select providers');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Filter minimax models');
+    term.send('zzz-no-such-model' + ENTER);
+
+    await term.waitFor('no models match');
+    // The filter is re-prompted here: this ENTER clears it. Sending before observing the
+    // re-render is safe — the bytes can only be consumed by the re-prompted filter, since
+    // the previous input already submitted — while waiting for its message would race the
+    // clear (message and re-render arrive in the same flush).
+    term.buffer = '';
+    term.send(ENTER); // clear the filter: all models shown
+
+    await term.waitFor('Select models for the panel — minimax (1 model):');
+    expect(term.buffer).toContain('MiniMax-M2.7');
+    term.send(SPACE + ENTER);
+
+    await term.waitFor('Thinking level for minimax/MiniMax-M2.7');
+    term.send(ENTER);
+
+    const reviewers = await resultPromise;
+    expect(reviewers.map((r) => r.model)).toEqual(['MiniMax-M2.7']);
   }, 10_000);
 });

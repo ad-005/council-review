@@ -239,6 +239,9 @@ async function driveFullPickerSelection(term: ScriptedTerminal): Promise<void> {
   await term.waitFor('Select providers');
   term.send(SPACE + ENTER); // the only provider, "test-gw"
 
+  await term.waitFor('Filter test-gw models');
+  term.send(ENTER); // empty filter shows all
+
   await term.waitFor('Select models');
   term.send(SPACE + DOWN + SPACE + DOWN + SPACE + ENTER); // all three models
 
