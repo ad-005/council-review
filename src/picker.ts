@@ -12,7 +12,7 @@
 import { PassThrough } from 'node:stream';
 import { styleText } from 'node:util';
 
-import { Separator, checkbox, select } from '@inquirer/prompts';
+import { Separator, checkbox, input, select } from '@inquirer/prompts';
 
 import type { ThinkingLevel } from './levels.js';
 import type { Reviewer } from './panel.js';
@@ -116,6 +116,7 @@ export interface ModelChoice {
   name: string;
   description: string;
   short: string;
+  checked?: boolean;
 }
 
 /**
@@ -174,8 +175,29 @@ export function modelGroupMessage(provider: string, modelCount: number): string 
  *
  * Blank separators are skipped by checkbox navigation (up/down/space/number keys all ignore
  * them), so they are pure vertical air with no effect on selection.
+ *
+ * `checkedKeys` pre-checks the rows whose JSON-encoded value it contains, so a re-filtered
+ * group re-opens with its already-checked rows still checked.
  */
-export function buildModelRows(models: readonly CatalogModel[]): Array<ModelChoice | Separator> {
+/**
+ * Case-insensitive substring filter over each model's `provider/id` identity and vendor. An
+ * empty or whitespace-only term matches everything, so clearing the filter shows all models.
+ */
+export function filterModels(models: readonly CatalogModel[], term: string): CatalogModel[] {
+  const needle = term.trim().toLowerCase();
+  if (needle === '') {
+    return [...models];
+  }
+  return models.filter(
+    (m) =>
+      modelIdentity(m).toLowerCase().includes(needle) || m.vendor.toLowerCase().includes(needle),
+  );
+}
+
+export function buildModelRows(
+  models: readonly CatalogModel[],
+  checkedKeys: readonly string[] = [],
+): Array<ModelChoice | Separator> {
   const identityWidth = Math.min(
     Math.max(0, ...models.map((m) => modelIdentity(m).length)),
     MAX_IDENTITY_WIDTH,
@@ -194,11 +216,13 @@ export function buildModelRows(models: readonly CatalogModel[]): Array<ModelChoi
     const specs =
       `${m.vendor.padEnd(vendorWidth)}  ·  ${formatTokenCount(m.contextWindow)} ctx  ·  ` +
       `${formatCostPair(m)}  ·  ${m.reasoning ? 'thinking' : 'no thinking'}`;
+    const value = modelKey(m.provider, m.id);
     choices.push({
-      value: modelKey(m.provider, m.id),
+      value,
       name: `${identity.padEnd(identityWidth)}  ${specs}`,
       description: modelDetailLine(m),
       short: identity,
+      ...(checkedKeys.includes(value) ? { checked: true as const } : {}),
     });
   }
   return choices;
@@ -292,6 +316,50 @@ function promptContext(io: PickerIO): {
 }
 
 /**
+ * One provider group's filter-then-check pass: an optional `input()` filter first, then a
+ * checkbox over the filtered rows. A filter that matches nothing prints "no models match" and
+ * re-prompts the filter (submitting it empty clears the filter and shows all models) instead
+ * of opening an empty checkbox. `alreadyChecked` pre-checks the rows the group had checked on
+ * a previous pass, so re-filtering never loses already-checked keys.
+ */
+async function promptModelGroup(
+  group: ModelGroup,
+  alreadyChecked: readonly string[],
+  io: PickerIO,
+): Promise<string[]> {
+  for (;;) {
+    const term = await input(
+      {
+        message: `Filter ${group.provider} models (optional, empty shows all):`,
+      },
+      promptContext(io),
+    );
+    const filtered = filterModels(group.models, term);
+    if (filtered.length === 0) {
+      io.output.write(
+        `no models match ${JSON.stringify(term)} in ${group.provider} — ` +
+          `enter another filter or clear it to show all ${group.models.length}.\n`,
+      );
+      continue;
+    }
+    return checkbox<string>(
+      {
+        message: modelGroupMessage(group.provider, group.models.length),
+        required: false,
+        choices: buildModelRows(filtered, alreadyChecked),
+        theme: pickerCheckboxTheme,
+        // The rows scroll in a circle within their group; the header message stays put.
+        loop: true,
+        // Spacer rows roughly double the list height versus the default page size of 7; a
+        // larger page keeps a modest panel on one screen instead of forcing paging.
+        pageSize: 12,
+      },
+      promptContext(io),
+    );
+  }
+}
+
+/**
  * Runs the three-stage picker: providers, then models scoped to those providers, then a
  * thinking level per selected reasoning model (non-reasoning selections are shown as "no
  * thinking" and skip the prompt entirely). From the second reasoning model on, each thinking
@@ -327,28 +395,19 @@ export async function pickPanel(catalog: Catalog, io: PickerIO = defaultIO()): P
       throw new Error('picker: no models available for the selected providers');
     }
 
-    // One checkbox prompt per provider group, with the group header as the prompt message.
-    // The message is rendered above the paginated list and never scrolls, so the header stays
-    // pinned at the top while the rows move beneath it.
+    // One filter-then-checkbox pass per provider group, with the group header as the
+    // checkbox message. The message is rendered above the paginated list and never scrolls,
+    // so the header stays pinned at the top while the rows move beneath it. Each group's
+    // checked keys survive a stage re-run, so re-filtering a group re-opens it with its
+    // previous checks intact.
     let selectedModelKeys: string[] = [];
     let modelsConfirmed = false;
+    const checkedByGroup = new Map<string, string[]>();
     while (!modelsConfirmed) {
       selectedModelKeys = [];
       for (const group of modelGroups) {
-        const keys = await checkbox<string>(
-          {
-            message: modelGroupMessage(group.provider, group.models.length),
-            required: false,
-            choices: buildModelRows(group.models),
-            theme: pickerCheckboxTheme,
-            // The rows scroll in a circle within their group; the header message stays put.
-            loop: true,
-            // Spacer rows roughly double the list height versus the default page size of 7; a
-            // larger page keeps a modest panel on one screen instead of forcing paging.
-            pageSize: 12,
-          },
-          promptContext(io),
-        );
+        const keys = await promptModelGroup(group, checkedByGroup.get(group.provider) ?? [], io);
+        checkedByGroup.set(group.provider, keys);
         selectedModelKeys.push(...keys);
       }
       // `required` cannot be per-group (a group may legitimately contribute nothing), so the
